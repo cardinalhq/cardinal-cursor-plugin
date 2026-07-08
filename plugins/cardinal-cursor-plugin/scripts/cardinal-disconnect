@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Disconnect Cursor from Cardinal.
+
+Strips managed entries from both the user-level ~/.cursor/{mcp,hooks}.json
+AND the project-level .cursor/{mcp,hooks}.json when --project was used
+on connect. Best-effort revokes ingest and MCP keys server-side, then
+removes local state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+CURSOR_DIR = Path.home() / ".cursor"
+USER_MCP_PATH = CURSOR_DIR / "mcp.json"
+USER_HOOKS_PATH = CURSOR_DIR / "hooks.json"
+STATE_PATH = CURSOR_DIR / "cardinal.json"
+SECRETS_PATH = CURSOR_DIR / "cardinal-secrets.json"
+RUNTIME_DIR = CURSOR_DIR / "cardinal"
+MCP_SERVER_NAME = "cardinal"
+HOOK_IDENTITY_MARKER = "cardinal-cursor-plugin"
+
+
+def atomic_write(path: Path, content: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(content)
+    tmp.replace(path)
+
+
+def backup(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_suffix(f"{path.suffix}.bak.{ts}")
+    target.write_text(path.read_text())
+    return target
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        sys.exit(f"Refusing to proceed: {path} is unreadable ({exc})")
+    if not isinstance(data, dict):
+        sys.exit(f"Refusing to proceed: {path} is not a JSON object.")
+    return data
+
+
+def read_mcp_plaintext_from_config(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    data = load_json(path)
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return None
+    entry = servers.get(MCP_SERVER_NAME)
+    if not isinstance(entry, dict):
+        return None
+    headers = entry.get("headers")
+    if not isinstance(headers, dict):
+        return None
+    key = headers.get("X-CardinalHQ-API-Key")
+    return key if isinstance(key, str) and key else None
+
+
+def read_secrets() -> dict:
+    return load_json(SECRETS_PATH) if SECRETS_PATH.exists() else {}
+
+
+def remove_mcp_entry(path: Path) -> bool:
+    if not path.exists():
+        return False
+    data = load_json(path)
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return False
+    entry = servers.get(MCP_SERVER_NAME)
+    if not isinstance(entry, dict):
+        return False
+    if not entry.get("cardinalManaged"):
+        print(
+            f"Skipping mcpServers.{MCP_SERVER_NAME} in {path} because it "
+            "was not written by cardinal-connect (cardinalManaged flag missing)."
+        )
+        return False
+    servers.pop(MCP_SERVER_NAME, None)
+    if servers:
+        data["mcpServers"] = servers
+    else:
+        data.pop("mcpServers", None)
+    b = backup(path)
+    if data:
+        atomic_write(path, json.dumps(data, indent=2) + "\n")
+    else:
+        # If the file had ONLY our managed entry, remove it outright.
+        path.unlink()
+    print(f"Removed managed Cardinal MCP entry from {path}")
+    if b:
+        print(f"Backup: {b}")
+    return True
+
+
+def strip_managed_hooks(data: dict) -> tuple[dict, bool]:
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        return data, False
+    changed = False
+    for event_name, entries in list(hooks.items()):
+        if not isinstance(entries, list):
+            continue
+        kept = []
+        for handler in entries:
+            if isinstance(handler, dict) and HOOK_IDENTITY_MARKER in str(handler.get("command") or ""):
+                changed = True
+                continue
+            kept.append(handler)
+        if kept:
+            hooks[event_name] = kept
+        else:
+            hooks.pop(event_name, None)
+    data["hooks"] = hooks
+    return data, changed
+
+
+def remove_hooks_config(path: Path) -> bool:
+    if not path.exists():
+        return False
+    data = load_json(path)
+    new_data, changed = strip_managed_hooks(data)
+    if not changed:
+        return False
+    b = backup(path)
+    # If nothing but managed hooks lived here, remove the file so we
+    # don't leave an empty {"version":1,"hooks":{}} husk behind.
+    if not new_data.get("hooks") and set(new_data.keys()) <= {"version", "hooks"}:
+        path.unlink()
+    else:
+        atomic_write(path, json.dumps(new_data, indent=2) + "\n")
+    print(f"Removed managed Cardinal hooks from {path}")
+    if b:
+        print(f"Hooks backup: {b}")
+    return True
+
+
+def revoke_key(host: str, key_id: str, plaintext: str | None) -> tuple[bool, str]:
+    url = host.rstrip("/") + f"/api/maestro-keys/{key_id}/revoke"
+    headers = {"content-type": "application/json"}
+    if plaintext:
+        headers["X-CardinalHQ-API-Key"] = plaintext
+    req = urllib.request.Request(url, data=b"", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status in (200, 204), f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return False, f"network error: {exc}"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="cardinal-disconnect",
+        description="Disconnect Cursor from Cardinal.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Do not fail if ~/.cursor/cardinal.json is missing.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if not STATE_PATH.exists() and not args.force:
+        print("Cardinal is not connected. Nothing to do.")
+        return 0
+
+    state = load_json(STATE_PATH)
+    host = state.get("host") or "https://app.cardinalhq.io"
+    secrets = read_secrets()
+    mcp_key_id = state.get("mcp_key_id")
+    ingest_key_id = state.get("ingest_key_id")
+
+    if ingest_key_id:
+        plaintext = secrets.get("ingest_api_key")
+        ok, msg = revoke_key(host, ingest_key_id, plaintext if isinstance(plaintext, str) else None)
+        if ok:
+            print(f"Revoked ingest key {state.get('ingest_key_prefix') or ingest_key_id} server-side ({msg})")
+        else:
+            print(f"Could not revoke ingest key server-side ({msg}).")
+            print(f"Visit {host}/settings/api-keys to revoke it manually.")
+
+    if mcp_key_id:
+        plaintext = (
+            read_mcp_plaintext_from_config(USER_MCP_PATH)
+            or secrets.get("mcp_api_key")
+        )
+        ok, msg = revoke_key(host, mcp_key_id, plaintext if isinstance(plaintext, str) else None)
+        if ok:
+            print(f"Revoked MCP key {state.get('mcp_key_prefix') or mcp_key_id} server-side ({msg})")
+        else:
+            print(f"Could not revoke MCP key server-side ({msg}).")
+            print(f"Visit {host}/settings/api-keys to revoke it manually.")
+
+    # User-level configs first.
+    if not remove_mcp_entry(USER_MCP_PATH):
+        print(f"No managed Cardinal MCP entry found in {USER_MCP_PATH}")
+    if not remove_hooks_config(USER_HOOKS_PATH):
+        print(f"No managed Cardinal hooks found in {USER_HOOKS_PATH}")
+
+    # Project-level configs, if we installed them.
+    project = state.get("project_install") or {}
+    if project:
+        p_mcp = Path(project.get("mcp_path") or "")
+        p_hooks = Path(project.get("hooks_path") or "")
+        if p_mcp:
+            if not remove_mcp_entry(p_mcp):
+                print(f"No managed Cardinal MCP entry found in {p_mcp}")
+        if p_hooks:
+            if not remove_hooks_config(p_hooks):
+                print(f"No managed Cardinal hooks found in {p_hooks}")
+
+    if SECRETS_PATH.exists():
+        SECRETS_PATH.unlink()
+        print(f"Removed {SECRETS_PATH}")
+
+    if STATE_PATH.exists():
+        STATE_PATH.unlink()
+        print(f"Removed {STATE_PATH}")
+
+    if RUNTIME_DIR.exists():
+        shutil.rmtree(RUNTIME_DIR, ignore_errors=True)
+        print(f"Removed {RUNTIME_DIR}")
+
+    print()
+    print("Restart Cursor so it reloads MCP and hook configuration.")
+    if project:
+        print(
+            "Remember to commit the removal of .cursor/mcp.json / "
+            ".cursor/hooks.json so cloud agents stop invoking the hook."
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

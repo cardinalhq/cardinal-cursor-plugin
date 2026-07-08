@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Report Cardinal Cursor connection status."""
+
+from __future__ import annotations
+
+import json
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+CURSOR_DIR = Path.home() / ".cursor"
+USER_MCP_PATH = CURSOR_DIR / "mcp.json"
+USER_HOOKS_PATH = CURSOR_DIR / "hooks.json"
+STATE_PATH = CURSOR_DIR / "cardinal.json"
+SECRETS_PATH = CURSOR_DIR / "cardinal-secrets.json"
+MCP_SERVER_NAME = "cardinal"
+
+
+def load_json(path: Path, label: str) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        print(f"{label} ({path}) is unreadable: {exc}")
+        sys.exit(1)
+    if not isinstance(data, dict):
+        print(f"{label} ({path}) is not a JSON object.")
+        sys.exit(1)
+    return data
+
+
+def mcp_entry(path: Path) -> dict:
+    data = load_json(path, path.name)
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return {}
+    entry = servers.get(MCP_SERVER_NAME)
+    return entry if isinstance(entry, dict) else {}
+
+
+def probe_mcp(mcp_url: str, api_key: str) -> str:
+    req = urllib.request.Request(
+        mcp_url,
+        method="GET",
+        headers={"x-cardinalhq-api-key": api_key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return f"OK MCP reachable (HTTP {resp.status})"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return f"FAIL MCP returned HTTP {exc.code}; run cardinal-connect --rotate."
+        return f"OK MCP reachable (HTTP {exc.code}; auth accepted)"
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return f"FAIL MCP network error: {exc}"
+
+
+def probe_ingest(endpoint: str, api_key: str, api_header: str) -> str:
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + "/v1/metrics",
+        data=b"",
+        method="POST",
+        headers={
+            "content-type": "application/x-protobuf",
+            api_header: api_key,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return f"OK ingest reachable (HTTP {resp.status})"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return f"FAIL ingest returned HTTP {exc.code}; run cardinal-connect --rotate."
+        if exc.code < 500:
+            return f"OK ingest reachable (HTTP {exc.code}; auth accepted)"
+        return f"FAIL ingest returned HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return f"FAIL ingest network error: {exc}"
+
+
+def main() -> int:
+    if not STATE_PATH.exists():
+        print("Not connected. Run cardinal-connect to configure Cardinal for Cursor.")
+        return 1
+
+    state = load_json(STATE_PATH, "cardinal.json")
+    secrets = load_json(SECRETS_PATH, "cardinal-secrets.json")
+    user_entry = mcp_entry(USER_MCP_PATH)
+    project = state.get("project_install") or {}
+
+    print(f"Mode:        {state.get('mode', 'unknown')}")
+    print(f"User:        {state.get('user_email')}")
+    print(f"Org:         {state.get('org_slug') or state.get('org_id')}")
+    print(f"Host:        {state.get('host')}")
+    print(f"Plugin ver:  {state.get('plugin_version')}")
+
+    written_at = state.get("written_at")
+    if written_at:
+        try:
+            connected_at = datetime.fromisoformat(written_at.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - connected_at).days
+            print(f"Connected:   {age_days} day(s) ago")
+        except Exception:
+            pass
+
+    print()
+    print(f"Telemetry:      {'enabled' if state.get('telemetry', {}).get('enabled') else 'disabled'}")
+    print(f"Ingest endpoint:{' ' if state.get('ingest_endpoint') else ''}{state.get('ingest_endpoint')}")
+    print(f"Ingest key pref:{' ' if state.get('ingest_key_prefix') else ''}{state.get('ingest_key_prefix')}")
+    print(f"Hooks path:     {USER_HOOKS_PATH}")
+    print(f"Secrets path:   {SECRETS_PATH}")
+    print()
+    print(f"MCP endpoint:   {state.get('mcp_url')}")
+    print(f"MCP key prefix: {state.get('mcp_key_prefix')}")
+    print(f"MCP config:     {USER_MCP_PATH}")
+    if project:
+        print()
+        print(f"Project install root:  {project.get('root')}")
+        print(f"Project MCP config:    {project.get('mcp_path')}")
+        print(f"Project hooks config:  {project.get('hooks_path')}")
+        print("(cloud-agent coverage; commit both files to your repo)")
+
+    failures = 0
+
+    ingest_endpoint = state.get("ingest_endpoint")
+    ingest_key = secrets.get("ingest_api_key")
+    ingest_header = secrets.get("ingest_api_header") or "x-cardinalhq-api-key"
+    if ingest_endpoint and ingest_key:
+        msg = probe_ingest(str(ingest_endpoint), str(ingest_key), str(ingest_header))
+        print(msg)
+        if msg.startswith("FAIL"):
+            failures += 1
+    elif state.get("telemetry", {}).get("enabled"):
+        print("FAIL Cardinal ingest endpoint or local ingest key is missing.")
+        failures += 1
+
+    if state.get("mcp_url"):
+        if not user_entry:
+            print(f"FAIL No mcpServers.{MCP_SERVER_NAME} entry found in {USER_MCP_PATH}.")
+            failures += 1
+        else:
+            config_url = user_entry.get("url")
+            headers = user_entry.get("headers")
+            api_key = headers.get("X-CardinalHQ-API-Key") if isinstance(headers, dict) else None
+
+            if config_url != state.get("mcp_url"):
+                print(f"WARN MCP URL in config differs from state: {config_url}")
+            if not config_url or not api_key:
+                print(f"FAIL Cardinal MCP URL or API-key header is missing from {USER_MCP_PATH}.")
+                failures += 1
+            else:
+                msg = probe_mcp(str(config_url), str(api_key))
+                print(msg)
+                if msg.startswith("FAIL"):
+                    failures += 1
+
+    print()
+    print("Restart Cursor if you connected or disconnected in the current process.")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
