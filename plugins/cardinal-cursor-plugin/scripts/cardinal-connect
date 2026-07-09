@@ -373,9 +373,11 @@ def write_hooks_config(path: Path) -> Path | None:
       sessionStart        — initiative-convention + budget standing
       beforeSubmitPrompt  — spend-limits gate + git_state
       postToolUse         — turn_tool + tool_result + notify piggyback
-      preCompact          — no-op placeholder (future turn-boundary needs)
+      preCompact          — cardinal.plan_usage (context-window slice)
       stop                — best-effort transcript sweep (v0.1.0 no-op)
       subagentStop        — subagent_usage
+      afterAgentResponse  — cardinal.turn_response (text length only)
+      afterAgentThought   — cardinal.turn_thought (duration + text len)
     """
     data = strip_managed_hooks(load_json_object(path, "hooks.json"))
     data.setdefault("version", 1)
@@ -387,6 +389,12 @@ def write_hooks_config(path: Path) -> Path | None:
         ("preCompact", 5),
         ("stop", 10),
         ("subagentStop", 5),
+        # v0.2.0: emit cardinal.turn_response / cardinal.turn_thought
+        # (length + duration only — no text). Passively also captures
+        # payloads to disk when CARDINAL_CURSOR_DEBUG_PAYLOADS=1 for
+        # post-hoc verification of the spend-limits gap D research.
+        ("afterAgentResponse", 5),
+        ("afterAgentThought", 5),
     ):
         hooks.setdefault(event, []).append(managed_hook_entry(event, timeout))
     path.parent.mkdir(parents=True, exist_ok=True)

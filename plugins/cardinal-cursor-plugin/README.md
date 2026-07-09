@@ -17,10 +17,14 @@ Cursor does not expose Claude Code's native OpenTelemetry emitter. This plugin e
 - `cardinal.git_state` from the active Git checkout on `beforeSubmitPrompt`, including initiative classification from the branch name (worktree noise stripped) and slash-command detection.
 - `cardinal.turn_tool` + `tool_result` from `postToolUse` payloads, with MCP-qualified `tool_name` on `turn_tool` and Bash-verb `bash_class` classification.
 - `cardinal.subagent_usage` from `subagentStop` payload keys (`subagent_type`, `status`, `task` / `description`, `duration_ms`, `message_count`, `tool_call_count`, `loop_count`).
+- `cardinal.turn_thought` from `afterAgentThought` — duration and text length only (never the model's thinking text itself, which is potentially large and sensitive).
+- `cardinal.turn_response` from `afterAgentResponse` — text length only (never the response text itself).
+- `cardinal.plan_usage` (context-window slice) from `preCompact` — `context_tokens`, `context_window_size`, `context_usage_percent`, `trigger`, `messages_to_compact`, `is_first_compaction`. This is a context-usage slice on the `plan_usage` event name; downstream disambiguates from per-model-call plan_usage on the presence of `plan.compact_trigger`.
+- Every emitted OTLP resource is stamped with `cursor.model`, `cursor.model_id`, `cursor.model_params`, and `cursor.version` from the hook payload's base fields when Cursor provides them, so downstream slicing by model and Cursor build works without inspecting each event.
 
-Currently deferred to a future release (see `docs/specs/cursor-parity.md` P0 spike):
+Cursor product-side gap — per-model-call `cardinal.turn_usage` / `cardinal.api_request`:
 
-- Per-model-call `api_request` / `cardinal.turn_usage` / `cardinal.plan_state` / `cardinal.plan_usage` — Cursor's transcript format and any per-turn token/rate-limit records are undocumented. `CARDINAL_CURSOR_DEBUG_PAYLOADS=1` captures raw payloads from `stop` / `subagentStop` / `postToolUse` under `~/.cursor/cardinal/telemetry/debug/` to inform the spike.
+- These events require input/output/cached token counts on every model call. **Cursor's hook surface and transcript format do not expose per-model-call token counts**, so no plugin-side implementation can produce them. This is a Cursor-side product gap, not a docs gap or a plugin blocker. Cursor staff confirmed on the forum that the transcript is JSONL of user/assistant messages with no usage records ([cursor forum #157311](https://forum.cursor.com/t/accessing-the-full-agent-transcript-in-cursor/157311)). `CARDINAL_CURSOR_DEBUG_PAYLOADS=1` still writes raw hook payloads under `~/.cursor/cardinal/telemetry/debug/` for post-hoc verification and future schema evolution.
 
 ## Session context & spend limits
 
@@ -60,7 +64,7 @@ The connect script prints a Cardinal approval URL, waits for approval, and write
 | File | What gets written |
 | --- | --- |
 | `~/.cursor/mcp.json` | A managed `mcpServers.cardinal` entry with the Cardinal MCP URL and API-key header. Tagged `cardinalManaged: true`. |
-| `~/.cursor/hooks.json` | Managed Cardinal hook entries for `sessionStart`, `beforeSubmitPrompt`, `postToolUse`, `preCompact`, `stop`, `subagentStop`. Each entry's `command` string embeds the marker `cardinal-cursor-plugin` for disconnect identification. |
+| `~/.cursor/hooks.json` | Managed Cardinal hook entries for `sessionStart`, `beforeSubmitPrompt`, `postToolUse`, `preCompact`, `stop`, `subagentStop`, `afterAgentResponse`, `afterAgentThought`. Each entry's `command` string embeds the marker `cardinal-cursor-plugin` for disconnect identification. |
 | `.cursor/mcp.json` + `.cursor/hooks.json` at repo root | Same content as the user-level files (only with `--project`). |
 | `~/.cursor/cardinal.json` | Non-secret state: org/user metadata, endpoint URLs, key ids, key prefixes, and config locations. |
 | `~/.cursor/cardinal-secrets.json` | Local plaintext ingest/MCP keys needed by hooks and status probes; written mode `0600`. |
