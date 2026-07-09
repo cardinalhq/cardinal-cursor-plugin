@@ -89,7 +89,10 @@ enumerated below.
 
 | # | Divergence | Claude / Codex behaviour | Cursor v0.1.0 target | Resolution |
 |---|-----------|--------------------------|-----------------------|------------|
-| D | Per-model-call token usage | Claude: native OTel `api_request` events; Codex: `token_count` transcript records | Cursor transcript is documented to include neither. `api_request` / `cardinal.turn_usage` / `cardinal.plan_state` / `cardinal.plan_usage` have no obvious source | **Undecided until we inspect a live transcript.** Best case: undocumented but present → parse as Codex does. Worst case: absent → accepted asymmetry (`api_request`/plan telemetry not emitted on Cursor). Decide during P1 spike below. |
+| D | Per-model-call token usage | Claude: native OTel `api_request` events; Codex: `token_count` transcript records | Cursor's hook surface never emits token counts, and the transcript format is JSONL of user/assistant messages with no usage records (confirmed by Cursor staff on [forum #157311](https://forum.cursor.com/t/accessing-the-full-agent-transcript-in-cursor/157311)) | **Cursor-side product gap — feature-request territory.** No plugin-side implementation can produce `cardinal.turn_usage` / `cardinal.api_request` without changes to Cursor. Accepted asymmetry until Cursor exposes token counts on `afterAgentResponse` or the transcript. See divergence J below for the context-window slice that v0.2.0 does emit on `plan_usage`. |
+| J | Per-turn text carriers (`afterAgentResponse` / `afterAgentThought`) | Claude: native OTel `api_request` covers this; Codex: no equivalent | Cursor payloads carry `text`, `duration_ms` (thought), plus the base fields. `text` is potentially large and sensitive (chain-of-thought / user code) | **Emit `cardinal.turn_thought` and `cardinal.turn_response`** — lengths and duration only, never the text itself. Debug-capture retained under `CARDINAL_CURSOR_DEBUG_PAYLOADS=1` for post-hoc verification. |
+| K | preCompact context-window slice | Claude: no equivalent; Codex: no equivalent | Cursor documents `trigger`, `context_usage_percent`, `context_tokens`, `context_window_size`, `message_count`, `messages_to_compact`, `is_first_compaction` on `preCompact` | **Emit `cardinal.plan_usage`** carrying these attributes under the `plan.*` namespace (`plan.context_tokens`, `plan.context_window`, `plan.context_pct`, `plan.compact_trigger`, `plan.messages_to_compact`, `plan.is_first_compaction`). This is a *context-window* slice on the `plan_usage` event name; the *per-model-call* slice remains blocked by gap D. Downstream disambiguates on the presence of `plan.compact_trigger`. |
+| L | Base model / Cursor identity | Claude: OTel resource attrs cover this; Codex: emitted per-event | Every Cursor hook payload carries `model`, `model_id`, `model_params`, `cursor_version` in the base fields | **Stamp `cursor.model`, `cursor.model_id`, `cursor.model_params` (JSON string when object), `cursor.version` on the OTLP resource** on every emit so downstream slicing works without touching each event handler. |
 | E | Notify / warn band delivery | Claude sends `systemMessage`; Codex sends the same via `hookSpecificOutput`; both allow inline messages on non-blocking turns | Cursor `beforeSubmitPrompt` has NO `additional_context` output and no allow-with-message path — its documented output schema is only `{continue, user_message}`, and `user_message` renders only when `continue: false` | **Three-tier resolution.** *Notify* has no clean surface on the submit path; instead, deliver the notify context on the **next** turn boundary via `sessionStart.additional_context` (session-wide standing) and — if per-turn refresh matters — via `postToolUse.additional_context` piggybacked on the first tool call of the turn (documented `additional_context` output). *Warn*: if the user opts into strict mode (`CARDINAL_CURSOR_STRICT_WARN=1`), escalate to *block*; otherwise degrade to *notify*. *Block*: `{continue: false, user_message: <server text>}`. Document all three modes. |
 | F | `tool_result` source | Claude: native tool events; Codex: transcript function_call_output records | Cursor transcript excludes tool outputs by design. `postToolUse` payload includes the tool result | Emit `tool_result` + `cardinal.turn_tool` from `postToolUse` payloads (never from transcript). |
 | G | SubagentStop payload fidelity | Claude: rich payload; Codex: **P5 deferred** (payload shape never observed in the wild — env-gated debug dump under `CARDINAL_CODEX_DEBUG_PAYLOADS`) | Cursor documents `subagentStop` payload keys verbatim as `subagent_type`, `status`, `task`, `description`, `summary`, `duration_ms`, `message_count`, `tool_call_count`, `loop_count`, `modified_files`, `agent_transcript_path` (no top-level `subagent_id` on stop — use the `subagentStart` payload's `subagent_id` if we need to correlate) | **Cursor is strictly better here**: emit `cardinal.subagent_usage` directly from these documented keys without a capture phase. Correlation to `subagentStart` (which does carry `subagent_id`, `parent_conversation_id`, `tool_call_id`, `subagent_model`, `is_parallel_worker`, `git_branch`) is via `agent_transcript_path` + `task`. |
@@ -110,19 +113,22 @@ enumerated below.
 
 ## Plan of action
 
-- **P0 — telemetry-source spike (2 days).** Before writing any hook code:
-  connect a throwaway Cursor session, run 5–10 prompts, and inspect
-  *three* candidate sources for per-model-call token / rate-limit
-  records — do not stop at the first that comes up empty:
-  1. `cat "$transcript_path"` and grep for `usage`, `tokens`,
-     `input_tokens`, `rate_limits`, `plan`, `token_count`.
-  2. Log the raw stdin JSON of `afterAgentResponse` and
-     `afterAgentThought` hooks (the docs are silent on their payload
-     shape; they are the most likely native carrier of per-turn usage).
-  3. Log the raw stdin JSON of `postToolUse` for aggregation potential.
-  Decision matrix: any of the three carrying token totals → parity path
-  for `api_request` / `cardinal.turn_usage` opens. All three empty →
-  accept D as an asymmetry and document the gap in the README.
+- **P0 — telemetry-source spike (resolved 2026-07-09).** Superseded by
+  divergence D above: the Cursor product surface does not expose
+  per-model-call token counts on any hook payload, and Cursor staff
+  confirmed the transcript is JSONL with no usage records
+  ([forum #157311](https://forum.cursor.com/t/accessing-the-full-agent-transcript-in-cursor/157311)).
+  `cardinal.turn_usage` / `cardinal.api_request` are Cursor-side
+  feature-request territory, not a docs gap. v0.2.0 pivoted to shipping
+  everything the hook surface *does* expose:
+  1. `cardinal.turn_thought` / `cardinal.turn_response` from
+     `afterAgentThought` / `afterAgentResponse` — length + duration
+     (never text).
+  2. `cardinal.plan_usage` context-window slice from `preCompact`.
+  3. `cursor.model` / `cursor.model_id` / `cursor.model_params` /
+     `cursor.version` stamped on the OTLP resource for every emit.
+  4. Debug-capture retained under `CARDINAL_CURSOR_DEBUG_PAYLOADS=1` for
+     schema evolution.
 - **P1 — repo bootstrap.** Create a new repo
   `cardinal-cursor-plugin` (peer of `cardinal-codex-plugin`,
   `cardinal-claude-plugin`) with the same layout:

@@ -352,7 +352,7 @@ class JsonManagedBlockTests(unittest.TestCase):
         self.assertTrue(any("echo foreign" in c for c in cmds))
         self.assertFalse(any("cardinal-cursor-plugin" in c for c in cmds))
 
-    def test_hooks_registers_all_six_events(self) -> None:
+    def test_hooks_registers_all_managed_events(self) -> None:
         path = self.home.cursor / "hooks.json"
         self.connect.write_hooks_config(path)
         data = json.loads(path.read_text())
@@ -360,6 +360,8 @@ class JsonManagedBlockTests(unittest.TestCase):
         self.assertEqual(events, {
             "sessionStart", "beforeSubmitPrompt", "postToolUse",
             "preCompact", "stop", "subagentStop",
+            # v0.2.0: emit cardinal.turn_response / cardinal.turn_thought.
+            "afterAgentResponse", "afterAgentThought",
         })
 
 
@@ -378,6 +380,152 @@ class ManifestTests(unittest.TestCase):
         pv.plugin_version.cache_clear()
         version = pv.plugin_version()
         self.assertRegex(version, r"^\d+\.\d+\.\d+")
+
+
+class ResourceAttrsTests(unittest.TestCase):
+    """Base OTel resource attributes stamp Cursor identity from the
+    hook payload's base fields (model, model_id, model_params,
+    cursor_version)."""
+
+    def setUp(self) -> None:
+        self.hook = _load_module("cursor_telemetry_ra",
+                                 HOOKS_DIR / "cardinal-cursor-telemetry.py")
+
+    def test_base_attrs_without_payload(self) -> None:
+        attrs = self.hook.resource_attrs({"deployment_environment": "prod",
+                                          "user_email": "a@b.com",
+                                          "org_slug": "acme"})
+        self.assertEqual(attrs["service.name"], "cursor")
+        self.assertEqual(attrs["deployment.environment"], "prod")
+        self.assertEqual(attrs["user.email"], "a@b.com")
+        self.assertEqual(attrs["cardinal.org"], "acme")
+        self.assertNotIn("cursor.model", attrs)
+        self.assertNotIn("cursor.version", attrs)
+
+    def test_payload_stamps_model_and_version(self) -> None:
+        payload = {
+            "model": "claude-3.5-sonnet",
+            "model_id": "anthropic/claude-3.5-sonnet",
+            "model_params": {"temperature": 0.2, "max_tokens": 4096},
+            "cursor_version": "0.44.11",
+        }
+        attrs = self.hook.resource_attrs({}, payload)
+        self.assertEqual(attrs["cursor.model"], "claude-3.5-sonnet")
+        self.assertEqual(attrs["cursor.model_id"], "anthropic/claude-3.5-sonnet")
+        self.assertEqual(attrs["cursor.version"], "0.44.11")
+        # model_params serialized to JSON string.
+        self.assertEqual(json.loads(attrs["cursor.model_params"]),
+                         {"temperature": 0.2, "max_tokens": 4096})
+
+    def test_payload_string_model_params_passthrough(self) -> None:
+        attrs = self.hook.resource_attrs({}, {"model_params": "opaque"})
+        self.assertEqual(attrs["cursor.model_params"], "opaque")
+
+    def test_payload_missing_fields_skipped(self) -> None:
+        attrs = self.hook.resource_attrs({}, {"model": ""})
+        self.assertNotIn("cursor.model", attrs)
+
+
+class PreCompactEmitTests(unittest.TestCase):
+    """preCompact payload → cardinal.plan_usage (context-window slice)."""
+
+    def setUp(self) -> None:
+        self.hook = _load_module("cursor_telemetry_pc",
+                                 HOOKS_DIR / "cardinal-cursor-telemetry.py")
+
+    def test_pre_compact_emits_plan_usage(self) -> None:
+        payload = {
+            "conversation_id": "conv-1",
+            "trigger": "auto",
+            "context_usage_percent": 87,
+            "context_tokens": 174_000,
+            "context_window_size": 200_000,
+            "message_count": 42,
+            "messages_to_compact": 30,
+            "is_first_compaction": True,
+            "model": "claude-3.5-sonnet",
+            "cursor_version": "0.44.11",
+        }
+        captured: list = []
+        with mock.patch.object(self.hook, "emit_records",
+                               side_effect=lambda records, payload=None: captured.append((records, payload))):
+            self.hook.handle_pre_compact(payload)
+        self.assertEqual(len(captured), 1)
+        records, forwarded_payload = captured[0]
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        # Body carries event name.
+        self.assertEqual(rec["body"]["stringValue"], "cardinal.plan_usage")
+        # Attributes contain the plan.* keys.
+        attrs = {a["key"]: list(a["value"].values())[0] for a in rec["attributes"]}
+        self.assertEqual(attrs["plan.compact_trigger"], "auto")
+        self.assertEqual(attrs["plan.context_tokens"], "174000")
+        self.assertEqual(attrs["plan.context_window"], "200000")
+        self.assertEqual(attrs["plan.messages_to_compact"], "30")
+        self.assertTrue(attrs["plan.is_first_compaction"])
+        # Payload forwarded so resource_attrs can stamp cursor.model etc.
+        self.assertIs(forwarded_payload, payload)
+
+    def test_pre_compact_no_conv_id_no_emit(self) -> None:
+        captured: list = []
+        with mock.patch.object(self.hook, "emit_records",
+                               side_effect=lambda *a, **kw: captured.append(a)):
+            self.hook.handle_pre_compact({"trigger": "auto"})
+        self.assertEqual(captured, [])
+
+
+class ThoughtResponseEmitTests(unittest.TestCase):
+    """afterAgentThought / afterAgentResponse emit length-only events."""
+
+    def setUp(self) -> None:
+        self.hook = _load_module("cursor_telemetry_tr",
+                                 HOOKS_DIR / "cardinal-cursor-telemetry.py")
+
+    def test_thought_emits_duration_and_len_never_text(self) -> None:
+        payload = {
+            "conversation_id": "conv-1",
+            "duration_ms": 1234,
+            "text": "internal chain-of-thought, do not emit",
+        }
+        captured: list = []
+        with mock.patch.object(self.hook, "emit_records",
+                               side_effect=lambda records, payload=None: captured.append(records)):
+            self.hook.handle_after_agent_thought(payload)
+        self.assertEqual(len(captured), 1)
+        rec = captured[0][0]
+        self.assertEqual(rec["body"]["stringValue"], "cardinal.turn_thought")
+        attrs = {a["key"]: list(a["value"].values())[0] for a in rec["attributes"]}
+        self.assertEqual(attrs["thought.duration_ms"], "1234")
+        self.assertEqual(attrs["thought.text_len"], str(len(payload["text"])))
+        # The raw text MUST NOT appear in any attribute value.
+        for a in rec["attributes"]:
+            for v in a["value"].values():
+                self.assertNotIn("chain-of-thought", str(v))
+
+    def test_response_emits_text_len_never_text(self) -> None:
+        payload = {
+            "conversation_id": "conv-1",
+            "text": "final response body containing user code",
+        }
+        captured: list = []
+        with mock.patch.object(self.hook, "emit_records",
+                               side_effect=lambda records, payload=None: captured.append(records)):
+            self.hook.handle_after_agent_response(payload)
+        self.assertEqual(len(captured), 1)
+        rec = captured[0][0]
+        self.assertEqual(rec["body"]["stringValue"], "cardinal.turn_response")
+        attrs = {a["key"]: list(a["value"].values())[0] for a in rec["attributes"]}
+        self.assertEqual(attrs["response.text_len"], str(len(payload["text"])))
+        for a in rec["attributes"]:
+            for v in a["value"].values():
+                self.assertNotIn("user code", str(v))
+
+    def test_response_no_conv_id_no_emit(self) -> None:
+        captured: list = []
+        with mock.patch.object(self.hook, "emit_records",
+                               side_effect=lambda *a, **kw: captured.append(a)):
+            self.hook.handle_after_agent_response({"text": "x"})
+        self.assertEqual(captured, [])
 
 
 class SubagentTests(unittest.TestCase):

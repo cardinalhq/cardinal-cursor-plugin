@@ -42,8 +42,9 @@ PLAN_STAMP_PATH = TELEMETRY_DIR / "plan.json"
 
 # Env-gated raw-payload dump for shape capture (mirrors the Codex
 # plugin's P5 affordance). Off by default; writes nothing unless
-# CARDINAL_CURSOR_DEBUG_PAYLOADS=1. Used for the P0 spike to inspect
-# afterAgentResponse / afterAgentThought / transcript payloads.
+# CARDINAL_CURSOR_DEBUG_PAYLOADS=1. Post-v0.2.0 handlers all emit real
+# events; this side channel is retained for post-hoc payload
+# verification and future schema evolution.
 DEBUG_PAYLOADS_ENV = "CARDINAL_CURSOR_DEBUG_PAYLOADS"
 DEBUG_DIR = TELEMETRY_DIR / "debug"
 
@@ -229,8 +230,17 @@ def load_connection() -> tuple[dict[str, Any], dict[str, Any]] | None:
     return state, secrets
 
 
-def resource_attrs(state: dict[str, Any]) -> dict[str, str]:
-    return {
+def resource_attrs(
+    state: dict[str, Any], payload: dict[str, Any] | None = None
+) -> dict[str, str]:
+    """Base OTel resource attributes for every emitted record, plus
+    per-event Cursor identity stamped from the hook payload's base
+    fields when supplied. Cursor documents `model`, `model_id`,
+    `model_params`, and `cursor_version` on every hook payload; when
+    the caller threads the payload through, we surface them on the
+    resource so downstream slicing by model / Cursor build works
+    without touching each event handler."""
+    attrs: dict[str, str] = {
         "service.name": "cursor",
         "agent.runtime": "cursor",
         "deployment.environment": str(state.get("deployment_environment") or "unknown"),
@@ -238,9 +248,32 @@ def resource_attrs(state: dict[str, Any]) -> dict[str, str]:
         "cardinal.org": str(state.get("org_slug") or state.get("org_id") or "unknown"),
         "cardinal.plugin_version": PLUGIN_VERSION,
     }
+    if isinstance(payload, dict):
+        model = payload.get("model")
+        if isinstance(model, str) and model:
+            attrs["cursor.model"] = model
+        model_id = payload.get("model_id") or payload.get("modelId")
+        if isinstance(model_id, str) and model_id:
+            attrs["cursor.model_id"] = model_id
+        model_params = payload.get("model_params")
+        if model_params is None:
+            model_params = payload.get("modelParams")
+        if isinstance(model_params, (dict, list)):
+            try:
+                attrs["cursor.model_params"] = json.dumps(model_params, separators=(",", ":"))
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(model_params, str) and model_params:
+            attrs["cursor.model_params"] = model_params
+        version = payload.get("cursor_version") or payload.get("cursorVersion")
+        if isinstance(version, str) and version:
+            attrs["cursor.version"] = version
+    return attrs
 
 
-def emit_records(records: list[dict[str, Any]]) -> None:
+def emit_records(
+    records: list[dict[str, Any]], payload: dict[str, Any] | None = None
+) -> None:
     if not records:
         return
     conn = load_connection()
@@ -255,7 +288,7 @@ def emit_records(records: list[dict[str, Any]]) -> None:
         "resourceLogs": [
             {
                 "resource": {
-                    "attributes": [kv(k, v) for k, v in resource_attrs(state).items()],
+                    "attributes": [kv(k, v) for k, v in resource_attrs(state, payload).items()],
                 },
                 "scopeLogs": [
                     {
@@ -710,7 +743,7 @@ def handle_before_submit_prompt(payload: dict[str, Any]) -> None:
             "cardinal_command": detect_command(payload.get("prompt") or payload.get("message")),
             **read_plan_stamp(),
         }
-        emit_records([log_record("cardinal.git_state", attrs, time.time_ns())])
+        emit_records([log_record("cardinal.git_state", attrs, time.time_ns())], payload)
 
     try:
         lc = _limits()
@@ -813,7 +846,7 @@ def handle_post_tool_use(payload: dict[str, Any]) -> None:
     }
     records.append(log_record("tool_result", tool_result_attrs, now_ns + 1))
 
-    emit_records(records)
+    emit_records(records, payload)
     state["tool_seq"] += 1
     _save_progress(conv_id, state)
 
@@ -832,10 +865,28 @@ def handle_post_tool_use(payload: dict[str, Any]) -> None:
 
 
 def handle_pre_compact(payload: dict[str, Any]) -> None:
-    """No-op placeholder for parity with the Codex plugin. Kept so future
-    turn-boundary needs have a wired handler without needing a
-    re-connect."""
+    """Emit `cardinal.plan_usage` (context slice) from Cursor's
+    documented preCompact payload: `trigger`, `context_usage_percent`,
+    `context_tokens`, `context_window_size`, `message_count`,
+    `messages_to_compact`, `is_first_compaction`. This is not the same
+    'plan_usage' as the Claude/Codex per-model-call token slice — it's
+    a context-window slice on the same event name; downstream can
+    disambiguate on the presence of `plan.compact_trigger`."""
     dump_debug_payload("preCompact", payload)
+    conv_id = conv_id_from_payload(payload)
+    if not conv_id:
+        return
+    attrs: dict[str, Any] = {
+        "session_id": conv_id,
+        "plan.context_tokens": payload.get("context_tokens"),
+        "plan.context_window": payload.get("context_window_size"),
+        "plan.context_pct": payload.get("context_usage_percent"),
+        "plan.compact_trigger": payload.get("trigger"),
+        "plan.messages_to_compact": payload.get("messages_to_compact"),
+        "plan.is_first_compaction": payload.get("is_first_compaction"),
+        **read_plan_stamp(),
+    }
+    emit_records([log_record("cardinal.plan_usage", attrs, time.time_ns())], payload)
 
 
 def handle_stop(payload: dict[str, Any]) -> None:
@@ -846,6 +897,46 @@ def handle_stop(payload: dict[str, Any]) -> None:
     from the Codex plugin ports here.
     """
     dump_debug_payload("stop", payload)
+
+
+def handle_after_agent_response(payload: dict[str, Any]) -> None:
+    """Emit `cardinal.turn_response` with the response text length.
+    We intentionally do NOT emit `text` itself — it can be large and
+    may contain sensitive user code/content. Debug-capture is retained
+    as a side channel under CARDINAL_CURSOR_DEBUG_PAYLOADS=1 for
+    post-hoc verification."""
+    dump_debug_payload("afterAgentResponse", payload)
+    conv_id = conv_id_from_payload(payload)
+    if not conv_id:
+        return
+    text = payload.get("text")
+    text_len = len(text) if isinstance(text, str) else None
+    attrs: dict[str, Any] = {
+        "session_id": conv_id,
+        "response.text_len": text_len,
+        **read_plan_stamp(),
+    }
+    emit_records([log_record("cardinal.turn_response", attrs, time.time_ns())], payload)
+
+
+def handle_after_agent_thought(payload: dict[str, Any]) -> None:
+    """Emit `cardinal.turn_thought` with the thought duration and text
+    length. We intentionally do NOT emit `text` — it is the model's
+    thinking and can be large and potentially sensitive. Debug-capture
+    remains under CARDINAL_CURSOR_DEBUG_PAYLOADS=1."""
+    dump_debug_payload("afterAgentThought", payload)
+    conv_id = conv_id_from_payload(payload)
+    if not conv_id:
+        return
+    text = payload.get("text")
+    text_len = len(text) if isinstance(text, str) else None
+    attrs: dict[str, Any] = {
+        "session_id": conv_id,
+        "thought.duration_ms": payload.get("duration_ms") or payload.get("durationMs"),
+        "thought.text_len": text_len,
+        **read_plan_stamp(),
+    }
+    emit_records([log_record("cardinal.turn_thought", attrs, time.time_ns())], payload)
 
 
 def subagent_description_from_payload(payload: dict[str, Any]) -> str | None:
@@ -883,7 +974,7 @@ def handle_subagent_stop(payload: dict[str, Any]) -> None:
         "loop_count": payload.get("loop_count") or payload.get("loopCount"),
         **read_plan_stamp(),
     }
-    emit_records([log_record("cardinal.subagent_usage", attrs, time.time_ns())])
+    emit_records([log_record("cardinal.subagent_usage", attrs, time.time_ns())], payload)
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1072,11 @@ HANDLERS = {
     "preCompact": handle_pre_compact,
     "stop": handle_stop,
     "subagentStop": handle_subagent_stop,
+    # v0.2.0: real emit (cardinal.turn_response / cardinal.turn_thought
+    # with lengths only, not text). Debug-capture side channel is
+    # retained under CARDINAL_CURSOR_DEBUG_PAYLOADS=1.
+    "afterAgentResponse": handle_after_agent_response,
+    "afterAgentThought": handle_after_agent_thought,
 }
 
 
