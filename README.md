@@ -1,5 +1,10 @@
 # Cardinal Cursor plugin
 
+> [!NOTE]
+> This repository is a **release mirror**. Development happens in
+> [cardinal-agent-plugins](https://github.com/cardinalhq/cardinal-agent-plugins) — send PRs there.
+
+
 This repository publishes one Cursor plugin: `cardinal-cursor-plugin`.
 
 The plugin source lives at [`plugins/cardinal-cursor-plugin`](./plugins/cardinal-cursor-plugin); the parity spec against the Codex and Claude plugins lives at [`docs/specs/cursor-parity.md`](./docs/specs/cursor-parity.md).
