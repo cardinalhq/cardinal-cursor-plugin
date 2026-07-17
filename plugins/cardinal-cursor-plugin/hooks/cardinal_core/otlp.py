@@ -80,9 +80,13 @@ def resource_attrs(
     org: str | None,
     plugin_version: str,
     include_core_version: bool = True,
+    extra: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Standard Cardinal resource attributes. Identity is an argument —
-    CLI adapters read it from state, omnigent supplies actor.run_as."""
+    CLI adapters read it from state, omnigent supplies actor.run_as.
+    `extra` merges adapter-specific attributes (e.g. omnigent's
+    cardinal.omnigent_harness) after the standard set; empty/None
+    values are skipped so callers can pass optionals unguarded."""
     attrs = {
         "service.name": service_name,
         "agent.runtime": agent_runtime,
@@ -93,6 +97,9 @@ def resource_attrs(
     }
     if include_core_version:
         attrs["cardinal.core_version"] = CORE_VERSION
+    for key, value in (extra or {}).items():
+        if value:
+            attrs[str(key)] = str(value)
     return attrs
 
 
