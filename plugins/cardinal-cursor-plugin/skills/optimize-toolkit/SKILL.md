@@ -426,13 +426,106 @@ nudge instead.
 `status: "presented"` and `proposed_kind: "gap"`; skip the
 write/confirmation loop.
 
-**Present** the authored artifact with:
+**Present the recommendation like a colleague on Slack, not a
+monitoring dashboard.** The mechanic below (§5's five-step algorithm,
+`my_toolkit_adoption` cross-reference, sub-cluster reduction) is
+scaffolding — it stays in your head, not on the user's screen. What
+the user sees should read like "someone smart looked at my week and
+noticed X."
 
-- The evidence summary in plain language.
-- The `matching_sessions` slice from the cluster if present.
-- The savings figure, honestly caveated per placeholder rules.
-- A plain confirmation question ("write this to
-  `.cursor/agents/<name>.md`? yes/no"). One candidate at a time.
+**Ban list — never appear in user-facing prose.** Do not use these
+internal-mechanic terms in the pitch:
+
+- `sub-cluster`, `verb-bucket`, `meta-cluster`
+- `routed side`, `bypassed side`, `contrast pair`
+- `cluster_spawns`, `my_toolkit_adoption`, `subtok`,
+  `zero_signal_count`, `tool_shape`, `tools_seen`
+- `signal-only`, `<X>-shaped signal`
+- Kind names as headings or prefixes ("Candidate 1 — adopt / agent:
+  Explore" is the mechanic's structure, not the user's mental model)
+- Tabular metric dumps as the lead (small tables INSIDE prose are
+  fine when they carry evidence)
+
+**Voice.** Short paragraphs. Concrete session dates and IDs where
+they add credibility. Ratios, not percentages, when the point is
+magnitude ("17× cheaper per spawn" reads sharper than "94% cheaper").
+The recommendation goes FIRST; the evidence justifies it, doesn't
+lead it.
+
+**Example — bad framing (dashboard):**
+
+> ### Candidate 1 — adopt Explore for code-locating spawns
+> Routed side (my_toolkit_adoption.agents.Explore): 14 spawns,
+> 1.75M subtok → ~125k subtok / spawn. Description: "fast read-only
+> search agent for locating code..."
+> Bypassed side (Research & Investigation sub-clusters whose labels +
+> Bash+Read shape read as pure code-locating, not routed through
+> Explore):
+> [table of metrics]
+
+**Example — good framing (peer):**
+
+> **Past week, one thing worth changing:**
+>
+> You reached for generic subagents to do code-exploration work 9
+> times, burning ~19M tokens. Two clear giveaways:
+>
+> - **Jul 15, session 9f21ee76**: "Trace polly sub-agent cwd flow"
+>   then "Find sub-agent detection signals" — back-to-back, both
+>   on opus-4-7, 8.4M combined
+> - **Jul 15, session 2bbbd04f**: three "Read <adapter> telemetry"
+>   spawns fired in 4 minutes at 09:29 (sonnet-5, 2.3M combined) —
+>   a hand-rolled fan-out
+>
+> Your Explore agent is designed for exactly this shape of work
+> (locating code, finding files, grepping symbols). You used it 14
+> times last week at ~125k tokens each — **17× cheaper per spawn
+> than the generic ones.**
+>
+> Next time you're about to spawn a Task starting with "Trace X,"
+> "Find X in code," "Read X telemetry," "Survey path," or
+> "Inventory constants for X" — reach for Explore. It can fan out
+> inside itself; that three-adapter read could have been one
+> "Read identity fields across omnigent/gemini/cursor" call.
+>
+> Can't quote dollars — your organization only prices Haiku and
+> Sonnet 4.6, and you mostly run on opus. The 17× is a magnitude
+> signal, not a receipt.
+
+**Present order per recommendation:**
+
+1. Lead with what to change. One-sentence recommendation, in the
+   user's own vocabulary (agent names, session labels).
+2. Show 1–3 concrete pieces of evidence — session IDs, dates, actual
+   labels, tokens. Bursts and cross-session recurrence carry the
+   most weight; solo spawns rarely justify a pitch.
+3. State the counterfactual as a ratio or a burst-collapse ("three
+   spawns in four minutes → one call would have covered it"), never
+   as a percentage. If dollars are unquotable, say so once and move
+   on — don't apologize twice.
+4. Give the concrete next action. If it writes a file, name the
+   file. If it's behavioral (`adopt`), say what to type/reach-for
+   next time. If it's `consolidate`, ask which absorbs which.
+5. Confirmation question ONLY when a file will be written.
+   `adopt` / `gap` / signal-only observations don't ask "yes/no?" —
+   they leave the reader with the observation and move on.
+
+**Signal-only observations** (patterns you noticed but won't
+recommend action on — MCP error rates without a cohort target,
+single-session extract candidates, etc.) go at the end under a plain
+"**Two things I noticed but won't recommend yet:**" heading. Never
+call them "signal-only." Explain in one sentence why you're holding
+off ("Only one session's worth so far — if it recurs, worth
+minting..."). No taxonomy prefix.
+
+**One candidate at a time — don't stack.** If a file write needs a
+yes/no, wait for it before showing the next candidate. Behavioral
+adopts / gaps flow together at the end; they don't need
+confirmation.
+
+**Confirmation format when a file will be written.** A plain
+question, target path visible ("write this to
+`.cursor/agents/<name>.md`? yes/no"), no ceremony.
 
 ### 8. Write (only on explicit confirmation)
 
