@@ -154,7 +154,13 @@ class GateDecision:
 
     tier: Literal["block", "warn", "notify"]  # after override downgrade
     band: int
-    reason: str | None          # server block_reason / fallback copy (block only)
+    # The tier's "why" copy for renderers whose channel has only a reason
+    # slot (omnigent PolicyResponse). block: server block_reason /
+    # fallback copy. warn/notify: block_reason when an override
+    # downgraded a live block (the why must survive the downgrade), else
+    # user_message / agent_context. gate_output() reads it on block only,
+    # so CLI hook bytes are unaffected.
+    reason: str | None
     agent_context: str | None
     user_message: str | None
     is_new_band: bool           # hysteresis: band rose vs last ack
@@ -192,10 +198,14 @@ def gate_decision(paths: AgentPaths, session_id: str) -> GateDecision | None:
     user_message = verdict.get("user_message")
     user_message = user_message if isinstance(user_message, str) and user_message else None
 
+    block_reason = verdict.get("block_reason")
+    block_reason = block_reason if isinstance(block_reason, str) and block_reason else None
+
+    downgraded = False
     if decision == "block" and age <= BLOCK_MAX_AGE_SEC:
         if not paths.override_path(session_id).exists():
             reason = (
-                verdict.get("block_reason")
+                block_reason
                 or user_message
                 or "A Cardinal spend limit for this work has been reached."
             )
@@ -205,6 +215,7 @@ def gate_decision(paths: AgentPaths, session_id: str) -> GateDecision | None:
                 is_new_band=True,
             )
         decision = "warn"  # overridden: keep the human-visible standing
+        downgraded = True
 
     if band <= 0 or age > WARN_MAX_AGE_SEC:
         return None
@@ -218,7 +229,11 @@ def gate_decision(paths: AgentPaths, session_id: str) -> GateDecision | None:
     return GateDecision(
         tier="warn" if decision == "warn" else "notify",
         band=band,
-        reason=None,
+        # An override-downgraded block keeps its block_reason; ordinary
+        # warn/notify carry the standing copy.
+        reason=(block_reason if downgraded else None)
+        or user_message
+        or agent_context,
         agent_context=agent_context,
         user_message=user_message,
         is_new_band=band > last_band,
