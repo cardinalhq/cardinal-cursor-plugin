@@ -84,8 +84,11 @@ both with `window: "30d"`. From the two responses, compose a short
 - Name the caller's top 1–2 model-mix rows by cost from
   `my_turn_pattern.models`.
 - Name the toolkit-adoption headline the first candidate will target,
-  e.g. "42 file-edit spawns / 480k tokens on a reasoning-tier model in
-  the last 30 days" (from `my_toolkit_adoption.agents` or `.skills`).
+  e.g. "231 Explore-shaped spawns / 32.6M subtok in the last 30 days"
+  — from whichever `my_toolkit_adoption` surface has the biggest
+  signal this window: `.agents`, `.skills`, `.commands`,
+  `.mcp_servers`, or `.tool_counts`. Built-ins count on equal footing
+  with namespaced agents here — see step 5.
 - **No usable evidence, stop before any ratio math.** If
   `my_toolkit_adoption.coverage.sessions_scanned == 0`, or
   `my_turn_pattern.turns_total` is 0, there is nothing to compute a
@@ -141,9 +144,12 @@ cat /tmp/spawns_reduced.json
 
 Output shape: `{ input_spawns_raw, zero_signal_spawns, sub_cluster_count,
 reduced_rows: [{verb, tool_shape, spawn_count, zero_signal_count,
+enriched_spawn_count, avg_tokens_per_enriched_spawn, tools_seen,
 unique_labels, top_labels[:8], tokens_total, session_count,
 burst_count, sample_top_by_tokens}] }`. Rows come sorted by
-`tokens_total` descending.
+`tokens_total` descending. `avg_tokens_per_enriched_spawn` and
+`tools_seen` are what step 5's counterfactual-ratio and extract-vs-gap
+mechanics read directly.
 
 **Zero-signal rows are retained, not dropped.** A row where
 `zero_signal_count == spawn_count` has no tokens/model on any member
@@ -197,7 +203,13 @@ still be there next session." For each of the top-K meta-clusters:
   `tool_shape`, read the matching file under
   `.cursor/agents/` (or the user-scoped equivalent) to confirm the fit
   before recommending `adopt`. Bad `adopt` recommendations happen when
-  the name matches but the actual scope doesn't.
+  the name matches but the actual scope doesn't. If the candidate is a
+  **built-in** with no file on disk, use its description from your own
+  tool listing instead — expected, not a reason to skip it (step 5).
+- If `my_toolkit_adoption.mcp_servers` shows an entry with
+  `err > 0.1 * n`, that's evidence for a `swap`/`pin` flag on the MCP
+  side — check `~/.cursor/mcp.json` for how that server is configured
+  before saying anything actionable about it.
 - If you're considering `extract` (mint new), grep under
   `.cursor/agents/` for the meta-cluster's `tool_shape` — a
   similar-shape agent may already exist under a name your
@@ -230,57 +242,67 @@ non-obvious plays only appear when you compare a sub-cluster's shape
 against `my_toolkit_adoption`.
 
 **Strongest pattern (empirically): toolkit-consistency adopt, found via
-contrast pairs.** A contrast pair sets a named agent's aggregate usage
-(from `my_toolkit_adoption`, the "routed" side) against a reducer
-sub-cluster whose labels credibly describe the same domain but never
-name that agent (the "bypassed" side). Do **not** look for the
-contrast inside a single spawn's `tool_signature` — an `Agent`/`Skill`
-call there reflects the *parent* turn's routing decision, not the
-child subagent's own trace, and `tool_shape` (top-2 tools by
-frequency) usually buries a lone `Agent`/`Skill` call under `Bash`/
-`Read` noise anyway. Cross-data-source contrast is the mechanic that
-actually surfaces evidence:
+contrast pairs — across every capability surface, not just agents.**
+A contrast pair sets a named capability's aggregate usage (from
+`my_toolkit_adoption`, the "routed" side) against a reducer sub-cluster
+whose labels credibly describe the same domain but never name that
+capability (the "bypassed" side). Do **not** look for the contrast
+inside a single spawn's `tool_signature` — an `Agent`/`Skill` call
+there reflects the *parent* turn's routing decision, not the child
+subagent's own trace, and `tool_shape` (top-2 tools by frequency)
+usually buries a lone `Agent`/`Skill` call under `Bash`/`Read` noise
+anyway. Cross-data-source contrast is the mechanic that actually
+surfaces evidence:
 
-1. From `my_toolkit_adoption.agents`, keep entries whose key is
-   namespaced (contains `:`, e.g. `pr-review-toolkit:code-reviewer` —
-   built-ins like `Explore`/`general-purpose`/`Plan` aren't a "domain"
-   to bypass, they're the generic fallback) and that clear **≥10
-   spawns OR ≥1M `subtok`**. This is the routed side.
-2. For each kept agent, build a small domain-vocabulary set from its
-   `description:` frontmatter (`Read` the file you already located in
-   step 4) — the content words in the "use this agent when..."
-   sentence, not just the slug. Reading the real description beats
-   guessing from the hyphenated name; a name like `pr-test-analyzer`
-   undersells that its domain also covers "coverage" and "regression."
+1. **Build the routed side from every `my_toolkit_adoption` surface,
+   not just `agents`.** Keep any entry — agent, skill, command, or MCP
+   server — clearing **≥10 spawns/invocations OR ≥1M `subtok`/`tok`**.
+   This explicitly *includes* built-ins with no file on disk — a
+   built-in clearing 200+ spawns is a real routed path, not "just the
+   generic fallback." Also check `.skills` (≥5 invocations OR ≥100k
+   `tok`) and `.commands` (≥5 invocations) the same way.
+2. For each kept capability, build a small domain-vocabulary set from
+   its real behavior: `Read` the `description:` frontmatter for a
+   file-backed agent/skill, or use the description string your own
+   tool listing carries for a built-in with no file on disk.
 3. Walk the reducer's `reduced_rows` — **including rows where
-   `zero_signal_count == spawn_count`** (v4 of `reduce_spawns.py`
-   retains these; they carry no tokens/model but their `top_labels`
-   are real evidence, and labels like "General code review" / "Silent
-   failure hunt" / "Test coverage review" / "Type design review" are
-   often the *strongest* signal precisely because they're bespoke,
-   self-narrated Task descriptions rather than toolkit boilerplate).
-   Flag a row as a bypass candidate when its `top_labels` share ≥2
-   content words with a kept agent's domain vocabulary.
-4. Require the candidate to clear the same bar a one-off wouldn't:
-   **≥2 spawns**, same session or sessions within the window you're
-   already scanning. Two or more label-only reviews fired back-to-back
-   in one session (check `at` timestamps — a burst under a few minutes
-   is a giveaway) is a much stronger tell than a single spawn.
-   Bonus confidence: if the same verb-phrase recurs across sessions
-   with only the trailing subject varying ("Code review Phase A" /
-   "Code review site-config-v2" / "General code review") — that's a
-   hand-rolled loop the user re-invents each time, not a one-off.
-5. State the caveat honestly when you present this: `cluster_spawns`
-   never exposes `subagent_type` on a member (only
-   `session_id`/`at`/`subagent_description`/`subagent_model`/
-   `tokens_total`), so you cannot prove the bypassed spawns did NOT
-   route through the named agent — only that their labels don't
-   mention it and their shape/cadence reads as ad hoc. Pitch it as
-   "these don't reference `<agent>` and look hand-rolled" rather than
-   "you didn't use `<agent>`."
+   `zero_signal_count == spawn_count`** (the reducer retains these;
+   their `top_labels` are real evidence, often the *strongest* signal
+   precisely because they're bespoke, self-narrated Task descriptions
+   rather than toolkit boilerplate). Flag a row as a bypass candidate
+   when its `top_labels` share ≥2 content words with a kept
+   capability's domain vocabulary. Also check `.tool_counts` for
+   recurring native-tool patterns echoing a sub-cluster's `tool_shape`.
+4. Require **≥2 spawns**, same session or sessions within the window.
+   A burst under a few minutes (check `at` timestamps) is a stronger
+   tell than a single spawn. Bonus confidence: the same verb-phrase
+   recurring across sessions with only the trailing subject varying.
+5. **Compute the counterfactual ratio.** Routed-side avg = the
+   capability's own `subtok / n` (agents) or `tok / n`
+   (skills/commands). Bypassed-side avg = the sub-cluster's
+   `avg_tokens_per_enriched_spawn` (from the reducer, divided by
+   non-zero-signal spawns only). Ratio = bypassed avg / routed avg.
+   **≥3x is a real magnitude signal** worth stating out loud even
+   with no cohort/$ pricing.
+6. State the caveat honestly: `cluster_spawns` never exposes
+   `subagent_type`, so you cannot prove the bypassed spawns did NOT
+   route through the named capability — only that their labels don't
+   mention it. Pitch it as "these don't reference `<capability>` and
+   look hand-rolled" rather than "you didn't use `<capability>`."
 
-Once you have a pair, the play is `adopt` — the user has the tool,
-they're inconsistently reaching for it.
+Once you have a pair, the play is `adopt` — the user has the
+capability, they're inconsistently reaching for it.
+
+**Extract vs gap — where the bar actually sits.** `gap` is not the
+default fallback when there's no adopt target. A single sub-cluster
+row clearing **≥2 spawns** with a non-empty `tool_shape` is `extract`.
+If sibling rows share the same verb but split across `tool_shape`
+buckets purely from top-2 noise (check `tools_seen` — the full tool
+set per row; near-identical `tools_seen` across rows means the same
+underlying job), **combine their spawn_count** before applying the ≥2
+bar. Only fall to `gap` when, after combining, the surviving
+`tools_seen` sets share fewer than 2 tool names, or no combination
+clears 2 spawns.
 
 **Tie-break — adopt beats downgrade when both fire.** If a sub-cluster
 is both `adopt`-covered (an existing agent handles this shape) AND
@@ -293,19 +315,25 @@ For each of the top-K meta-clusters, reason about kind from the
 evidence in front of you (the semantic cluster label, its member verb
 buckets, its dominant tool shapes, its token magnitude, and the
 `my_toolkit_adoption` match you just grounded). There is no server-side kind gate — you pick, you
-justify. The five buildable kinds and one signal-only kind:
+justify. **None of these kinds are agent-only** — every kind below can
+target an agent, a skill, or an MCP server. The five buildable kinds
+and one signal-only kind:
 
 - **`adopt`** — the cluster's `tool_signature` and label overlap an
-  existing capability you saw in step 3. Recommend the user reach
-  for the existing thing consistently, no new file. Softer signal:
-  the user's own `my_toolkit_adoption` shows the target with
-  meaningful usage already.
+  existing capability you saw in step 3 (agent or skill). Recommend
+  the user reach for the existing thing consistently, no new file.
+  Softer signal: the user's own `my_toolkit_adoption` shows the
+  target with meaningful usage already.
 - **`swap`** — cluster overlaps an existing capability, but that
   existing capability is the wrong shape or wrong model for this
-  work. Recommend replacing it. Harder to justify than `adopt`;
-  state the reason ("existing agent is pinned to a reasoning tier
-  but the tool_signature is mechanical — swap it for a cheap-tier
-  variant").
+  work — or, for an MCP server, the wrong integration for the job.
+  Recommend replacing it. Harder to justify than `adopt`; state the
+  reason ("existing agent is pinned to a reasoning tier but the
+  tool_signature is mechanical — swap it for a cheap-tier variant").
+  MCP-server candidates surface from `.mcp_servers`: an entry with
+  `err > 0.1 * n` is worth flagging, but a swap needs an alternative
+  to point at — absent cross-org data, you usually can't name one; say
+  so and skip the artifact rather than force a `swap`.
 - **`pin`** — cluster runs on a mix of tiers with the org's cheap
   tier already carrying meaningful share (say, ≥30% of the
   cluster's `subagent_model` occurrences) and no evidence the
@@ -326,9 +354,11 @@ justify. The five buildable kinds and one signal-only kind:
   job under two different labels. No new file; recommend merging.
   Present conversationally, don't auto-locate the files.
 - **`gap`** (signal only, no artifact) — cluster is real recurring
-  work, but you cannot pick a kind honestly. Say so plainly, no
-  artifact, no confirmation question, no `estimate_savings` call
-  for this candidate.
+  work, but you cannot pick a kind honestly even after the "Extract
+  vs gap" combining step above. Say so plainly, no artifact, no
+  confirmation question, no `estimate_savings` call for this
+  candidate. Not every capability surface produces a play from a
+  given window — that's a quiet window, not a mechanic failure.
 
 Thresholds above are rules of thumb, not gates. Adjust when the
 cluster's specifics clearly warrant.
@@ -373,13 +403,24 @@ not a full-file replacement.
 **`adopt` — usually no file.** Author a plain-language
 recommendation: "stop spawning this inline pattern; your existing
 `<capability>` already handles it — I saw N sessions where it would
-have applied." No confirmation-to-write question.
+have applied," plus the counterfactual ratio from step 5. No
+confirmation-to-write question. **Never offer a settings-entry or
+other prose-nudge note as a fallback** — not on request. A
+recommendation with no clean capability-level artifact is signal you
+present honestly and move on.
 
-**`swap` — edit or replace an existing file.** Author the dry-run
+**`swap` — edit or replace an existing file** (`.cursor/agents/*.md`
+or `~/.cursor/mcp.json` for an MCP-server swap). Author the dry-run
 as the specific edit you'd propose.
 
 **`consolidate` — no automated file work.** Present the two-candidate
 overlap and ask the user which capability should absorb the other.
+
+**No clean capability-level intervention exists.** Some patterns don't
+map onto `.cursor/agents/*.md` or `~/.cursor/mcp.json` at all — an
+MCP-server error-rate flag with no alternative to name is the clearest
+example. Say so plainly and stop; never substitute a settings-note
+nudge instead.
 
 **`gap` — no artifact.** State the pattern, call `mark` with
 `status: "presented"` and `proposed_kind: "gap"`; skip the
@@ -473,4 +514,10 @@ exist specifically so you don't overstate a number:
 - Don't paper over a bad pick with a plausibly-worded artifact.
   If you find yourself writing template-shaped prose, reclassify
   as `gap` and say so.
+- Don't reach for `gap` just because a sub-cluster's exact
+  `tool_shape` row only has one spawn — check whether combining
+  same-verb sibling rows by `tools_seen` overlap changes the count
+  first.
+- Don't offer a settings-entry or other prose-nudge note as a
+  fallback artifact — for any kind, on request or not.
 - Don't exceed the ~10-call budget on `outcomes__*` tools.

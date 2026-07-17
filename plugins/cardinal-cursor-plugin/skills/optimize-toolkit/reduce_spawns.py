@@ -26,9 +26,35 @@ Stages:
      window count as one "burst" (retain per-burst member count).
   6. Emit: per-sub-cluster row with {verb, tool_shape, spawn_count,
      unique_labels, top_labels[:8], tokens_total, session_count,
-     burst_count, zero_signal_count, sample_top_by_tokens}.
+     burst_count, zero_signal_count, enriched_spawn_count,
+     avg_tokens_per_enriched_spawn, tools_seen, sample_top_by_tokens}.
 
 Zero-signal spawns are retained, not dropped (v4 change).
+
+v5 adds two fields that harden the counterfactual and extract-vs-gap
+mechanics SKILL.md §5 now runs (see "Flaws fixed in v5" in
+optimize-toolkit's changelog for the full rationale):
+
+  - `enriched_spawn_count` / `avg_tokens_per_enriched_spawn`: the
+    bypassed-side half of a contrast-pair's counterfactual ratio needs
+    "tokens per real (non-zero-signal) spawn," not "tokens per spawn
+    including zero-signal ones" (which understates the average by
+    diluting it with rows that carry 0 tokens by construction). Doing
+    this division correctly is exactly the kind of arithmetic an LLM
+    pass gets wrong under token pressure, so the reducer does it once,
+    mechanically, and ships the number.
+  - `tools_seen`: the FULL set of tool names with nonzero count across
+    every cluster contributing to this bucket — not just the top-2
+    that make up `tool_shape`. Two rows with the same verb can land in
+    different `tool_shape` buckets purely because which tool ranked
+    #2 flipped (e.g. `{Bash:6,Edit:2,Read:12,Write:16}` → "Read+Write"
+    vs `{Bash:13,Edit:1,Read:11,Write:8}` → "Bash+Read" — both are
+    really "migrate: read source, write docs, occasionally shell out,"
+    split into two spawn_count=1 rows by top-2 noise). SKILL.md's
+    extract-vs-gap judgment is expected to recognize this by comparing
+    `tools_seen` overlap across same-verb sibling rows, not just
+    `tool_shape` string equality — recurrence a naive reading would
+    miss entirely.
 
 v3 filtered spawns with no model + no tokens + no tool_signature entirely,
 reasoning they "carry no evidence useful for kind selection." That's true
@@ -85,6 +111,18 @@ def first_verb(label: str) -> str:
     if re.match(r'^(w\d|plg|mcp|search|sonnet-\d|fresh-eyes|per-adapter)', w):
         return w
     return w
+
+def tools_seen(tool_signature: dict) -> list:
+    """Full set of tool names with nonzero count — not just the top-2 that
+    make up tool_shape. See the module docstring's v5 note: this is what
+    lets the semantic pass recognize same-verb rows as the same underlying
+    work even when top-2 noise splits them into different tool_shape
+    buckets (e.g. Read+Write vs Bash+Read for two "migrate" spawns that
+    both actually touch Bash+Edit+Read+Write in different proportions)."""
+    if not tool_signature:
+        return []
+    return sorted(t for t, c in tool_signature.items() if c)
+
 
 def tool_shape(tool_signature: dict) -> str:
     """Grouping key over the spawn's tool_counts. Picks the top 2 tools by
@@ -168,6 +206,7 @@ def main():
         'sessions': set(),
         'bursts': set(),
         'zero_signal_count': 0,
+        'tools_seen': set(),
         'sample_examples': [],  # (label, tokens, model, shape)
     })
     for s in spawns:
@@ -181,6 +220,7 @@ def main():
         b['tokens'] += s['tokens']
         b['sessions'].add(s['session_id'])
         b['bursts'].add(burst_key(s['session_id'], s['at']))
+        b['tools_seen'].update(tools_seen(s['tool_signature']))
         if s['zero_signal']:
             b['zero_signal_count'] += 1
         b['sample_examples'].append(
@@ -192,11 +232,22 @@ def main():
     for (verb, shape), b in sorted(buckets.items(), key=lambda kv: -kv[1]['tokens']):
         exs = sorted(b['sample_examples'], key=lambda x: -x[1])[:5]
         spawn_count = sum(b['labels'].values())
+        enriched_spawn_count = spawn_count - b['zero_signal_count']
+        # v5: mechanical counterfactual denominator — see module docstring.
+        # Divide by ENRICHED spawns only; zero-signal spawns carry 0 tokens
+        # by construction and would silently deflate a plain spawn_count
+        # average.
+        avg_tokens_per_enriched = (
+            b['tokens'] / enriched_spawn_count if enriched_spawn_count else None
+        )
         reduced.append({
             'verb': verb,
             'tool_shape': shape,
             'spawn_count': spawn_count,
             'zero_signal_count': b['zero_signal_count'],
+            'enriched_spawn_count': enriched_spawn_count,
+            'avg_tokens_per_enriched_spawn': avg_tokens_per_enriched,
+            'tools_seen': sorted(b['tools_seen']),
             'unique_labels': len(b['labels']),
             'top_labels': [l for l, _ in b['labels'].most_common(8)],
             'tokens_total': b['tokens'],
