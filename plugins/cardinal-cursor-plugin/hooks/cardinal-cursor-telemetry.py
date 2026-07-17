@@ -568,6 +568,9 @@ def handle_subagent_stop(payload: dict[str, Any]) -> None:
         "agent_runtime": "cursor",
         "subagent_type": payload.get("subagent_type") or payload.get("subagentType"),
         "subagent_description": subagent_description_from_payload(payload),
+        # Cross-adapter contract key; best-effort — Cursor's documented
+        # subagentStop payload has no model field (gap D adjacent).
+        "model": payload.get("model") or payload.get("modelName") or payload.get("model_name"),
         "subagent_status": payload.get("status"),
         "duration_ms": payload.get("duration_ms") or payload.get("durationMs"),
         "message_count": payload.get("message_count") or payload.get("messageCount"),

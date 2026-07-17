@@ -11,4 +11,4 @@ Design constraints honored throughout (spec §omnigent constraints):
 - Identity (user_email/actor) is an argument, never a file read.
 """
 
-CORE_VERSION = "0.2.0"
+CORE_VERSION = "0.3.0"
