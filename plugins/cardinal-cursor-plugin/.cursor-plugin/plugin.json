@@ -1,6 +1,6 @@
 {
   "name": "cardinal-cursor-plugin",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Connect Cursor to Cardinal: telemetry to the Outcomes Dashboard + unified Cardinal MCP tools, with a per-turn git_state hook that derives initiative name and type from the current branch so the Outcomes Dashboard can map sessions to repos/branches/PRs/initiatives.",
   "author": {
     "name": "CardinalHQ",
