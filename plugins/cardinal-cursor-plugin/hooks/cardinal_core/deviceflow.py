@@ -130,6 +130,25 @@ def verify_mcp_reachable(mcp_url: str | None, api_key: str | None) -> tuple[bool
         return False, f"network error: {exc}"
 
 
+def revoke_maestro_key(host: str, key_id: str, plaintext: str | None) -> tuple[bool, str]:
+    """Best-effort POST /api/maestro-keys/<id>/revoke. Authenticates with the
+    plaintext (R11 §1 self path); without it the server returns 403 and the
+    caller should point the user at the admin UI. Shared by connect (revoking a
+    dropped act token) and disconnect (revoking on teardown)."""
+    url = host.rstrip("/") + f"/api/maestro-keys/{key_id}/revoke"
+    headers = {"content-type": "application/json"}
+    if plaintext:
+        headers["X-CardinalHQ-API-Key"] = plaintext
+    req = urllib.request.Request(url, data=b"", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status in (200, 204), f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return False, f"network error: {exc}"
+
+
 def _ingest_probe_once(endpoint: str, api_key: str, api_header: str) -> tuple[bool, str]:
     url = endpoint.rstrip("/") + "/v1/metrics"
     req = urllib.request.Request(
