@@ -318,7 +318,19 @@ The adapter SKILL.md tells you *how* to spawn a cold subagent in this agent's ru
 
 The subagent (or inline judge, when degraded) gets: absolute paths to the fresh `sentinel.yaml` and `rationale.md`, plus the ratification checklist below. It reads them cold (no compilation context), evaluates each rule literally against the YAML, and returns the verdict block. Do NOT ask the subagent to opine beyond the checklist — the point is a rules pass, not a judgment call.
 
-**Ratification checklist v1 — additive over time. Every new failure mode observed in the wild becomes a numbered rule here.**
+**How the subagent evaluates R1–R6.** The six rules below are also implemented in the shared module `common/mechanize/ratification.py` — the same module the sentinel-lint CLI (`spike/executor/lint.py`) imports. This is the single source of truth; compiler and lint never drift.
+
+The cold subagent MUST call the shared module rather than re-derive the rules from the prose below:
+
+```
+python3 <repo-root>/common/mechanize/ratification.py <absolute-path-to-sentinel.yaml> <absolute-path-to-rationale.md>
+```
+
+The command prints the Stage 5.5 verdict block directly and exits 0 on `RATIFIED`, 1 on `REVISE`. The subagent's job is (a) run the command, (b) return its stdout verbatim as the verdict, and (c) NOT attempt to override or supplement the module's judgment. If the subagent cannot invoke Python (no bash-shaped tool), it falls back to reading the checklist prose below and evaluating each rule by hand — but that path is a degradation and MUST be noted in `rationale.md`'s Unresolved subsection.
+
+The checklist below documents what each rule enforces, so a human reviewer can audit both the ratification module and the subagent's read.
+
+**Ratification checklist v1 — additive over time. Every new failure mode observed in the wild becomes a numbered rule here (add the rule to `ratification.py` in the same PR).**
 
 **R1. Variation-point completeness.** For every input under `spec.inputs` that has a `default:` AND is templated anywhere in the YAML as `${inputs.<name>}` (in a tool argument, function argument, or expression), there MUST be an entry in `spec.variationPoints[]` with `path: /spec/inputs/<name>/default` and a non-empty `operations:` list (typically `[replace]`, or `[bind]` for identity-shaped inputs like a service selector). Missing entries FAIL — cite the offending input name(s) and the tool/function node(s) that reference them.
 
