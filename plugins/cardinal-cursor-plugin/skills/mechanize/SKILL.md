@@ -107,9 +107,33 @@ No documented vocabulary. In a hand-authored transcript, whatever the author use
 
 Use CORE.md Stage 5.5's checklist and verdict format verbatim.
 
+## Stage 8 addendum — presenting `preview.html` in Cursor
+
+Reachable only via Escape hatch B (hand-authored transcript). Cursor exposes no `Artifact`-tool equivalent to this SKILL. After the shared renderer writes `<OUT_DIR>/preview.html`, print the absolute path with an open instruction:
+
+```
+Preview rendered: <OUT_DIR>/preview.html
+Open with: open <OUT_DIR>/preview.html   (macOS)
+           xdg-open <OUT_DIR>/preview.html   (Linux)
+```
+
+Mermaid inside the HTML renders as raw source text when opened as a plain file — known adapter degradation; the rest of the preview is fully legible.
+
+## Stage 9 addendum — rubric-gen and cold grading in Cursor
+
+Reachable only via Escape hatch B. Cursor exposes no subagent-spawning mechanism to this SKILL.
+
+**Stage 9a (rubric-gen).** Run `python3 <repo-root>/common/mechanize/review.py rubric-gen-instructions <OUT_DIR>` and follow the printed prompt yourself, inline. Write `<OUT_DIR>/rubric.md`. Flag in `rationale.md` under `Unresolved`:
+
+> `Stage 9a ran inline (Cursor exposes no subagent-spawning mechanism). Rubric may lean toward the compiler's framing.`
+
+**Stage 9b (cold grading).** **Skip entirely.** Per CORE.md, an inline pass by the compiler is nearly worthless. Record in `rationale.md`:
+
+> `Stage 9b skipped: Cursor exposes no cold-subagent mechanism. Rubric available at rubric.md for manual review.`
+
 ## Now continue with CORE.md
 
-If you reached this point, you entered via Escape hatch B and have a segmented mental model. Continue at **CORE.md Stage 2** and follow through Stage 7 with the Cursor addenda above.
+If you reached this point, you entered via Escape hatch B and have a segmented mental model. Continue at **CORE.md Stage 2** and follow through Stage 9 with the Cursor addenda above (path-only preview at Stage 8, inline 9a, skipped 9b at Stage 9).
 
 Do NOT skip any of Stages 2 through 7. Do NOT hallucinate rules that aren't in CORE.md.
 
