@@ -484,6 +484,82 @@ The stub body MUST include the node-id and the one-line paraphrase — otherwise
 
 At the end, tell the user (a) where you wrote the files (Sentinel directory), (b) the top-line summary (node count by kind, procedure signature), (c) how many function bodies were **generated** vs how many are **stubs** requiring operator fill-in, (d) what you refused to compile and why (task-execution phases, mixed-phase splits), (e) the largest single judgment call you had to make.
 
+### Stage 8 — Preview
+
+Stage 5.5 tells the reviewer whether the Sentinel obeys the mechanical rules. Stage 8 tells the reviewer *what the Sentinel is* — DAG shape, node bodies, inputs, capabilities, rationale — rendered as one page instead of a directory of files they have to grep. This is what a human reviewer actually reads; without it, semantic review defaults to raw-YAML archaeology.
+
+Invoke the shared renderer:
+
+```
+python3 <repo-root>/common/mechanize/preview.py <OUT_DIR>
+```
+
+The command writes `<OUT_DIR>/preview.html` and prints that path on stdout. The HTML embeds a mermaid DAG diagram, per-node cards (inlined function bodies for `kind: function`, `toolRef`+arguments for `kind: tool`, the expression for `kind: condition`, the finding config for `kind: emit`), the `spec.inputs` table, capabilities, variation points, outputs, execution config, and the full `rationale.md`. Self-contained, theme-aware, no external assets.
+
+**Presentation to the user is adapter-specific.** The adapter SKILL.md tells you how — for Claude that's the Artifact tool; for other adapters, follow whatever "show this file inline" mechanism the adapter documents. If no such mechanism exists, print the absolute path and instruct the user to open it in a browser.
+
+Stage 8 is presentation-only. It does not modify the Sentinel, does not gate anything, and does not consume additional tool calls beyond the single Python invocation. Failure to render (e.g. malformed YAML the renderer chokes on) is a signal Stage 5 missed something — surface the error and continue; do not silently swallow.
+
+### Stage 9 — Review (rubric-gen + cold grading)
+
+Stage 9 attaches a semantic-quality review to every fresh compile. It's advisory — `/mechanize` completes either way — but it puts the review artifact right next to the Sentinel so a human doesn't have to remember to invoke a separate skill (which nobody remembers to do). Two subagents, deliberately split:
+
+- **9a is warm.** It has the compile context. Its job is to generate the *rubric*, not to grade against it. A rubric written blind to what the Sentinel actually claims is a generic checklist; a rubric written with context can ask the right specific questions.
+- **9b is cold.** It sees only the Sentinel directory and the rubric 9a produced. It never sees the compile context or the source session. The whole point of splitting is that the reasoning that generated the rubric doesn't also grade against it — otherwise the review inherits the compiler's blind spots.
+
+The taxonomy + base rubrics live in `common/mechanize/review.py` — the same module both subagents invoke. This is what makes reviews of two capacity-shaped Sentinels comparable to each other, and prevents rubric drift from silently loosening review across compiles.
+
+#### Stage 9a — Rubric generation (warm)
+
+Fetch the instructions and hand them to a warm subagent:
+
+```
+python3 <repo-root>/common/mechanize/review.py rubric-gen-instructions <OUT_DIR>
+```
+
+This prints a self-contained prompt: taxonomy classification (which base rubric applies), the base rubric text verbatim, the node inventory, and the rules for the appendix + falsifier. Spawn a warm subagent using whatever mechanism the adapter SKILL.md documents for warm subagents (context-carrying task delegation). Pass the printed prompt as the subagent's task. The subagent writes `<OUT_DIR>/rubric.md` and returns.
+
+Structure `rubric.md` must have:
+1. **Base rubric** — reproduced verbatim from `review.py base-rubric <bucket>`. Cross-Sentinel comparability depends on this being byte-identical across Sentinels of the same class.
+2. **Appendix — specific to this Sentinel.** 2–5 items targeting the actual node ids, capability choices, function bodies, or rationale claims that a domain expert would ask about *this* Sentinel. Each with a one-line question, an explicit PASS criterion, and a pointer to specific evidence.
+3. **Falsifier.** At least one item the Sentinel, as compiled, plausibly FAILS. A rubric with only pass-shaped items is theater; the falsifier is the hedge against rubric softness. Frame as a question anchored to specific evidence, not a prosecution.
+
+If the adapter has no warm-subagent mechanism, fall back to running Stage 9a inline (compiler generates the rubric directly) and note the degradation in `rationale.md`'s Unresolved subsection. Inline generation still beats no rubric.
+
+#### Stage 9b — Cold grading
+
+Fetch the grading instructions and hand them to a cold subagent (same mechanism the adapter documents for Stage 5.5's cold subagent):
+
+```
+python3 <repo-root>/common/mechanize/review.py grade-instructions <OUT_DIR>
+```
+
+This prints the cold reviewer's task: read `sentinel.yaml`, `rationale.md`, `functions/`, and `rubric.md` in the Sentinel directory. Grade each rubric item as `PASS`, `FAIL`, or `PARTIAL` with specific evidence. Write `<OUT_DIR>/review.md`.
+
+**No overall verdict word.** `review.md` does not open with APPROVE / REVISE / REJECT. A single-word verdict trains readers to skim past the details — worse than no verdict, because it costs credibility every time it's overridden. Emit per-item comments grouped by section (Base / Appendix / Falsifier). The pattern of PASS/FAIL/PARTIAL is the signal; the human reader decides what to do with it.
+
+Every non-PASS verdict must cite specific evidence — a bare "FAIL" without pointing to a node id, function file, or rationale claim is not a review.
+
+If the adapter has no cold-subagent mechanism, Stage 5.5's degradation footnote applies here too: run inline, flag the degradation in `rationale.md` under Unresolved. But a Stage 9b run inline by the compiler is nearly worthless — the whole point is the cold read. Prefer to skip Stage 9b entirely and note that in the output rather than pretend an inline pass is a cold review.
+
+#### Stage 9 outputs
+
+Both stages add files to `<OUT_DIR>` — nothing outside the Sentinel directory changes:
+
+- `preview.html` (from Stage 8)
+- `rubric.md` (from Stage 9a)
+- `review.md` (from Stage 9b, or absent with an explanation if degraded)
+
+Stage 9 does NOT gate anything. `metadata.ratification` is set by Stage 5.5 only. If `review.md` contains FAILs the user cares about, that's a signal to iterate the compile or to hand-fix the Sentinel — not something `/mechanize` decides for them.
+
+#### Extending Stage 7's final message
+
+When Stage 7's final summary lists the files written, append:
+
+- The `preview.html` path plus how to open it (adapter-specific — Artifact, browser link, etc.)
+- The `rubric.md` bucket and item count
+- The `review.md` PASS/FAIL/PARTIAL counts (if 9b ran) — as a *count*, not a verdict
+
 ## Known capability registry
 
 Emit only these capability IDs (per §10 abstract-capability rule). Do NOT emit vendor-shaped IDs (`lakerunner.*`, `datadog.*`, etc.).
