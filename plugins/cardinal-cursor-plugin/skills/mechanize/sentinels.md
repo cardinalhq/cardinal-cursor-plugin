@@ -565,15 +565,17 @@ Generated functions must:
 * declare network and filesystem permissions;
 * be content-addressed.
 
-Function signature:
+Function signature (v0, Python):
 
-export async function run(input: unknown): Promise<unknown>
+def run(inp: dict[str, Any]) -> dict[str, Any]
+
+The runtime loads the module named by `config.source`, resolves the `run` attribute, and invokes it as `run(args)` where `args` is the fully-rendered `config.arguments` mapping — a single positional dict. Function bodies destructure by argument name from `inp` (`x = inp["x"]`). Signatures like `def run(x: dict)` — even when `x` matches the sole argument key — are silently miscalled to `run({"x": {...}})`; the single-`inp`-dict form is the only shape the runtime calls correctly. Missing keys in `inp` MUST raise (KeyError/TypeError) rather than defaulting to empty values.
 
 The compiler must generate:
 
-functions/<node-id>.mjs
-tests/<node-id>.test.mjs
-fixtures/<node-id>/*.json
+functions/<node-id>.py
+
+Future runtimes MAY declare a different entrypoint shape (e.g. JS `export async function run(input): Promise<...>` colocated with `tests/<node-id>.test.mjs` and `fixtures/<node-id>/*.json`); such a runtime MUST declare its shape in this section before it is accepted by the executor.
 
 Function nodes may not silently execute arbitrary shell commands.
 
