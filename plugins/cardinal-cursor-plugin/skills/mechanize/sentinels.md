@@ -444,9 +444,13 @@ spec:
           dedupeKey: >
             ${inputs.service}:${nodes.get-deployment.output.deploymentId}
           evidence:
-            - "${nodes.get-deployment.output}"
-            - "${nodes.compare-rates.output}"
-            - "${nodes.assess-causality.output}"
+            - nodeRef: get-deployment
+              field: output
+            - nodeRef: compare-rates
+              field: relativeIncrease
+            - nodeRef: assess-causality
+              field: output
+              optional: true
   outputs:
     finding:
       value: "${nodes.emit-finding.output}"
@@ -641,6 +645,29 @@ interface Finding {
   evidence: EvidenceReference[];
   attributes?: Record<string, unknown>;
 }
+
+An EvidenceReference names an upstream node and, optionally, one field of its
+output. It is authored as a mapping, never as a `${...}` interpolation string:
+the string form cannot express `optional`, and an emit node must be able to
+cite evidence from a node that may legitimately not have run.
+
+interface EvidenceReference {
+  nodeRef: string;            // an id under spec.nodes
+  field?: string;             // a field of that node's output; "output" or absent = the whole output
+  optional?: boolean;         // default false
+}
+
+At execution the runtime resolves each reference and records `value` plus
+`resolved`. A reference whose `optional` is false and which does not resolve
+must fail the emit node. A malformed reference — anything that is not a mapping
+carrying `nodeRef` — must also fail the node. Silently dropping a reference the
+runtime does not recognize produces a finding whose evidence list is empty but
+whose severity is unchanged, which is indistinguishable from a conclusion that
+genuinely had no evidence behind it.
+
+Severity may be given as a literal `severity` or computed by a
+`severityExpression`, not both. A severity that resolves to anything outside the
+three permitted values must fail the emit node rather than default to `info`.
 
 The runtime must deduplicate findings using:
 

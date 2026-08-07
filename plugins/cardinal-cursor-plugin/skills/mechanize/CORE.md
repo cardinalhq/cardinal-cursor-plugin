@@ -122,7 +122,13 @@ spec:
         finding:
           type: deployment-error-regression
           title: "Error regression after deployment for ${inputs.service}"
+          severity: warning
           dedupeKey: "${inputs.service}:${nodes.get-deployment.output.deploymentId}"
+          evidence:
+            - nodeRef: compare-rates
+              field: output
+            - nodeRef: get-deployment
+              field: deploymentId
   outputs:
     finding:
       value: "${nodes.emit-finding.output}"
@@ -141,6 +147,11 @@ Note the shape:
 - Explicit output contract per node (schema shape).
 - Explicit capability contract (abstract IDs, not vendor tool names).
 - Variation points declared up front.
+- **Evidence as `{nodeRef, field}` mappings — never `"${nodes.x.output}"` strings.** The
+  string form cannot express `optional` or field selection, and the runtime refuses it.
+  A finding whose evidence silently resolved to `[]` is a severity-bearing conclusion
+  backed by nothing; §14 makes both the shape and the refusal normative.
+- **Severity as a literal `severity:` OR a computed `severityExpression:`, never both.**
 
 ## Compilation flow — stages that live in this file
 
@@ -401,6 +412,28 @@ Write these files to `OUT_DIR`:
 3. `rationale.md` — for each retained node: which tool_use ordinal(s) it derived from, why this node kind, what was preserved verbatim, what was generalized, what was guessed. Also list every tool call NOT retained with its classification and rationale. Include an `Attachment handling` subsection per Stage 4.5 and a `Code-reading option chosen` subsection per Stage 2.5. For each function node, name in the rationale whether its body was **generated** (M-pattern impl) or is a **stub** (operator must fill in).
 4. `audit.jsonl` — per §47, one entry per capture event with the compiler's decision. Skip if too expensive — but the rationale.md is mandatory.
 
+Plus the three files Stage 10 consumes. **These are not optional.** Without them the Sentinel cannot be trial-executed, and a Sentinel nobody has run is a guess:
+
+5. `inputs.json` — the input bindings the source investigation actually used. Values come from the session, not from imagination: if the operator queried `checkout-api` over a 1h window, that is what goes here.
+6. `fixtures/<node-id>.json` — for every `kind: tool` node, the captured `tool_result` that node derived from, written **verbatim**. This is the same "do NOT invent tool outputs" rule as everywhere else, and it bites hardest here: a fixture you made up produces a trial that proves nothing while looking green. If a node's capture is unavailable (spilled and unrecoverable, or the tool errored), say so in the rationale and let the trial fail T2 — do not synthesize one.
+7. `expectation.json` — Stage 11's ground truth, distilled from the session's terminal conclusion:
+
+```json
+{
+  "sourceSession": "<short session id>",
+  "conclusion": "<one line: what the original investigation concluded>",
+  "expectFindings": [
+    {"emitNode": "emit-health-finding",
+     "type": "deployment-health-summary",
+     "severity": "warning",
+     "evidenceNodes": ["compute-health-summary"]}
+  ],
+  "expectNoFindings": ["emit-reconciliation-finding"]
+}
+```
+
+`expectFindings` lists the emit nodes the original investigation's conclusion reached; `expectNoFindings` lists the ones it explicitly did not. `type`, `severity`, and `evidenceNodes` are checked only when present — state them when the session's conclusion actually pins them, and leave them out rather than guessing. An `expectation.json` that asserts nothing fails Stage 11 by design.
+
 **Function-body emission rules.** The Sentinel ships as a directory, not a single file — every `source: functions/<node-id>.py` reference must resolve to a real file next to `sentinel.yaml`. The executor loads them by re-rooting `source` at the Sentinel's directory (per `spike/executor/executor.py load_function`).
 
 For each function node, pick one:
@@ -564,6 +597,80 @@ When Stage 7's final summary lists the files written, append:
 - The `rubric.md` bucket and item count
 - The `review.md` PASS/FAIL/PARTIAL counts (if 9b ran) — as a *count*, not a verdict
 
+### Stage 10 — Trial execution (§29 stage 10)
+
+**The compiler runs what it emits. A compile that has not executed is not finished.**
+
+Everything through Stage 9 checks the Sentinel against *rules* — schema, references, graph shape, the R1–R6 checklist, a rubric. None of it checks the Sentinel against *reality*. That gap is not theoretical: it is how a Sentinel that emitted a `critical` finding with an empty evidence list passed every gate, deployed to production, and was discovered by reading pod logs. Stage 10 closes it.
+
+Run:
+
+```
+python3 <repo-root>/common/mechanize/trial.py <OUT_DIR>
+```
+
+The command executes the Sentinel twice against the fixtures you wrote in Stage 7, through the same `serve` path production runs, and prints a verdict block. It exits 0 on `TRIAL: PASSED`, 1 on `TRIAL: FAILED`, 2 if the harness itself could not run.
+
+The trial is **hermetic**: it synthesizes a deployment binding every capability to the `fixture` provider, so it reaches the network for nothing. A compile-time check that quietly queried production would be worse than no check.
+
+Nine checks, T1–T9:
+
+| | Check | Fails when |
+|---|---|---|
+| T1 | trial-inputs | `inputs.json` is missing or leaves a required input unbound |
+| T2 | fixture-coverage | a tool node has no captured fixture, or a fixture is not valid JSON |
+| T3 | executable-bodies | a function body is still a `NotImplementedError` stub, or an ungated `llm`/`ask_human` node makes the DAG unrunnable |
+| T4 | execution-completes | any node ends FAILED or CANCELLED (`when:`-gated SKIPs are fine and are reported) |
+| T5 | determinism | two runs against identical fixtures disagree — a time-varying `dedupeKey` or a non-deterministic function body |
+| T6 | evidence-populated | a finding carries no evidence, fewer entries than declared, or a required entry that resolved to null |
+| T7 | attributes-resolved | a rendered attribute or title collapsed to the literal string `"null"` |
+| T8 | conclusion-reached | an expected emit node produced nothing, or one that should not have fired did |
+| T9 | conclusion-matches | a finding's type, severity, or evidence nodes diverge from the original conclusion |
+
+T1–T3 are preflight; if any fails the DAG is not run, because a second, noisier failure downstream would say less than the first one. T4–T7 are Stage 10 proper. T8–T9 are Stage 11.
+
+The harness writes `<OUT_DIR>/trial/report.json` with the full node-state map, both runs' findings, and the per-check verdicts. Read it when a check fails — the verdict line names the node, the report shows what it produced.
+
+### Stage 11 — Conclusion comparison (§29 stage 11)
+
+T4 answering "the DAG did not crash" is not the same claim as "the DAG reproduces the reasoning it was distilled from." Stage 11 is the second claim, and it is the one that matters: a Sentinel that emits a finding with the wrong severity, or emits nothing where the operator concluded something, has compiled the *shape* of the investigation and lost its *content*.
+
+Stage 11 runs as part of the same `trial.py` invocation — T8 and T9 above, driven by the `expectation.json` you wrote in Stage 7.
+
+**Stage 11 is not optional and has no silent-skip.** If `expectation.json` is absent, T8 and T9 FAIL rather than skip. (`--allow-missing-expectation` downgrades them to SKIP; that flag is for CI running over already-checked-in Sentinels, never for a fresh compile.) A compiler that could not state what the investigation concluded did not understand the investigation well enough to compile it.
+
+### Stage 12 — Artifact disposition (§29 stage 12)
+
+Stamp the trial result into `sentinel.yaml` so no downstream consumer — executor, PR review, matcher, human — has to guess whether this artifact has ever run:
+
+```yaml
+metadata:
+  name: <sentinel name>
+  version: <version>
+  trial:
+    status: passed | failed
+    ranAt: <RFC3339 timestamp>
+    checks: "T1-T9"
+    unresolved:            # present only when status: failed
+      - <Tn>: <one-line reason>
+```
+
+**On `TRIAL: PASSED`** — stamp `status: passed` and report the compile as complete.
+
+**On `TRIAL: FAILED`** — you have a compile that did not finish. In order:
+
+1. **Iterate once.** Most trial failures are compiler bugs with obvious fixes: an evidence ref pointing at the wrong field, an input the fixture doesn't satisfy, a stub body that a Stage 3.5 M-pattern should have generated. Fix and re-run Stage 10. This is a Stage 6 iteration and the node-ID freeze still applies.
+2. **If it still fails**, emit the artifact with `metadata.trial.status: failed` and every unresolved check listed, and say so plainly in the final message — which check failed, on which node, and what a human would have to do about it.
+
+Do **not** report a compile as successful, and do **not** describe a Sentinel as ready to deploy, when the trial did not pass. The whole point of Stage 10 is that `/mechanize` either hands the operator something proven or tells them why it couldn't. An unrun Sentinel presented as a finished one is the failure mode this stage exists to end.
+
+#### Extending Stage 7's final message, again
+
+Alongside the Stage 9 additions, the final summary must state:
+
+- The trial verdict — `PASSED` or `FAILED` — and for a failure, which checks failed.
+- What the trial actually exercised: node count executed, findings emitted, and the conclusion it was compared against.
+
 ## Known capability registry
 
 Emit only these capability IDs (per §10 abstract-capability rule). Do NOT emit vendor-shaped IDs (`lakerunner.*`, `datadog.*`, etc.).
@@ -633,11 +740,17 @@ Test: read the node ID out loud without any surrounding context. If it doesn't a
 - Do NOT gate `llm` or `ask_human` nodes with `when:` on their own inputs — §32 prohibits this.
 - Do NOT read prior compilation outputs of the same session (if any exist in the OUT_DIR from a previous run) before writing your own.
 - Do NOT skip the rationale.md. Without it, no reviewer can tell whether the compilation was honest.
+- Do NOT emit `evidence:` as `"${nodes.x.output}"` strings. Mappings of `{nodeRef, field, optional}` per §14 — the runtime refuses the string form.
+- Do NOT synthesize a fixture. Stage 10's fixtures are captured tool_results, verbatim. A made-up fixture produces a green trial that proves nothing, which is strictly worse than a red one.
+- Do NOT skip Stage 10, and do NOT report a compile as successful when the trial failed. "It validates" is not "it runs", and "it runs" is not "it reaches the same conclusion."
 
 ## Success criterion
 
 You produced:
 - A `sentinel.yaml` that is structurally valid, OR a `refusal-report.md` that honestly explains why compilation didn't complete.
 - A `rationale.md` that a human reader could use to audit every compilation decision, including the code-reading option chosen (Stage 2.5), the attachment disposition (Stage 4.5), and the analytical-node kind selection per §32 (Stage 4).
+- A trial verdict — `metadata.trial.status` stamped, and for a failure, the unresolved checks named.
 
 If a human reads the rationale and says "yes, this is what the investigation was, and here's why these nodes exist" — the compilation succeeded. If they say "this is a plausible-looking DAG but doesn't match what I did" — the compiler surfaced a weakness worth flagging.
+
+Note what the two halves check. The rationale is a claim a human audits; the trial is a claim a machine audits. Neither substitutes for the other: a Sentinel can execute cleanly and still be a faithless compilation of the session, and a Sentinel can be a beautiful account of the investigation that has never once run. Stage 10 exists because until it did, only the first kind of failure was ever caught — the second kind shipped.

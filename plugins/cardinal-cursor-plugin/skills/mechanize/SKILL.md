@@ -1,13 +1,13 @@
 ---
 name: cardinal-mechanize
-description: Compile a completed Cursor session (a past investigation) into a candidate Sentinel DAG plus rationale — a reusable procedure that could later be executed against a similar problem. Use when the user asks to /mechanize, compile a session, or extract a reusable investigation procedure. Spike-quality; produces YAML + rationale, does not execute anything.
+description: Compile a completed Cursor session (a past investigation) into a candidate Sentinel DAG plus rationale — a reusable procedure that could later be executed against a similar problem. Use when the user asks to /mechanize, compile a session, or extract a reusable investigation procedure. Compiles, then trial-executes the DAG against captured fixtures and checks it reaches the same conclusion the investigation did before emitting.
 ---
 
 # mechanize (Cursor) — compile a Cursor session into a Sentinel DAG
 
-**Spike-quality compiler.** Produces a candidate `sentinel.yaml` + `rationale.md` from a past investigation session. Does NOT execute the Sentinel; that's a separate executor. Does NOT ship — this is exploratory work, and the rationale is where the honesty lives.
+**Spike-quality compiler.** Produces a candidate `sentinel.yaml` + `rationale.md` from a past investigation session, then **runs it** — Stage 10 executes the DAG against the tool responses captured from the source session, and Stage 11 checks it reaches the conclusion the investigation reached. A compile that has not executed is not finished, and the skill reports it as such. Does NOT ship — this is exploratory work, and the rationale is where the honesty lives.
 
-This SKILL.md is the **Cursor-specific** part of the mechanize skill. The shared compilation algorithm — Stages 2 through 7, the Sentinel example, the ratification checklist, the expression language, the capability registry, the rules — lives in `CORE.md`, co-located in this directory.
+This SKILL.md is the **Cursor-specific** part of the mechanize skill. The shared compilation algorithm — Stages 2 through 12, the Sentinel example, the ratification checklist, the expression language, the capability registry, the rules — lives in `CORE.md`, co-located in this directory.
 
 ## Known blocker — read this first
 
@@ -133,9 +133,9 @@ Reachable only via Escape hatch B. Cursor exposes no subagent-spawning mechanism
 
 ## Now continue with CORE.md
 
-If you reached this point, you entered via Escape hatch B and have a segmented mental model. Continue at **CORE.md Stage 2** and follow through Stage 9 with the Cursor addenda above (path-only preview at Stage 8, inline 9a, skipped 9b at Stage 9).
+If you reached this point, you entered via Escape hatch B and have a segmented mental model. Continue at **CORE.md Stage 2** and follow through Stage 12 (Stage 10's trial execution is a plain `python3` invocation, needing only this agent's shell-shaped tool) with the Cursor addenda above (path-only preview at Stage 8, inline 9a, skipped 9b at Stage 9).
 
-Do NOT skip any of Stages 2 through 7. Do NOT hallucinate rules that aren't in CORE.md.
+Do NOT skip any of Stages 2 through 12. In particular, do NOT stop after Stage 9 and report success: Stage 10 is what turns a plausible-looking DAG into one that has actually run, and Stage 11 is what turns one that ran into one that ran *correctly*. Do NOT hallucinate rules that aren't in CORE.md.
 
 ## Success criterion
 
