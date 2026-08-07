@@ -145,7 +145,7 @@ Note the shape:
 - Explicit expressions using `${inputs.x}`, `${nodes.y.output.z}`, `${execution.now}`.
 - Explicit input contract with types and defaults.
 - Explicit output contract per node (schema shape).
-- Explicit capability contract (abstract IDs, not vendor tool names).
+- Explicit capability contract. (The ids in this example are illustrative; per Stage 2.1 a real compile records each tool node's OBSERVED tool identity from the transcript, verbatim.)
 - Variation points declared up front.
 - **Evidence as `{nodeRef, field}` mappings — never `"${nodes.x.output}"` strings.** The
   string form cannot express `optional` or field selection, and the runtime refuses it.
@@ -169,7 +169,22 @@ For each tool call, assign exactly one:
 - **LOCAL_ONLY** — depends on operator's local machine state that cannot be parameterized. Omit or convert to input.
 - **COLLAPSED** — spill-projection call absorbed into a preceding REQUIRED/SUPPORTING node per Stage 1.5. Do NOT double-classify.
 
-**Synthetic capability IDs for shell-shaped tool calls.** Many agents expose a general-purpose shell/exec tool. When a tool call is such a shell call, derive a synthetic capability ID from `argv[0]`: `bash.grep`, `bash.kubectl`, `bash.git`, `bash.gh`, `bash.jq`, `bash.find`, `bash.ls`, `bash.cat`, `bash.mv`, `bash.curl`, `bash.python`. Preserve the raw tool name; add the synthetic ID for capability binding. The adapter SKILL.md names which of its tools count as shell-shaped.
+**Synthetic capability IDs for shell-shaped tool calls — audit-log labels only.** Many agents expose a general-purpose shell/exec tool. When a tool call is such a shell call, derive a synthetic label from `argv[0]` (`bash.grep`, `bash.kubectl`, `bash.jq`, …) and record it in the audit log so a reviewer can see at a glance what kind of work the call did. These labels are **classification aids, not capabilities**: a shell call never becomes a `kind: tool` node and its label never appears in `spec.capabilities.required` — Stage 2.1 compiles it to a generated `function` node. (This supersedes the spike-era F5 rule that used these ids for capability binding; `bash.grep` is precisely the kind of invented capability no provider implements.)
+
+### Stage 2.1 — MCP-backed tools become `tool` nodes; everything else becomes `function`
+
+**This is the rule that decides whether a retained action is `kind: tool` or `kind: function`, and it is not a judgment call.**
+
+**There is no capability registry.** A Sentinel's capability inventory is derived from the session transcript — it is an *observation*, not a vocabulary lookup. For each REQUIRED/SUPPORTING action:
+
+1. **Was it an MCP tool call?** In most agents MCP tools carry a distinguishing prefix (in Claude Code, `mcp__<server>__<tool>`). If yes, emit a `kind: tool` node whose capability id **is the observed tool identity** (e.g. `lakerunner__execute_logs_query`), recorded verbatim from the transcript. Do not rename it, do not abstract it, do not consult any list. The deployment binds it to a provider at deploy time; the runtime's provider registrations decide servability there (the `mcp` provider passes the id through as the gateway tool name).
+2. **Was it anything else** — a built-in agent tool (web fetch, file read, HTTP call), a shell call, a bespoke API poke? **Emit a `kind: function` node and generate the code.** Do NOT invent a capability ID for it. The Sentinel ships the implementation next to `sentinel.yaml` exactly as it does for every other function node, and `deployment.yaml` grants `network: enabled` for that node when it needs to reach out.
+
+**Do NOT invent a capability to model a non-MCP tool, and do NOT mint abstract capability names.** Both halves of this rule come from the same shipped failure: a session that used a built-in web-fetch tool compiled to a `tool` node with a freshly-minted abstract capability id, which no provider implemented and no list contained. It passed the compiler's own checks and then died at runtime. Observed identities and generated code have none of that problem — there is nothing to register, nothing to keep in sync, and nothing that can drift.
+
+(Historical note: four pre-decision Sentinels use abstract ids — `observability.query-metrics` and siblings. The `mcp` provider keeps a legacy alias map for exactly those four; new compiles never add to it.)
+
+**Consequence for the trial (Stage 10).** Tool nodes are stubbed from `fixtures/<node-id>.json`, so they stay hermetic for free. A function node that reaches the network does not, and the trial runs functions with `network: disabled`. If a generated function's only job is the outbound call, either split it — one function performing the call, a second doing the deterministic parse the conclusion actually rests on — and trial the parse against the captured payload, or state plainly in the rationale that the fetch is untrialable and which check that weakens. Never let a network-reaching function run live during a trial.
 
 ### Stage 2.5 — Code-reading compression policy
 
@@ -349,7 +364,7 @@ The checklist below documents what each rule enforces, so a human reviewer can a
 
 **R1. Variation-point completeness.** For every input under `spec.inputs` that has a `default:` AND is templated anywhere in the YAML as `${inputs.<name>}` (in a tool argument, function argument, or expression), there MUST be an entry in `spec.variationPoints[]` with `path: /spec/inputs/<name>/default` and a non-empty `operations:` list (typically `[replace]`, or `[bind]` for identity-shaped inputs like a service selector). Missing entries FAIL — cite the offending input name(s) and the tool/function node(s) that reference them.
 
-**R2. Capability-ID abstraction.** Every `spec.capabilities.required[].id` MUST use an abstract prefix listed in the "Known capability registry" section below (`observability.*`, `code.*`). Vendor-shaped IDs (`lakerunner.*`, `datadog.*`, `prometheus.*`, `grafana.*`, etc.) FAIL. If a needed abstract capability isn't in the registry, the ID must appear in a `capability-registry-extension-needed` note in `rationale.md`; a vendor-shaped ID with no such rationale note FAILS.
+**R2. Capability well-formedness.** Every entry in `spec.capabilities.required[]` MUST be a mapping with a unique, non-empty string `id`. That is the whole rule: capability inventories are transcript-derived (Stage 2.1), so there is no vocabulary to check ids against at compile time — the id is the observed tool identity, and whether a (capability, provider) binding is servable is a deploy-time question (sentinel-lint R10 answers it from the runtime's provider registrations). Malformed entries, empty ids, and duplicate ids FAIL.
 
 **R3. Function-vs-LLM discipline.** Every `kind: llm` node MUST have a rationale paragraph in `rationale.md` explicitly justifying why it isn't `kind: function` per §32. An `llm` node without that justification FAILS.
 
@@ -671,18 +686,9 @@ Alongside the Stage 9 additions, the final summary must state:
 - The trial verdict — `PASSED` or `FAILED` — and for a failure, which checks failed.
 - What the trial actually exercised: node count executed, findings emitted, and the conclusion it was compared against.
 
-## Known capability registry
+## Capability IDs — transcript-derived, no registry
 
-Emit only these capability IDs (per §10 abstract-capability rule). Do NOT emit vendor-shaped IDs (`lakerunner.*`, `datadog.*`, etc.).
-
-- `observability.list-services` — enumerate services matching a filter
-- `observability.error-overview` — per-service error rollup
-- `observability.query-metrics` — time-series metric query
-- `observability.query-logs` — LogQL-shaped log query
-- `code.grep` — recursive grep over a filesystem path
-- `code.read` — read a file
-
-Rule: when the SKILL wants to emit a capability whose ID isn't in this table, it must either (a) map to an existing compatible one, or (b) declare it and flag `capability-registry-extension-needed` in the rationale.
+There is no capability registry and no canonical id table. A tool node's capability id is the **observed tool identity recorded from the session transcript** (Stage 2.1): for an MCP call, the gateway tool name (`lakerunner__execute_logs_query`); nothing else produces a tool node at all. Do not invent abstract families (`observability.*`, `web.*`), do not map observed names onto them, and do not maintain any list to extend. Reuse across backends is a Variation concern — §21 tool-binding replacements rebind a node to a different provider without renaming what the source session observed.
 
 ## Expression language
 
@@ -735,7 +741,7 @@ Test: read the node ID out loud without any surrounding context. If it doesn't a
 - Do NOT rename node IDs after Round 1 iteration (Stage 6 freeze).
 - Do NOT treat spill-projection calls as INCIDENTAL — collapse them per the adapter's Stage 1.5.
 - Do NOT invent expression-language functions beyond those enumerated above.
-- Do NOT emit vendor-shaped capability IDs (`lakerunner.*`, `datadog.*`) — use the abstract registry above.
+- Do NOT mint capability IDs of any shape — a tool node's id is the observed MCP tool identity from the transcript, verbatim (Stage 2.1); everything non-MCP compiles to a generated function node with no capability at all.
 - Do NOT emit function-node runtimes other than `python3.12` for v0.
 - Do NOT gate `llm` or `ask_human` nodes with `when:` on their own inputs — §32 prohibits this.
 - Do NOT read prior compilation outputs of the same session (if any exist in the OUT_DIR from a previous run) before writing your own.
