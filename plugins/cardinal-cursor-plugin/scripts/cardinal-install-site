@@ -1,0 +1,622 @@
+#!/usr/bin/env python3
+"""cardinal-install-site — drive the Cardinal site-install flow via the maestro
+control-plane API, authenticated by the user-scoped `maestro:act` token.
+
+This is a subcommand tool with JSON output. The SKILL.md (the model) holds the
+conversation — asks which org, confirms the helm command, etc. — and calls these
+subcommands via Bash. The split mirrors cardinal-status: the bin does discrete,
+testable operations; the model orchestrates.
+
+Auth: the act token is sent as `X-CardinalHQ-API-Key` (the maestro_api_keys
+path — NOT Bearer, which is OIDC/psk only), plus `X-Org-Id` on org-scoped routes.
+The token lives 0600 in cardinal-secrets.json (written by
+`cardinal-connect`).
+
+Security invariant: the per-site `psk_` install key is NEVER printed to stdout.
+`install-perch` fetches it and runs `helm` itself so the plaintext never enters
+the model's transcript. `--dry-run` renders the command with the key redacted.
+
+Every subcommand prints one JSON object: `{"ok": true, ...}` on success or
+`{"ok": false, "error": "...", "hint": "..."}` on failure, and exits non-zero on
+failure so the model can branch on the exit code too.
+"""
+
+import argparse
+import http.client
+import json
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+CURSOR_DIR = Path.home() / ".cursor"
+SECRETS_PATH = CURSOR_DIR / "cardinal-secrets.json"
+# Per-site reservation keys (idempotency for the lakerunner reserve→install).
+# Not secret; kept so a resumed add-lakerunner reuses the same key.
+INSTALLS_PATH = CURSOR_DIR / "cardinal-installs.json"
+
+PERCH_CHART = "oci://public.ecr.aws/cardinalhq.io/perch"
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+def emit(obj: dict) -> None:
+    print(json.dumps(obj, indent=2))
+
+
+def fail(error: str, hint: str | None = None, **extra) -> "NoReturn":  # type: ignore[name-defined]
+    out = {"ok": False, "error": error}
+    if hint:
+        out["hint"] = hint
+    out.update(extra)
+    emit(out)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Token + HTTP
+# ---------------------------------------------------------------------------
+
+def load_token() -> tuple[str, str]:
+    """Return (act_api_key, endpoint) or fail with a connect hint."""
+    if not SECRETS_PATH.exists():
+        fail(
+            "no_act_token",
+            "Run `cardinal-connect` first to mint a "
+            "control-plane token.",
+        )
+    try:
+        data = json.loads(SECRETS_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        fail("secrets_unreadable", f"{SECRETS_PATH} is missing or malformed.")
+    key = data.get("act_api_key")
+    endpoint = data.get("act_endpoint")
+    if not key or not endpoint:
+        fail(
+            "no_act_token",
+            "cardinal-secrets.json has no act token. Re-run "
+            "`cardinal-connect`.",
+        )
+    return key, endpoint.rstrip("/")
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, body: dict | str):
+        self.status = status
+        self.body = body
+        super().__init__(f"HTTP {status}")
+
+
+def api(
+    method: str,
+    path: str,
+    token: str,
+    endpoint: str,
+    org: str | None = None,
+    body: dict | None = None,
+    timeout: float = 30.0,
+) -> dict:
+    """One maestro API call. Raises ApiError on non-2xx."""
+    url = endpoint + path
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"X-CardinalHQ-API-Key": token}
+    if org:
+        headers["X-Org-Id"] = org
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode()
+            if not raw.strip():
+                return {}
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                # A 2xx with a non-JSON body is off-contract; surface it as an
+                # ApiError so the caller emits a clean JSON error, not a traceback.
+                raise ApiError(resp.status, raw) from None
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode() if e.fp else ""
+        try:
+            parsed = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            parsed = raw
+        raise ApiError(e.code, parsed) from None
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError) as e:
+        raise ApiError(0, f"network error: {e}") from None
+
+
+def _api_err_field(body, *names):
+    if isinstance(body, dict):
+        for n in names:
+            if body.get(n):
+                return body[n]
+    return None
+
+
+def _rows(payload, key: str) -> list:
+    """Normalize a list-or-{key: list} response to a list. An off-contract
+    shape yields [] rather than a downstream AttributeError."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        v = payload.get(key)
+        return v if isinstance(v, list) else []
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Reservation-key persistence
+# ---------------------------------------------------------------------------
+
+def reservation_key_for(site_id: str) -> str:
+    data = {}
+    if INSTALLS_PATH.exists():
+        try:
+            raw = INSTALLS_PATH.read_text()
+        except OSError:
+            # A read failure (permissions, races) must NOT lead to rewriting the
+            # file with only this site — that would wipe every other site's
+            # reservation key and defeat the idempotency this file exists for.
+            fail("installs_unreadable",
+                 f"{INSTALLS_PATH} exists but can't be read. Fix its permissions "
+                 "(or remove it if you have no in-flight installs) and retry.")
+        # A corrupt/non-object file is safe to reset: it holds only reservation
+        # keys, and a resume with a fresh key just reserves anew (idempotent
+        # server-side on the same site).
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    entry = data.get(site_id) or {}
+    key = entry.get("reservation_key")
+    if not key:
+        key = str(uuid.uuid4())
+        data[site_id] = {"reservation_key": key}
+        CURSOR_DIR.mkdir(parents=True, exist_ok=True)
+        INSTALLS_PATH.write_text(json.dumps(data, indent=2) + "\n")
+    return key
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_whoami(args) -> None:
+    token, endpoint = load_token()
+    try:
+        me = api("GET", "/api/me", token, endpoint)
+    except ApiError as e:
+        if e.status == 401:
+            fail("unauthorized", "The act token was revoked or expired. Re-run "
+                 "`cardinal-connect`.")
+        fail("api_error", f"GET /api/me failed ({e.status}).", status=e.status, body=e.body)
+    orgs = me.get("orgs") or []
+    owner = [
+        {"orgId": o["orgId"], "name": o.get("name"), "slug": o.get("slug"), "role": o.get("role")}
+        for o in orgs if o.get("role") == "owner"
+    ]
+    emit({
+        "ok": True,
+        "user": me.get("user") or {"email": None},
+        "owner_orgs": owner,
+        "non_owner_count": len(orgs) - len(owner),
+    })
+
+
+def cmd_list_sites(args) -> None:
+    token, endpoint = load_token()
+    try:
+        sites = api("GET", f"/api/orgs/{args.org}/sites", token, endpoint, org=args.org)
+    except ApiError as e:
+        _org_route_error(e)
+    rows = _rows(sites, "sites")
+    emit({"ok": True, "sites": [
+        {"siteId": s.get("siteId"), "name": s.get("name"),
+         "status": s.get("status"), "namespace": s.get("workloadNamespace"),
+         "mode": s.get("mode")}
+        for s in (rows or [])
+    ]})
+
+
+def cmd_create_site(args) -> None:
+    token, endpoint = load_token()
+    body = {
+        "name": args.name,
+        # ALWAYS operator_managed — a self_managed site 409s at add-lakerunner
+        # (site_not_operator_managed), long after install.
+        "mode": "operator_managed",
+        "workloadNamespace": args.namespace,
+    }
+    try:
+        res = api("POST", f"/api/orgs/{args.org}/sites", token, endpoint, org=args.org, body=body)
+    except ApiError as e:
+        if e.status == 403:
+            fail("not_owner", "Only an org owner can create a site. Your token "
+                 "resolved to a non-owner role for this org.")
+        # Only a 400/409 is a name collision. A 500 that happens to leak a DB
+        # "unique" string must not be mislabeled as "name already exists".
+        if e.status in (400, 409) and (
+            e.status == 409 or "unique" in str(e.body).lower()
+        ):
+            fail("name_taken", f"A site named {args.name!r} already exists in this "
+                 "org. Use `list-sites` and resume it, or pick another name.")
+        _org_route_error(e)
+    site = res.get("site") or {}
+    emit({
+        "ok": True,
+        "siteId": site.get("siteId"),
+        "name": site.get("name"),
+        "namespace": args.namespace,
+        # The psk is deliberately NOT returned. install-perch re-fetches it.
+        "next": "install-perch",
+    })
+
+
+def _fetch_psk(token: str, endpoint: str, org: str, site: str) -> str:
+    """Recoverable install-key plaintext, valid until perch first phones home.
+
+    bootstrap-step returns { step, site, apiKey?: { plaintext, prefix } }; the
+    key is present only on the `install` step (before first phone-home).
+    """
+    try:
+        step = api("GET", f"/api/orgs/{org}/sites/{site}/bootstrap-step",
+                   token, endpoint, org=org)
+    except ApiError as e:
+        if e.status == 404:
+            fail("site_not_found", "No such site in this org.")
+        _org_route_error(e)
+    key = step.get("apiKey") if isinstance(step.get("apiKey"), dict) else None
+    psk = key.get("plaintext") if key else None
+    if not psk:
+        fail("install_key_unavailable",
+             f"The install key is no longer recoverable (step={step.get('step')!r} "
+             "— perch already registered, or none is active). Rotate it with "
+             "`rotate-key` and retry.")
+    return psk
+
+
+def _render_helm(site_id: str, namespace: str, endpoint: str, psk: str) -> list[str]:
+    return [
+        "helm", "install", "perch", PERCH_CHART,
+        "-n", namespace, "--create-namespace",
+        "--set", f"site.id={site_id}",
+        "--set", f"site.apiKey={psk}",
+        "--set", f"site.endpoint={endpoint}",
+    ]
+
+
+def _preview(cmd: list[str]) -> str:
+    """Human-readable helm command with the install key redacted."""
+    parts = []
+    for a in cmd:
+        if a.startswith("site.apiKey="):
+            parts.append("'site.apiKey=***REDACTED***'")
+        elif " " in a:
+            parts.append(f"'{a}'")
+        else:
+            parts.append(a)
+    return " ".join(parts)
+
+
+def cmd_install_perch(args) -> None:
+    token, endpoint = load_token()
+    psk = _fetch_psk(token, endpoint, args.org, args.site)
+    cmd = _render_helm(args.site, args.namespace, endpoint, psk)
+    preview = _preview(cmd)
+    if args.dry_run:
+        emit({"ok": True, "dry_run": True, "command": preview,
+              "note": "Run without --dry-run to execute. The real key is passed "
+                      "at exec time and never printed."})
+        return
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        fail("helm_missing", "`helm` is not on PATH. Install Helm and retry, or "
+             "run the (redacted) command yourself after `install-perch --dry-run`.")
+    except subprocess.TimeoutExpired:
+        fail("helm_timeout", "helm install timed out after 5m.")
+    if proc.returncode != 0:
+        # helm's stderr may echo --set values; scrub the key before surfacing.
+        scrubbed = proc.stderr.replace(psk, "***REDACTED***")
+        fail("helm_failed",
+             "helm install failed. The site row still exists — fix the cluster "
+             "issue and re-run `install-perch` (the key is still recoverable), or "
+             "`delete-site` to abandon.",
+             command=preview, stderr=scrubbed.strip()[:2000])
+    emit({"ok": True, "command": preview, "next": "wait-perch"})
+
+
+def cmd_wait_perch(args) -> None:
+    token, endpoint = load_token()
+    deadline = time.monotonic() + args.timeout
+    interval = 5.0
+    last = None
+    while time.monotonic() < deadline:
+        try:
+            st = api("GET", f"/api/orgs/{args.org}/sites/{args.site}/bootstrap-status",
+                     token, endpoint, org=args.org)
+        except ApiError as e:
+            if e.status == 404:
+                fail("site_not_found", "No such site in this org.")
+            _org_route_error(e)
+        last = st
+        if st.get("phonedHome"):
+            emit({"ok": True, "phonedHome": True,
+                  "agentVersion": st.get("agentVersion"),
+                  "lastPhonedHomeAt": st.get("lastPhonedHomeAt")})
+            return
+        # Don't overshoot the deadline by a whole interval on the last iteration.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+    fail("timeout",
+         f"Perch has not phoned home after {args.timeout}s. Check the perch pod: "
+         "`kubectl -n <ns> get pods` and `kubectl -n <ns> logs deploy/perch`.",
+         last_status=last)
+
+
+def cmd_add_lakerunner(args) -> None:
+    token, endpoint = load_token()
+    # 1. Resolve a license for this org.
+    try:
+        res = api("POST", f"/api/orgs/{args.org}/sites/{args.site}/workloads/license/resolve",
+                  token, endpoint, org=args.org, body={})
+    except ApiError as e:
+        if e.status == 403:
+            fail("trial_not_eligible",
+                 "This org isn't eligible for a trial license. Contact Cardinal "
+                 "sales, or attach a license before adding a Lakerunner.")
+        if e.status == 404:
+            fail("site_not_found", "No such site in this org.")
+        _org_route_error(e)
+    decision = res.get("decision")
+    if decision == "contact_sales":
+        fail("contact_sales", "No license is available for this org and it needs "
+             "sales involvement. A Lakerunner can't be installed yet.")
+    lic = res.get("license") or {}
+    license_id = lic.get("id")
+    if not license_id:
+        fail("no_license", "License resolution returned no usable license.",
+             decision=decision)
+
+    # 2. Install a managed POC Lakerunner. Managed object-store + Postgres mean
+    #    perch provisions RustFS + pgvector in-cluster; no BYO credentials.
+    reservation_key = reservation_key_for(args.site)
+    body = {
+        "name": args.name,
+        "namespace": args.namespace,
+        "reservationKey": reservation_key,
+        "licenseId": license_id,
+        "lakerunner": {
+            "profile": "poc",
+            "objectStore": {"mode": "managed"},
+            "lrdb": {"mode": "managed"},
+            "configdb": {"mode": "managed"},
+        },
+    }
+    try:
+        out = api("POST", f"/api/orgs/{args.org}/sites/{args.site}/workloads/lakerunner",
+                  token, endpoint, org=args.org, body=body)
+    except ApiError as e:
+        reason = _api_err_field(e.body, "reason", "error")
+        if reason == "site_not_operator_managed":
+            fail("not_operator_managed",
+                 "This site is self-managed, so a managed Lakerunner can't be "
+                 "added. Sites created by this skill are operator-managed; this "
+                 "one wasn't.")
+        if reason == "operator_not_phoned_home":
+            fail("operator_not_phoned_home",
+                 "Perch hasn't checked in yet — run `wait-perch` until it reports, "
+                 "then retry.")
+        if e.status == 400 and reason == "license_not_found":
+            fail("license_not_found", "The resolved license was rejected on install.")
+        if e.status == 409 and reason == "all_slots_used":
+            fail("all_slots_used",
+                 "This org has consumed all its Lakerunner slots. Delete an "
+                 "existing Lakerunner in the Cardinal UI (Sites → Lakerunners) "
+                 "or contact Cardinal to expand the quota, then retry.")
+        _org_route_error(e)
+    emit({"ok": True,
+          "workload": out.get("workload"),
+          "license": out.get("license"),
+          "next": "wait-perch (perch reconciles the new workload), then verify"})
+
+
+def cmd_verify(args) -> None:
+    token, endpoint = load_token()
+    try:
+        wls = api("GET", f"/api/orgs/{args.org}/sites/{args.site}/workloads",
+                  token, endpoint, org=args.org)
+    except ApiError as e:
+        _org_route_error(e)
+    emit({"ok": True, "workloads": _rows(wls, "workloads")})
+
+
+def cmd_connect_info(args) -> None:
+    token, endpoint = load_token()
+    # Guard: the credentials endpoint happily returns forward-looking
+    # port-forward instructions even when no lakerunner/maestro has been
+    # installed for this site. That produces a "success" that silently fails
+    # the moment the user runs the kubectl port-forward. Check that a
+    # lakerunner workload exists first — if not, tell the user to run
+    # `add-lakerunner` before retrying.
+    try:
+        wls = api("GET", f"/api/orgs/{args.org}/sites/{args.site}/workloads",
+                  token, endpoint, org=args.org)
+    except ApiError as e:
+        _org_route_error(e)
+    workloads = _rows(wls, "workloads")
+    # Each row wraps {"workload": {"kind": "lakerunner"|"maestro"|..., ...},
+    # "status": {...}}. add-lakerunner emits both a lakerunner AND a maestro
+    # workload — we key on the lakerunner because that's what the user's
+    # `add-lakerunner` step just created.
+    def _kind(row):
+        w = row.get("workload") if isinstance(row, dict) else None
+        return (w or {}).get("kind")
+    if not any(_kind(w) == "lakerunner" for w in workloads):
+        fail("no_lakerunner",
+             "No Lakerunner workload on this site yet, so there is no maestro "
+             "to connect to. Run `add-lakerunner`, then `wait-perch`, then retry.")
+    try:
+        c = api("GET", f"/api/orgs/{args.org}/sites/{args.site}/workloads/maestro/credentials",
+                token, endpoint, org=args.org)
+    except ApiError as e:
+        reason = _api_err_field(e.body, "reason")
+        if e.status == 409 and reason == "not_ready":
+            fail("not_ready", "Maestro isn't up in the cluster yet — wait for perch "
+                 "to finish reconciling, then retry.")
+        if e.status == 409 and reason == "no_owner":
+            fail("no_owner", "This org has no owner on record, so there's no login "
+                 "identity to hand back. That's a standing misconfiguration — fix "
+                 "the org's ownership rather than retrying.")
+        _org_route_error(e)
+    ns = c.get("namespace")
+    svc = c.get("service")
+    port = c.get("port")
+    emit({
+        "ok": True,
+        "login_email": c.get("email"),
+        "base_url": c.get("baseUrl"),
+        "namespace": ns,
+        "service": svc,
+        "port": port,
+        "port_forward": f"kubectl port-forward -n {ns} svc/{svc} {port}:{port}",
+        "read_password": (
+            f"kubectl get secret {c.get('passwordSecret')} -n {ns} "
+            f"-o jsonpath='{{.data.{c.get('passwordKey')}}}' | base64 -d"
+        ),
+        "note": "Maestro never receives this password — perch mints it inside your "
+                "cluster. The command above reads it from the Secret.",
+    })
+
+
+def cmd_rotate_key(args) -> None:
+    token, endpoint = load_token()
+    try:
+        api("POST", f"/api/orgs/{args.org}/sites/{args.site}/bootstrap-key",
+            token, endpoint, org=args.org, body={})
+    except ApiError as e:
+        reason = _api_err_field(e.body, "reason", "error")
+        if reason in ("site_revoked", "already_registered"):
+            fail(reason, "The install key can't be rotated (site revoked or perch "
+                 "already registered).")
+        _org_route_error(e)
+    emit({"ok": True, "next": "install-perch"})
+
+
+def cmd_delete_site(args) -> None:
+    token, endpoint = load_token()
+    try:
+        api("DELETE", f"/api/orgs/{args.org}/sites/{args.site}",
+            token, endpoint, org=args.org)
+    except ApiError as e:
+        # site-delete has two guards the caller must know how to unblock:
+        # workloads_exist (uninstall the workload first) and
+        # license_claims_exist (delete the leaked license claim first, which
+        # this scope can't reach — needs the Cardinal UI's Deployments page).
+        # Without these hints both come out as a generic "Unexpected API
+        # error (400)" with the reason buried in body.error.
+        reason = _api_err_field(e.body, "error", "reason")
+        if e.status == 400 and reason == "workloads_exist":
+            body = e.body if isinstance(e.body, dict) else {}
+            fail("workloads_exist",
+                 f"Site still has {body.get('workloadCount', '?')} workload(s) "
+                 f"({body.get('presentCount', '?')} present, "
+                 f"{body.get('removedCount', '?')} removed). Uninstall each one "
+                 "before deleting the site.")
+        if e.status == 400 and reason == "license_claims_exist":
+            body = e.body if isinstance(e.body, dict) else {}
+            fail("license_claims_exist",
+                 f"Site is holding {body.get('claimCount', '?')} license claim(s) "
+                 "with no workload attached (leaked from a prior install). This "
+                 "scope can't reach license installations — open the Cardinal UI "
+                 "→ this site → Deployments page and remove the stale claim, "
+                 "then retry.")
+        _org_route_error(e)
+    emit({"ok": True, "deleted": args.site})
+
+
+def _org_route_error(e: "ApiError") -> "NoReturn":  # type: ignore[name-defined]
+    if e.status == 0:
+        fail("network_error", str(e.body))
+    if e.status == 401:
+        fail("unauthorized", "The act token was revoked or expired. Re-run "
+             "`cardinal-connect`.")
+    if e.status == 400 and _api_err_field(e.body, "error") == "org_required":
+        fail("org_required", "This request needs an org context (internal: X-Org-Id).")
+    if e.status == 403:
+        fail("forbidden", "Your token isn't authorized for this org (not a member, "
+             "or lacks the required role).")
+    if e.status == 404:
+        fail("not_found", "Not found (wrong org or site id?).")
+    fail("api_error", f"Unexpected API error ({e.status}).", status=e.status, body=e.body)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="cardinal-install-site")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("whoami")
+
+    s = sub.add_parser("list-sites"); s.add_argument("--org", required=True)
+
+    s = sub.add_parser("create-site")
+    s.add_argument("--org", required=True)
+    s.add_argument("--name", required=True)
+    s.add_argument("--namespace", required=True)
+
+    s = sub.add_parser("install-perch")
+    s.add_argument("--org", required=True)
+    s.add_argument("--site", required=True)
+    s.add_argument("--namespace", required=True)
+    s.add_argument("--dry-run", action="store_true")
+
+    s = sub.add_parser("wait-perch")
+    s.add_argument("--org", required=True)
+    s.add_argument("--site", required=True)
+    s.add_argument("--timeout", type=float, default=300.0)
+
+    s = sub.add_parser("add-lakerunner")
+    s.add_argument("--org", required=True)
+    s.add_argument("--site", required=True)
+    s.add_argument("--name", required=True)
+    s.add_argument("--namespace", required=True)
+
+    for name in ("verify", "connect-info", "rotate-key", "delete-site"):
+        s = sub.add_parser(name)
+        s.add_argument("--org", required=True)
+        s.add_argument("--site", required=True)
+
+    args = p.parse_args()
+    handlers = {
+        "whoami": cmd_whoami,
+        "list-sites": cmd_list_sites,
+        "create-site": cmd_create_site,
+        "install-perch": cmd_install_perch,
+        "wait-perch": cmd_wait_perch,
+        "add-lakerunner": cmd_add_lakerunner,
+        "verify": cmd_verify,
+        "connect-info": cmd_connect_info,
+        "rotate-key": cmd_rotate_key,
+        "delete-site": cmd_delete_site,
+    }
+    handlers[args.cmd](args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
