@@ -21,15 +21,7 @@ Every subcommand prints one JSON object: `{"ok": true, ...}` on success or
 failure so the model can branch on the exit code too.
 """
 
-import sys                        # cardinal:py311-guard
-if sys.version_info < (3, 11):    # cardinal:py311-guard
-    import os, shutil             # cardinal:py311-guard
-    for _p in ("python3.13", "python3.12", "python3.11"):
-        _x = shutil.which(_p)
-        if _x: os.execv(_x, [_x, __file__, *sys.argv[1:]])
-    sys.stderr.write("cardinal: needs Python >=3.11 (found "
-        + sys.version.split()[0] + "). Try: brew install python@3.11\n")
-    sys.exit(1)                   # cardinal:py311-guard
+from __future__ import annotations
 
 import argparse
 import http.client
