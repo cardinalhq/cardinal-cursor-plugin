@@ -51,6 +51,11 @@ HOOK_SCRIPT = PLUGIN_ROOT / "hooks" / "cardinal-cursor-telemetry.py"
 # plugin owns without needing a custom JSON field Cursor might reject.
 HOOK_IDENTITY_MARKER = "cardinal-cursor-plugin"
 
+# postToolUse also records submitted decisions: a cache-miss D18 tree
+# listing (git ls-tree, <=5s), a `gh pr view` (<=1.5s), and OTLP posts
+# (<=2s each) must fit inside Cursor's per-hook timeout.
+POST_TOOL_USE_TIMEOUT_SECS = 15
+
 CURSOR_DIR = Path.home() / ".cursor"
 USER_MCP_PATH = CURSOR_DIR / "mcp.json"
 USER_HOOKS_PATH = CURSOR_DIR / "hooks.json"
@@ -179,7 +184,11 @@ def write_hooks_config(path: Path) -> Path | None:
     Events registered:
       sessionStart        — initiative-convention + budget standing
       beforeSubmitPrompt  — spend-limits gate + git_state
-      postToolUse         — turn_tool + tool_result + notify piggyback
+      postToolUse         — turn_tool + tool_result + notify piggyback +
+                            cardinal.decision recording (the sandboxed
+                            `cardinal-decision record` only prints a
+                            marker; this hook gates, ledgers, resolves the
+                            PR via gh, and emits — hence the longer timeout)
       preCompact          — cardinal.plan_usage (context-window slice)
       stop                — best-effort transcript sweep (no-op; gap D)
       subagentStop        — subagent_usage
@@ -192,7 +201,7 @@ def write_hooks_config(path: Path) -> Path | None:
     for event, timeout in (
         ("sessionStart", 5),
         ("beforeSubmitPrompt", 5),
-        ("postToolUse", 5),
+        ("postToolUse", POST_TOOL_USE_TIMEOUT_SECS),
         ("preCompact", 5),
         ("stop", 10),
         ("subagentStop", 5),

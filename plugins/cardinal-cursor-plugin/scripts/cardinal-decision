@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""cardinal-decision — record the decisions an agent makes while it works
+(Cursor adapter).
+
+Two audiences, two kinds of subcommand:
+
+  record   run BY THE AGENT from Cursor's terminal tool. Since Cursor 3.6
+           the default Auto-review mode runs agent shell commands in a
+           sandbox (writes only in the workspace and /tmp, network
+           denied by default), so `record` has no side effects at all: it
+           validates the arguments, prints one confirmation marker line,
+           and exits 0. It never reads ~/.cursor (a sandbox may deny
+           that, and guessing would misreport the on/off state), never
+           writes, never runs `gh`, never touches the network.
+           The plugin's postToolUse hook — which runs outside the sandbox
+           — re-parses the command the agent ran with the same argument
+           parser (hooks/_decision_cli.py), accepts the decision only when
+           the marker in the output matches it, applies the on/off gate,
+           writes the session ledger, and hands the PR lookup and the
+           single `cardinal.decision` emit to a detached background child.
+
+  on       run BY THE USER in their own terminal: turn capture on
+  off      run by the user: turn capture off
+  status   run by the user: show the setting (and a session's decisions)
+
+CARDINAL_DECISIONS=1/0 in the hook process env overrides on/off.
+"""
+
+from __future__ import annotations
+
+import sys
+
+# `record` runs inside Cursor's sandbox: never write bytecode caches next
+# to the plugin (outside the workspace).
+sys.dont_write_bytecode = True
+
+import argparse  # noqa: E402
+import os  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import _decision_cli  # noqa: E402
+from cardinal_core import decisions  # noqa: E402
+
+EXIT_USAGE = 2
+
+
+def _paths():
+    # Imported lazily: only the user-run subcommands touch ~/.cursor.
+    from cardinal_core.paths import AgentPaths
+
+    return AgentPaths(home=Path.home() / ".cursor")
+
+
+def cmd_on(_args: argparse.Namespace) -> int:
+    decisions.set_enabled(_paths().runtime_dir, True)
+    print(
+        "Decision capture is on. New Cursor chats will ask the agent to record its "
+        "decisions (start a new chat for an open session to pick it up)."
+    )
+    return 0
+
+
+def cmd_off(_args: argparse.Namespace) -> int:
+    decisions.set_enabled(_paths().runtime_dir, False)
+    print("Decision capture is off.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    from cardinal_core import otlp
+
+    paths = _paths()
+    override = os.environ.get(decisions.ENABLE_ENV)
+    enabled = decisions.is_enabled(paths.runtime_dir, override)
+    source = f" ({decisions.ENABLE_ENV}={override})" if decisions.parse_override(override) is not None else ""
+    print(f"Decision capture: {'on' if enabled else 'off'}{source}")
+    connected = otlp.connection_from_paths(paths) is not None
+    print(f"Cardinal telemetry: {'connected' if connected else 'not connected (run cardinal-connect)'}")
+    if args.session:
+        print(f"Decisions in session {args.session}:")
+        print(decisions.render_ledger(decisions.read_ledger(paths.runtime_dir, args.session), limit=50))
+    return 0
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    try:
+        marker, decision = _decision_cli.build_marker(args, os.getcwd())
+    except decisions.DecisionError as err:
+        print(f"cardinal-decision: {err}", file=sys.stderr)
+        return EXIT_USAGE
+    print(_decision_cli.marker_line(marker))
+    print(
+        f"Decision submitted: {decision['choice']} (proposed id {decision['id']}). "
+        "Cardinal's hook records it after this command finishes and reports the final id."
+    )
+    return 0
+
+
+HANDLERS = {"record": cmd_record, "on": cmd_on, "off": cmd_off, "status": cmd_status}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _decision_cli.build_parser()
+    args = parser.parse_args(argv)
+    handler = HANDLERS.get(args.command)
+    if handler is None:
+        parser.print_help()
+        return EXIT_USAGE
+    return handler(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
