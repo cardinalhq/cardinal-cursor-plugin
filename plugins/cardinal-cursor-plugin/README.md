@@ -83,6 +83,12 @@ Unverified, and worth knowing:
 - **Turning capture on doesn't affect sessions that are already open.** Start a new chat to pick it up.
 - **User Rules are not used.** They live only in Cursor Settings (*Customize → Rules*), and there's no file on disk the plugin could write ([rules docs](https://cursor.com/docs/context/rules)). Project rules (`.cursor/rules/*.mdc`) would have to be committed to each repo.
 
+## Evidence capture (storyboards)
+
+The `postToolUse` and `postToolUseFailure` hooks record every tool call (Cursor's own tools such as `Shell` and `read_file`, any MCP server's `mcp__<server>__<tool>`, and any tool Cursor adds later) in the local evidence spool shared with the other adapters: `~/.cardinal/evidence/<conversation_id>/ev_<id>.json` (directories 0700, files 0600). The shared pipeline (`cardinal_core.evidence_capture`) decides without naming any tool: a call that touches something sensitive (a `.env` or key file, `~/.aws`, `printenv`, `gh auth token`, a credentialed URL or header) is kept only as a *withheld* stub; everything else is scrubbed (the gateway's receipt scrub plus plain-text `key=value` rules), capped at 256 KiB and removed after 14 days. The hook hands the agent `[evidence:ev_…]` via `additional_context` (the first capture of a conversation also explains how to cite it). Entries name the client `cursor/<cursor_version>`. Nothing leaves the machine: `scripts/cardinal-evidence promote --storyboard sb_… ev_…` uploads only what a storyboard cites, with the connection's MCP key. Cursor's agent sandbox denies network by default, so promote has to run outside it (approve it, or run it in your own terminal). Cardinal's own `cardinal` server is skipped (its gateway mints witnessed receipts). Opt out with `CARDINAL_EVIDENCE_CAPTURE=0`, `scripts/cardinal-evidence off` or the flag file `~/.cardinal/evidence/disabled`. Capture is local file work and fails open.
+
+`postToolUseFailure` is registered by `cardinal-connect` from this version on: re-run `cardinal-connect --rotate` (or `--project` for cloud agents) to pick it up. Its payload fields are not yet verified against a live Cursor build; the hook reads the error from `error` / `error_message` / `errorMessage` and falls back to `tool_output`, and `CARDINAL_CURSOR_DEBUG_PAYLOADS=1` dumps the real payload.
+
 ## Cloud agents
 
 Cursor cloud agents do **not** load `~/.cursor/hooks.json`. They only load `.cursor/hooks.json` at the repo root, plus team/enterprise hooks distributed centrally. To send Cardinal telemetry from cloud-agent runs:

@@ -8,6 +8,7 @@ which agent is asking for consent.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
 import urllib.error
@@ -107,6 +108,46 @@ def poll_device_token(
         desc = body.get("error_description", "")
         raise DeviceFlowError(f"device-code failed: {err}{(': ' + desc) if desc else ''}")
     raise DeviceFlowError("Timed out waiting for browser approval. Re-run cardinal-connect.")
+
+
+# Why maestro granted the other scopes but minted no ingest key (the bundle's
+# top-level `ingest_unavailable_reason`, sent alongside `ingest: null`). Keep
+# in sync with maestro's IngestUnavailableReason (routes/device-auth.ts).
+INGEST_UNAVAILABLE_REASONS = {
+    "no_lakerunner_integration": "this Cardinal org has no active Lakerunner integration",
+    "ingest_endpoint_not_configured": "this Cardinal server has no telemetry ingest endpoint configured",
+}
+_REASON_CODE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
+
+
+def ingest_unavailable_reason(bundle: dict | None) -> str | None:
+    """The server's reason code when the bundle carries no ingest credential.
+
+    None when ingest was granted. When ingest is absent this always returns a
+    code: the server's own (if it is a plain lowercase code; anything else
+    is server text we don't echo to the terminal) or "unknown" for an older
+    server that sent `ingest: null` without a reason.
+    """
+    if not isinstance(bundle, dict) or bundle.get("ingest"):
+        return None
+    reason = bundle.get("ingest_unavailable_reason")
+    if isinstance(reason, str) and _REASON_CODE_RE.match(reason):
+        return reason
+    return "unknown"
+
+
+def ingest_unavailable_note(reason: str, mcp_connected: bool) -> str:
+    """One-line, user-facing explanation for a connect with no ingest key.
+
+    Connect prints this instead of failing: the MCP tools work without
+    telemetry, so a missing Lakerunner must not block them.
+    """
+    detail = INGEST_UNAVAILABLE_REASONS.get(reason)
+    shown = f"{reason} ({detail})" if detail else reason
+    note = f"telemetry ingest unavailable: {shown}"
+    if mcp_connected:
+        note += "; MCP tools connected"
+    return note
 
 
 def verify_mcp_reachable(mcp_url: str | None, api_key: str | None) -> tuple[bool, str]:

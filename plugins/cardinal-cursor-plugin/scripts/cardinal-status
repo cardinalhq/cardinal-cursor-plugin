@@ -108,7 +108,16 @@ def main() -> int:
             pass
 
     print()
-    print(f"Telemetry:      {'enabled' if state.get('telemetry', {}).get('enabled') else 'disabled'}")
+    telemetry = state.get("telemetry") if isinstance(state.get("telemetry"), dict) else {}
+    if telemetry.get("enabled"):
+        telemetry_line = "enabled"
+    elif telemetry.get("unavailable_reason"):
+        # Connected without an ingest key (org has no Lakerunner, or the
+        # server has no ingest endpoint). Informational — not a failure.
+        telemetry_line = f"unavailable ({telemetry['unavailable_reason']}); re-run cardinal-connect --rotate once ingest is available"
+    else:
+        telemetry_line = "disabled"
+    print(f"Telemetry:      {telemetry_line}")
     print(f"Ingest endpoint:{' ' if state.get('ingest_endpoint') else ''}{state.get('ingest_endpoint')}")
     print(f"Ingest key pref:{' ' if state.get('ingest_key_prefix') else ''}{state.get('ingest_key_prefix')}")
     print(f"Hooks path:     {USER_HOOKS_PATH}")

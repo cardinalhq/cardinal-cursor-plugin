@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""cardinal-evidence — cite any tool result from a Cursor session in a
+Cardinal storyboard (Cursor adapter).
+
+The plugin's hook keeps the result of every tool call Cursor makes (shell
+commands, file reads and edits, searches, web fetches, other MCP servers,
+any tool) on this machine: ~/.cardinal/evidence/<session>/ev_<id>.json,
+scrubbed, capped at 256 KiB, removed after 14 days. A call that touched
+something sensitive is kept only as a *withheld* stub and cannot be cited.
+Nothing is uploaded until you promote it.
+
+Commands (cardinal_core.evidence_promote, shared by every adapter):
+  promote --storyboard sb_... ev_... [ev_...]   upload as captured receipts
+  list [--tool GLOB] [--grep TEXT] [--withheld]  this session's entries
+  find TEXT                                     entries containing TEXT
+  show ev_...                                   one entry as it would be cited
+  off | on | status
+
+promote uploads with the Cardinal MCP key `cardinal-connect` stored in
+~/.cursor/cardinal-secrets.json, only to the origin of the connected MCP URL
+(~/.cursor/cardinal.json mcp_url), never across a redirect.
+
+Cursor runs agent shell commands in a sandbox with network access denied by
+default: promote needs the network, so approve running it outside the sandbox
+(or run it in your own terminal).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+
+from cardinal_core import evidence_promote  # noqa: E402
+from cardinal_core.paths import AgentPaths  # noqa: E402
+
+RUNTIME = "cursor"
+SESSION_ENV = ()
+
+
+def adapter() -> "evidence_promote.PromoteAdapter":
+    paths = AgentPaths(home=Path.home() / ".cursor")
+    return evidence_promote.PromoteAdapter(
+        runtime=RUNTIME,
+        client=RUNTIME,
+        connection=evidence_promote.agent_paths_connection(paths),
+        session_env=SESSION_ENV,
+        connect_hint="cardinal-connect",
+        reconnect_hint="cardinal-connect --rotate",
+        prog="cardinal-evidence",
+    )
+
+
+def main(argv=None) -> int:
+    return evidence_promote.main(argv, adapter())
+
+
+if __name__ == "__main__":
+    sys.exit(main())
