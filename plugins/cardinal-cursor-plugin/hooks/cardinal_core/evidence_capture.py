@@ -18,7 +18,9 @@ leaves the machine only when the author promotes it
          (cardinal_core.evidence_normalizers; shape only, never a gate)
       5  redact every field: the gateway's scrub (evidence.scrub) plus
          plain-text key=value rules, sensitive-path lines, base64 blobs and
-         local paths (spill root -> [local file], cwd -> ".", $HOME -> "~")
+         local paths (Claude's session temp dir -> [session tmp], spill
+         root -> [local file], the dash-encoded cwd/$HOME -> [cwd]/[home],
+         cwd -> ".", $HOME -> "~"); a summary is scrubbed before it is clipped
       6  cap: args <= 64 KiB, result <= 256 KiB, else conductor's
          {truncated, original_bytes, prefix} envelope
       7  write (atomic, 0600 in a 0700 dir) + gc (TTL, 256 MiB, 10k/session)
@@ -43,7 +45,7 @@ from typing import Any, Optional
 
 from . import evidence
 from . import evidence_gate as gate
-from .evidence_normalizers import Normalized, ToolCall, normalize_call
+from .evidence_normalizers import MAX_SUMMARY_CHARS, Normalized, ToolCall, normalize_call
 
 SCHEMA_V2 = "cardinal.evidence.v2"
 
@@ -151,12 +153,36 @@ _B64_RUN = re.compile(r"[A-Za-z0-9+/=_\-\r\n]+")
 _DATA_URL = re.compile(r"data:[^,;\s]{0,100}(?:;[^,;\s]{0,100}){0,4};base64,", re.IGNORECASE)
 
 
+# Claude Code's per-session temp dir: <TMPDIR>/claude-<uid>/<cwd with every
+# character outside [A-Za-z0-9] as "-">/... (e.g.
+# /private/tmp/claude-501/-Users-alice-git-app/<session uuid>/scratchpad).
+# The encoded segment names the user; a shape rule, not a list of TMPDIRs.
+_SESSION_TMP = re.compile(r"(?<=/)(claude-\d+/)-[A-Za-z0-9._-]+(?![A-Za-z0-9._-])")
+SESSION_TMP = "[session tmp]"
+# An encoded path (see _SESSION_TMP) shorter than this is too generic to
+# rewrite ("-root" would hit "--root-dir").
+MIN_ENCODED = 6
+_ENCODED_LEFT = r"(?:^|(?<=[/\s\"'=`]))"
+_ENCODED_RIGHT = r"(?=[-/\u2026]|$|[^\w])"
+
+
+def encode_path(p: str) -> str:
+    """A path as Claude Code encodes it into a directory name: every
+    character outside [A-Za-z0-9] becomes "-" (/Users/alice -> -Users-alice)."""
+    return re.sub(r"[^A-Za-z0-9]", "-", p.rstrip("/"))
+
+
 class _Local:
-    """Local path rewrites: spill root -> [local file], cwd -> ".",
-    home -> "~"."""
+    """Local path rewrites, in this order: Claude's session temp dir ->
+    claude-<uid>/[session tmp]; spill root -> [local file] (whole path, so
+    the encoded project dir, session id and file name under it all go);
+    the dash-encoded cwd/home (-Users-alice-app) -> [cwd]/[home], longest
+    first; cwd -> ".", home -> "~". The spill rule must precede the encoded
+    rules: a spill path holds the encoded cwd, and rewriting that first
+    would end the spill match at the "]" of "[cwd]"."""
 
     def __init__(self, spill_root: Optional[str], cwd: Optional[str], home: Optional[str]):
-        self.rules = []
+        self.rules = [("claude-", _SESSION_TMP, lambda m: m.group(1) + SESSION_TMP)]
         roots = set()
         if spill_root:
             roots.add(str(spill_root))
@@ -167,6 +193,22 @@ class _Local:
         for r in sorted(roots, key=len, reverse=True):
             if len(r) > 1:
                 self.rules.append((r, re.compile(re.escape(r) + r"(?:/[^\s\]\"'`)]*)?"), LOCAL_FILE))
+        encoded = {}
+        for p, repl in ((cwd, "[cwd]"), (home, "[home]")):
+            if not isinstance(p, str) or not p.startswith("/"):
+                continue
+            paths = {p}
+            try:
+                paths.add(os.path.realpath(p))
+            except (OSError, ValueError):
+                pass
+            for q in paths:
+                enc = encode_path(q)
+                if len(enc) >= MIN_ENCODED and enc not in encoded:
+                    encoded[enc] = repl
+        for enc in sorted(encoded, key=len, reverse=True):
+            rx = re.compile(_ENCODED_LEFT + re.escape(enc) + _ENCODED_RIGHT)
+            self.rules.append((enc, rx, encoded[enc]))
         for p, repl in ((cwd, "."), (home, "~")):
             if isinstance(p, str) and len(p.rstrip("/")) > 1 and p.startswith("/"):
                 q = p.rstrip("/")
@@ -415,12 +457,31 @@ class Captured:
     withheld: bool = False
 
 
+# The run of characters a path segment or word can end in (see _clip_scrubbed).
+_PARTIAL_TAIL = re.compile(r"[^\s/\\:;,=\"'`()\[\]{}<>|&]+$")
+
+
 def _clip_scrubbed(s: Any, n: int, local: _Local) -> Optional[str]:
+    """s scrubbed, THEN clipped to one line of at most n characters. This is
+    the only clip: a cut made before the scrub can land inside a path
+    (/Users/mgr…) that the local rules no longer recognise. The scrub sees
+    at most n*4 characters; when s is longer (or was already clipped
+    upstream, ending in "…"), its partial last segment is dropped first for
+    the same reason, and the result ends in "…"."""
     if not isinstance(s, str) or not s:
         return None
-    t = local.apply(redact_text_wide(evidence.redact_plain_text(evidence._nul(s[: n * 4]))))
+    raw = evidence._nul(s[: n * 4])
+    cut = len(s) > n * 4 or (len(s) == n * 4 and raw.endswith("…"))
+    if cut:
+        # A single run with no separator at all is kept (it holds no path).
+        raw = _PARTIAL_TAIL.sub("", raw.rstrip("…")).rstrip() or raw
+    t = local.apply(redact_text_wide(evidence.redact_plain_text(raw)))
     t = " ".join(t.split())
-    return t if len(t) <= n else t[: n - 1] + "…"
+    if len(t) > n:
+        return t[: n - 1] + "…"
+    if cut:
+        return (t[: n - 1] if len(t) >= n else t) + "…"
+    return t or None
 
 
 def _base_record(call: ToolCall, local: _Local, called_at: str) -> dict:
@@ -495,7 +556,7 @@ def build_record(call: ToolCall, *, home: Optional[str] = None, withheld: Option
             rec["is_error"] = True
         if isinstance(norm.exit_code, int) and not isinstance(norm.exit_code, bool):
             rec["exit_code"] = norm.exit_code
-        summary = _clip_scrubbed(norm.summary, 120, local)
+        summary = _clip_scrubbed(norm.summary, MAX_SUMMARY_CHARS, local)
         if summary:
             rec["summary"] = summary
     ev_id = evidence_id_v2(call.runtime, call.session_id, call.tool_use_id)

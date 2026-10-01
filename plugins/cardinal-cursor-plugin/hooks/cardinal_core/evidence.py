@@ -674,15 +674,47 @@ def _key_sep_matches(s: str):
         yield start, s[key_start:run_end], end
 
 
+_GO_TEST_STATUS_LEAD = "--- "
+
+
+def _is_go_test_status(s: str, key_start: int, key_end: int, value_start: int) -> bool:
+    """conductor isGoTestStatus: whether the pair whose key is
+    s[key_start:key_end] and whose value starts at value_start is a `go test
+    -v` status line ("--- PASS: TestX (0.01s)") rather than a credential.
+    PASS is a credential key, so without this every passing test's name is
+    redacted. One exact shape, no tool and no list; all of these must hold:
+    the key is exactly PASS (upper case, the whole key run); the four
+    characters before it are "--- " (so it is unquoted); the separator is a
+    ':' directly after the key followed by a space or tab; the value does
+    not open with a quote or a backslash (an escaped quote). Column-0
+    "PASS: <file>" (TAP/automake), "Pass:", "--- PASS=x" and DB_PASS stay
+    redacted."""
+    if s[key_start:key_end] != "PASS":
+        return False
+    lead = len(_GO_TEST_STATUS_LEAD)
+    if key_start < lead or s[key_start - lead:key_start] != _GO_TEST_STATUS_LEAD:
+        return False
+    if key_end + 1 >= len(s) or s[key_end] != ":" or s[key_end + 1] not in " \t":
+        return False
+    return not (value_start < len(s) and s[value_start] in "\"'\\")
+
+
 def _redact_key_values(s: str, pred=None) -> str:
     """The value of every key=value / key: value pair whose key is a
     credential key (pred: a wider key test, used by the plugin's own
-    stricter pass; the gateway parity path always uses is_credential_key)."""
+    stricter pass; the gateway parity path always uses is_credential_key).
+    A `go test -v` status line keeps its test name (_is_go_test_status),
+    whichever key test is in use."""
     pred = pred or is_credential_key
     out = []
     last = 0
     for start, key, end in _key_sep_matches(s):
         if start < last or not pred(key):
+            continue
+        # start is the key's first character unless a quote or escape
+        # prefix precedes it; then s[start:start+4] is not "PASS" and the
+        # shape test fails, as the Go one does for a quoted key.
+        if _is_go_test_status(s, start, start + len(key), end):
             continue
         vs, ve = _value_span(s, end)
         if vs == end:
