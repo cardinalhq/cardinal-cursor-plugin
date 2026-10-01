@@ -177,3 +177,30 @@ def default_pr_resolver(cache_dir) -> PrResolver:
         return decisions.resolve_pr(cwd, repo, branch, cache_dir)
 
     return resolve
+
+
+def cache_only_pr_resolver(cache_dir, now=None) -> PrResolver:
+    """The branch's PR from decisions.resolve_pr's cache (prs.json), within
+    the same TTLs, and never `gh`: for a hook that must not spend seconds on
+    a subprocess (storyboard_discovery). A miss or a stale entry is no PR."""
+    import time
+    from pathlib import Path
+
+    from . import decisions
+
+    def resolve(cwd: str, repo: str, branch: str):  # noqa: ARG001
+        if not repo or not branch or branch in decisions.PROTECTED_BRANCHES:
+            return None, None
+        entry = decisions.read_json(Path(cache_dir) / "prs.json").get(f"{repo}#{branch}")
+        if not isinstance(entry, dict):
+            return None, None
+        try:
+            age = (time.time() if now is None else now) - float(entry.get("at") or 0)
+        except (TypeError, ValueError):
+            return None, None
+        ttl = decisions.PR_CACHE_TTL_SEC if entry.get("number") else decisions.PR_NEGATIVE_TTL_SEC
+        if not 0 <= age < ttl:
+            return None, None
+        return entry.get("number"), entry.get("url")
+
+    return resolve

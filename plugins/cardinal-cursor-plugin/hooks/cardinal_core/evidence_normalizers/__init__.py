@@ -107,19 +107,24 @@ def input_summary(tool_input: Any) -> Optional[str]:
     """A short description of a call from its input, whatever the tool: the
     first short string among the input's top-level values (a command, a
     path, a pattern, a URL, a query), else None. Shape-based: it looks at
-    values, never at the tool's name."""
+    values, never at the tool's name.
+
+    UNCLIPPED to MAX_SUMMARY_CHARS on purpose (a long cap, MAX_SUMMARY_CHARS
+    * 4): the pipeline scrubs the summary and only then clips it
+    (evidence_capture._clip_scrubbed). Clipping here first could cut a path
+    mid-username (/Users/mgr…), which no path rule then recognises."""
     if isinstance(tool_input, str):
-        return one_line(tool_input)
+        return one_line(tool_input, MAX_SUMMARY_CHARS * 4)
     if not isinstance(tool_input, dict):
         return None
     preferred = ("command", "cmd", "file_path", "filePath", "path", "pattern", "url", "query", "description")
     for k in preferred:
-        s = one_line(tool_input.get(k))
+        s = one_line(tool_input.get(k), MAX_SUMMARY_CHARS * 4)
         if s:
             return s
     for v in list(tool_input.values())[:16]:
         if isinstance(v, str) and len(v) <= 4096 and "\n" not in v.strip():
-            s = one_line(v)
+            s = one_line(v, MAX_SUMMARY_CHARS * 4)
             if s:
                 return s
     return None
