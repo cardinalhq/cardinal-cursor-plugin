@@ -49,6 +49,7 @@ which reads as no matches.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -178,8 +179,22 @@ def _state_path(state_dir: Path, session_id: str) -> Path:
     return Path(state_dir) / f"{safe_session(session_id)}.json"
 
 
-def _read_state(state_dir: Optional[Path], session_id: Optional[str]) -> Optional[dict]:
-    """This session's state file, {} when unreadable, None when absent."""
+def connection_id(conn: Any) -> Optional[str]:
+    """A short fingerprint of {origin, org, key}: what the session cache is
+    recorded under. A block found with one org's key must never be shown
+    under another (a reconnect as a different user or org in a running
+    session, or after /resume), so a state recorded under a different
+    connection reads as absent. The key itself is never stored."""
+    if not _usable(conn):
+        return None
+    raw = "\n".join(conn[k] for k in ("origin", "org", "key"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _read_state(state_dir: Optional[Path], session_id: Optional[str],
+                conn_id: Optional[str] = None) -> Optional[dict]:
+    """This session's state file, {} when unreadable, None when absent.
+    conn_id: a state recorded under another connection (or none) is absent."""
     if state_dir is None or not session_id:
         return None
     path = _state_path(state_dir, session_id)
@@ -189,21 +204,27 @@ def _read_state(state_dir: Optional[Path], session_id: Optional[str]) -> Optiona
         last = read_json(path)
     except Exception:
         return {}
-    return last if isinstance(last, dict) else {}
+    if not isinstance(last, dict):
+        return {}
+    if conn_id is not None and last.get("conn") != conn_id:
+        return None
+    return last
 
 
 def should_run(state_dir: Optional[Path], session_id: Optional[str], branch: Optional[str],
-               head_sha: Optional[str], event: str, now: Optional[float] = None) -> bool:
+               head_sha: Optional[str], event: str, now: Optional[float] = None,
+               conn_id: Optional[str] = None) -> bool:
     """SessionStart always runs (startup, resume, clear, compact).
     UserPromptSubmit runs when (branch, head_sha) differs from this session's
     last attempt, or there was none, or the last attempt failed and its
     backoff (`retry_after`) has passed. Without a session id or a state dir
-    there is nothing to compare with: prompts never run."""
+    there is nothing to compare with: prompts never run. conn_id: an attempt
+    recorded under another connection does not count (it runs again)."""
     if event == SESSION_START:
         return True
     if event != USER_PROMPT_SUBMIT or not session_id or state_dir is None:
         return False
-    last = _read_state(state_dir, session_id)
+    last = _read_state(state_dir, session_id, conn_id)
     if last is None:
         return True
     if (last.get("branch"), last.get("head_sha")) != (branch, head_sha):
@@ -224,19 +245,22 @@ def retry_after(attempts: Any) -> float:
 def record_run(state_dir: Optional[Path], session_id: Optional[str], branch: Optional[str],
                head_sha: Optional[str], now: Optional[float] = None,
                block: Optional[str] = None, *, failed: bool = False, pending: bool = False,
-               attempts: int = 0) -> None:
+               attempts: int = 0, conn_id: Optional[str] = None) -> None:
     """Remember this attempt, whatever it returned (atomic: tmp + replace),
     with the block to keep for this branch/HEAD: None clears the one an
     earlier attempt stored, so a subagent never gets a stale block. `failed`:
     the attempt timed out or errored (should_run retries it later; `attempts`
     consecutive failures on this branch/HEAD set the backoff).
     `pending`: the block was not delivered (the next prompt emits it).
+    `conn_id`: the connection the block was found with (connection_id).
     Prunes other sessions' files older than STATE_TTL_S, and temp files a
     killed write left behind."""
     if state_dir is None or not session_id:
         return
     now = time.time() if now is None else now
     state: dict = {"branch": branch, "head_sha": head_sha, "at": now}
+    if conn_id is not None:
+        state["conn"] = conn_id
     if _storable(block):
         state["block"] = block
         if pending:
@@ -266,11 +290,12 @@ def _storable(block: Any) -> bool:
             and f"\n{OPEN_MARKER}\n" in block and f"\n{CLOSE_MARKER}\n" in block)
 
 
-def stored_block(state_dir: Optional[Path], session_id: Optional[str]) -> Optional[str]:
+def stored_block(state_dir: Optional[Path], session_id: Optional[str],
+                 conn_id: Optional[str] = None) -> Optional[str]:
     """The block this session's last attempt rendered, or None (no session
     id, no state dir, no file, a corrupt or partial file, a cleared block).
     Local file read only: no git, no network."""
-    block = (_read_state(state_dir, session_id) or {}).get("block")
+    block = (_read_state(state_dir, session_id, conn_id) or {}).get("block")
     return block if _storable(block) else None
 
 
@@ -606,12 +631,13 @@ def discover(
     try:
         if not _usable(conn):
             return None
+        cid = connection_id(conn)
         if event == SUBAGENT_START:
-            return _subagent_block(cwd, state_dir, session_id)
+            return _subagent_block(cwd, state_dir, session_id, cid)
         if deadline is None:
             deadline = time.monotonic() + deadline_s
         branch, head_sha = head_state(cwd)
-        last = _read_state(state_dir, session_id) or {}
+        last = _read_state(state_dir, session_id, cid) or {}
         same_head = bool(last) and (last.get("branch"), last.get("head_sha")) == (branch, head_sha)
         last_failed = same_head and last.get("failed") is True
         last_attempts = last.get("attempts") if isinstance(last.get("attempts"), int) else 1
@@ -619,9 +645,10 @@ def discover(
             # The last look finished too late to be delivered: deliver it now
             # (keeping a failure's backoff, if the look after it failed).
             record_run(state_dir, session_id, branch, head_sha, last.get("at") if last_failed else now,
-                       block=last["block"], failed=last_failed, attempts=last_attempts if last_failed else 0)
+                       block=last["block"], failed=last_failed, attempts=last_attempts if last_failed else 0,
+                       conn_id=cid)
             return last["block"]
-        if not should_run(state_dir, session_id, branch, head_sha, event, now):
+        if not should_run(state_dir, session_id, branch, head_sha, event, now, cid):
             return None
         block, failed = None, True
         try:
@@ -633,18 +660,21 @@ def discover(
             late = block is not None and deliver_by is not None and time.monotonic() > deliver_by
             record_run(state_dir, session_id, branch, head_sha, now, block=keep, failed=failed,
                        pending=late or (failed and keep is not None and last.get("pending") is True),
-                       attempts=(last_attempts + 1 if last_failed else 1) if failed else 0)
+                       attempts=(last_attempts + 1 if last_failed else 1) if failed else 0,
+                       conn_id=cid)
         return None if late else block
     except Exception:
         return None
 
 
-def _subagent_block(cwd: str, state_dir: Optional[Path], session_id: Optional[str]) -> Optional[str]:
+def _subagent_block(cwd: str, state_dir: Optional[Path], session_id: Optional[str],
+                    conn_id: Optional[str] = None) -> Optional[str]:
     """The stored block, unless it is still pending (the session itself has
     not seen it yet: a subagent must not know more than its parent) or cwd is
     in a git work tree on a branch other than the one it was found for (a
-    worktree-isolated subagent; a git failure falls back to the block)."""
-    state = _read_state(state_dir, session_id) or {}
+    worktree-isolated subagent; a git failure falls back to the block), or it
+    was found with another connection (conn_id)."""
+    state = _read_state(state_dir, session_id, conn_id) or {}
     block = state.get("block")
     if not _storable(block) or state.get("pending") is True:
         return None

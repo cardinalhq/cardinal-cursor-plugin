@@ -21,6 +21,13 @@ so the services must already be shipping OTLP to Cardinal (the migration is abou
 the *views and rules*, which is why metric names get checked against Cardinal's
 catalog before anything is converted).
 
+**Gate: data must already be flowing to Cardinal.** Before anything else — before
+asking for Grafana credentials — step 0 checks that the target org is receiving
+data. If it is, carry on with the migration as written. If it isn't, pause and send
+the user to set up data onboarding first (step 0c says how, for Cardinal SaaS and
+self-hosted), wait for them to say it's done, re-check, and continue in the same
+session once data shows up.
+
 Migration is optional. If the user has no Grafana to migrate from (a fresh start on
 Cardinal), say there's nothing to migrate and stop — Cardinal's own dashboard
 authoring and `manage_alert_rules` MCP tool are the right path for them.
@@ -96,7 +103,8 @@ what the scripts write under `export/`, `catalog/`, `plan/`).
 
 ### 0. Connect, pick the org, confirm Cardinal is receiving data
 
-Do this first, before asking for anything Grafana-side.
+Do this first, before asking for anything Grafana-side — it is the data-flowing gate
+above (0c).
 
 **a. Connected?** Run `python3 $SCRIPTS/cardinal_catalog.py --orgs`. It lists the
 user's Cardinal orgs and marks the connected one. If it exits 3 (not connected) or 4
@@ -123,9 +131,34 @@ With a `telemetry:query` connection this works for any of the user's orgs (no lo
 token). Connected without it, only the connected org can be checked; for another org it
 exits 6 — either reconnect with the three scopes (`--rotate`, where SKILL.md's connect
 can grant them) or run it again right
-after the user adds the login token (before step 2). If it says Cardinal isn't receiving
-data, stop: the user's services need to send OTLP to Cardinal first (a
-data-onboarding step, not a migration one); migrated dashboards would all be empty.
+after the user adds the login token (before step 2).
+
+- **Receiving data** (`Cardinal is receiving data: …`): continue to step 1.
+- **Not receiving data** (no data lake, or no metrics on it): **pause the migration** —
+  migrated dashboards would all be empty. The user's services need to send telemetry
+  to Cardinal first; that is a data-onboarding step, not a migration one. What to tell
+  them depends on where their Cardinal runs:
+  - **Cardinal SaaS** (the hostname of the connection's host / `CARDINAL_URL` is
+    `app.cardinalhq.io`, whatever the scheme or path; it's the default): ask them to follow the setup steps at
+    <https://docs.cardinalhq.io/data-lake/instrumentation#get-an-api-key> — get an API
+    key and point their OpenTelemetry collector / SDKs at Cardinal.
+  - **Self-hosted Cardinal** (connected with `--host <their URL>`, or the hostname is
+    anything other than `app.cardinalhq.io`): ask them to set up their site and data lake with the Cardinal
+    plugin's **install-site** skill (`/cardinal:install-site` in Claude Code,
+    `cardinal-install-site` in Codex, Cursor and Gemini CLI), then send telemetry to it.
+  - Not sure which one they're on: ask.
+
+  Then **wait in this session**: ask them to reply once it's set up (data can take a
+  few minutes to show up after the first send). Don't ask for Grafana credentials or
+  export anything meanwhile. When they reply, re-run the `--check` above:
+  - Receiving data now: say so in one line and continue to step 1. Steps 0a/0b are
+    done and the org stays the same.
+  - Still no data: say so, and help them work out why before asking them to try again.
+    Is the collector/SDK running? Is it pointed at the right endpoint with the API key
+    for **this** org? Self-hosted: did install-site finish with the data lake up? Then
+    wait and re-check again.
+  - They'd rather do it later: end here. Tell them to re-run this migration once data
+    is flowing; step 0 will confirm it.
 
 If the user can't or won't connect: ask for the org ID (it's in the
 `/api/orgs/<org-id>/...` request URL) and `CARDINAL_URL`, put both in `.env.cardinal`
@@ -195,7 +228,8 @@ Also check:
   user, and prefer an equivalent filter that does exist (e.g. a cluster label) by
   adding it to the mapping's `labels`.
 
-If the catalog comes back empty, the org isn't receiving data yet; stop and say so.
+If the catalog comes back empty, the org isn't receiving data yet; stop and handle it
+as in step 0c (SaaS: the API-key setup doc; self-hosted: install-site).
 
 ### 3. Convert (offline)
 

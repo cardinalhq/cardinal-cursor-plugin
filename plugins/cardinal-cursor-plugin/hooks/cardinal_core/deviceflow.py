@@ -253,19 +253,24 @@ def revoke_maestro_key(host: str, key_id: str, plaintext: str | None) -> tuple[b
     """Best-effort POST /api/maestro-keys/<id>/revoke. Authenticates with the
     plaintext (R11 §1 self path); without it the server returns 403 and the
     caller should point the user at the admin UI. Shared by connect (revoking a
-    dropped act token) and disconnect (revoking on teardown)."""
-    url = host.rstrip("/") + f"/api/maestro-keys/{key_id}/revoke"
-    headers = {"content-type": "application/json"}
-    if plaintext:
-        headers["X-CardinalHQ-API-Key"] = plaintext
-    req = urllib.request.Request(url, data=b"", method="POST", headers=headers)
+    dropped act token) and disconnect (revoking on teardown).
+
+    Never raises: a teardown must not abort halfway because one revoke hit a
+    malformed host, a dropped connection or a TLS error."""
     try:
+        url = host.rstrip("/") + f"/api/maestro-keys/{key_id}/revoke"
+        headers = {"content-type": "application/json"}
+        if plaintext:
+            headers["X-CardinalHQ-API-Key"] = plaintext
+        req = urllib.request.Request(url, data=b"", method="POST", headers=headers)
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status in (200, 204), f"HTTP {resp.status}"
     except urllib.error.HTTPError as exc:
         return False, f"HTTP {exc.code}"
     except (urllib.error.URLError, TimeoutError) as exc:
         return False, f"network error: {exc}"
+    except Exception as exc:  # noqa: BLE001 — ValueError (bad host), RemoteDisconnected, ssl…
+        return False, f"error: {type(exc).__name__}: {exc}"
 
 
 def _ingest_probe_once(endpoint: str, api_key: str, api_header: str) -> tuple[bool, str]:
