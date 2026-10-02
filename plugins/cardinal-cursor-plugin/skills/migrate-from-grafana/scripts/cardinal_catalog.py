@@ -8,8 +8,7 @@ underscores. This script finds, for every metric/label referenced by the export,
 the name Cardinal actually has, so queries keep returning data after migration.
 
 Reads CARDINAL_URL, CARDINAL_ORG_ID and CARDINAL_API_KEY or CARDINAL_TOKEN (env or --env-file).
-CARDINAL_URL / CARDINAL_ORG_ID default to the cardinal-connect org; --check without a
-token uses the cardinal-connect MCP key.
+CARDINAL_URL / CARDINAL_ORG_ID default to the cardinal-connect org.
 
 Usage:
   cardinal_catalog.py --check [--instance <id-or-slug>] [--env-file .env.cardinal]
@@ -18,10 +17,14 @@ Usage:
   cardinal_catalog.py --orgs
 
 --orgs lists the user's Cardinal orgs (via the cardinal-connect token) so they can pick one.
---check only confirms Cardinal is receiving data and writes nothing. Without a token it
-exits 3 when cardinal-connect hasn't been run, 4 when its key needs --rotate, and 6 when
-the chosen org isn't the connected one (then it needs the login token). Any script exits
-5 when the login token is expired or cut off.
+--check only confirms Cardinal is receiving data and writes nothing: a metric must have
+a sample from the last 15 minutes that isn't an agent's own usage telemetry (which
+cardinal-connect switches on, so it doesn't prove a collector is sending). It exits 1
+when nothing is flowing; 7 when the org has several data lakes and --instance wasn't
+given (it lists each one's status; --export exits 7 the same way); 3 when cardinal-connect
+hasn't been run, 4 when it was run without telemetry:query (reconnect with --rotate),
+and 6 when the chosen org isn't the connected one (then it needs the login token). Any
+script exits 5 when the login token is expired or cut off.
 
 Writes:
   catalog/instance.json          chosen lakerunner instance {id, slug, name}
@@ -60,6 +63,7 @@ def load_env_file(path):
 AGENT_HOMES = ["~/.claude", "~/.codex", "~/.cursor", "~/.gemini"]
 # --check exit codes the skill branches on: connect, or reconnect with --rotate.
 EXIT_NOT_CONNECTED, EXIT_CONNECT_REJECTED, EXIT_NEEDS_TOKEN = 3, 4, 6
+EXIT_PICK_INSTANCE = 7  # several data lakes and no --instance: ask the user which one
 EXIT_BAD_TOKEN = 5  # login token expired / truncated: ask for a fresh one, resume the same step
 COPY_HINT = ("Copy a fresh one: reload Cardinal, dev tools > Network, right-click an /api/orgs/... "
              "request > Copy > Copy as cURL, and take everything after 'Bearer ' (the Headers pane "
@@ -530,34 +534,52 @@ def set_rule_enabled(c, instance_slug, rule_id, enabled):
     return None if state is enabled else f"Cardinal still reports it {'enabled' if state else 'disabled'}"
 
 
-def check_via_mcp(conn, want_instance):
-    """Pre-flight with the cardinal-connect MCP key: is the org receiving metrics?"""
-    mcp = CardinalMCP(conn["mcp_url"], conn["mcp_key"])
-    print(f"using cardinal-connect ({conn.get('user_email', 'unknown user')}, org {conn.get('org_id')})")
-    text, err = mcp.call("lakerunner__list_instances", {})
-    try:
-        instances = json.loads(text).get("instances", []) if not err else []
-    except ValueError:
-        instances = []
-    if not instances:
-        sys.exit(f"this Cardinal org has no lakerunner (data lake) instance: {text[:300]}")
-    inst = instances[0]
-    if want_instance:
-        match = [i for i in instances if want_instance in (i.get("slug"), i.get("name"))]
-        if not match:
-            sys.exit(f"instance '{want_instance}' not found; available: {[i.get('slug') for i in instances]}")
-        inst = match[0]
-    elif len(instances) > 1:
-        print(f"note: {len(instances)} instances; checked the default '{inst['slug']}'. "
-              f"Pass --instance to choose: {[i.get('slug') for i in instances]}")
-    text, err = mcp.call("lakerunner__discover_metrics",
-                         {"instance": inst["slug"], "question": "request rate, latency, errors, cpu, memory"})
-    found = re.findall(r"^\s*\d+\.\s+\*\*([^*]+)\*\*", text, re.M)
-    if err or not found:
-        sys.exit(f"Cardinal isn't receiving metrics on '{inst.get('name') or inst['slug']}' yet"
-                 + (f": {text[:300]}" if err else ""))
-    print(f"Cardinal is receiving data: instance '{inst['slug']}' ({inst.get('name')}), "
-          f"metrics found e.g. {', '.join(found[:5])}")
+# Every agent's own usage telemetry (what cardinal-connect switches on) carries this
+# resource attribute; a collector's data doesn't. Data with it doesn't count as flowing.
+AGENT_LABEL = "agent_runtime"
+LIVE_WINDOW_MIN = 15
+LIVE_PROBES = 40  # metric names probed per data lake, spread across the list
+PROM_NAME = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
+
+
+def metric_names(c, inst):
+    """Every metric name lakerunner has stored for this data lake (ignores time ranges)."""
+    code, body = c.req("GET", f"/api/lakerunner/{inst['id']}/prometheus/api/v1/label/__name__/values")
+    if code != 200:
+        sys.exit(f"could not read Cardinal metric names ({code}): {body}")
+    return body.get("data", []) if isinstance(body, dict) else []
+
+
+def live_metric(native, names, probes=LIVE_PROBES):
+    """A metric that got a sample in the native query's window from something other
+    than an agent's own telemetry (i.e. from a collector or SDK), or None.
+
+    The metric-name listing can't answer this: it ignores time ranges, keeps names
+    long after a source stops, and also lists the connected agent's own metrics."""
+    names = [n for n in names if PROM_NAME.match(n)]
+    stride = max(1, len(names) // probes)
+    for name in names[::stride][:probes]:
+        vals, err = native.values("metrics", f'count({name}{{{AGENT_LABEL}=""}})')
+        if vals and not err:
+            return name
+    return None
+
+
+def lake_status(c, inst):
+    """(stored metric names, a live collector metric or None) for one data lake."""
+    names = metric_names(c, inst)
+    live = live_metric(NativeQuery(c, inst["id"], window_ms=LIVE_WINDOW_MIN * 60_000), names) if names else None
+    return names, live
+
+
+def describe_lake(inst, names, live):
+    label = f"'{inst.get('slug') or inst['id']}' ({inst.get('name')})"
+    if live:
+        return f"{label}: receiving data, e.g. {live} in the last {LIVE_WINDOW_MIN} min"
+    if names:
+        return (f"{label}: no data from a collector in the last {LIVE_WINDOW_MIN} min "
+                f"({len(names)} metric names stored, none current outside agent telemetry)")
+    return f"{label}: no metrics"
 
 
 def norm(name):
@@ -756,12 +778,12 @@ def main():
               file=sys.stderr)
         sys.exit(EXIT_NEEDS_TOKEN)
     if args.check and not has_token:
-        if not conn.get("mcp_key"):
-            print("not connected to Cardinal" + (" (connected for telemetry only)" if conn else "")
-                  + ": run cardinal-connect" + (" --rotate" if conn else "") + " "
-                  + " ".join(MIGRATION_SCOPES), file=sys.stderr)
-            sys.exit(EXIT_CONNECT_REJECTED if conn else EXIT_NOT_CONNECTED)
-        return check_via_mcp(conn, args.instance)
+        # Telling a collector's live data from stale names and the agent's own telemetry
+        # needs telemetry:query; the MCP key alone can't.
+        print("not connected to Cardinal" + (" with telemetry:query" if conn else "")
+              + ": run cardinal-connect" + (" --rotate" if conn else "") + " "
+              + " ".join(MIGRATION_SCOPES), file=sys.stderr)
+        sys.exit(EXIT_CONNECT_REJECTED if conn else EXIT_NOT_CONNECTED)
     c = Cardinal.from_env(connect_scopes=["telemetry:query"])
     if not args.check:
         os.makedirs(args.out, exist_ok=True)
@@ -779,25 +801,30 @@ def main():
             sys.exit(f"instance '{args.instance}' not found; available: {[i.get('slug') for i in instances]}")
         inst = match[0]
     elif len(instances) > 1:
-        print(f"note: {len(instances)} instances; using the default '{inst.get('slug')}'. "
-              f"Pass --instance to choose: {[i.get('slug') for i in instances]}", file=sys.stderr)
+        # Never pick a data lake for the user: the default may be empty while another
+        # holds someone else's data. Show each one's state and let them choose.
+        print(f"this org has {len(instances)} data lakes; ask the user which one their collector "
+              "sends to, then re-run with --instance <slug>:")
+        for i in instances:
+            print("  - " + (describe_lake(i, *lake_status(c, i)) if args.check else
+                            f"'{i.get('slug') or i['id']}' ({i.get('name')})"))
+        sys.exit(EXIT_PICK_INSTANCE)
     if not args.check:
         json.dump({"chosen": inst, "all": instances}, open(os.path.join(args.out, "instance.json"), "w"), indent=2)
-    prom = f"/api/lakerunner/{inst['id']}/prometheus/api/v1"
 
     # Metric names come from the Prometheus-compatible metadata route; everything
     # else uses lakerunner's native query API (POST JSON, SSE responses), which is
     # what Cardinal's own UI calls.
-    code, body = c.req("GET", f"{prom}/label/__name__/values")
-    if code != 200:
-        sys.exit(f"could not read Cardinal metric names ({code}): {body}")
-    cardinal_metrics = body.get("data", []) if isinstance(body, dict) else []
+    if args.check:
+        names, live = lake_status(c, inst)
+        status = describe_lake(inst, names, live)
+        if not live:
+            sys.exit(f"Cardinal isn't receiving data on {status}")
+        print(f"Cardinal is receiving data on {status}")
+        return
+    cardinal_metrics = metric_names(c, inst)
     if not cardinal_metrics:
         sys.exit("Cardinal returned no metrics for this instance: it isn't receiving data yet")
-    if args.check:
-        print(f"Cardinal is receiving data: instance '{inst.get('slug') or inst['id']}', "
-              f"{len(cardinal_metrics)} metric names, e.g. {', '.join(sorted(cardinal_metrics)[:5])}")
-        return
     native = NativeQuery(c, inst["id"])
 
     by_norm = {}

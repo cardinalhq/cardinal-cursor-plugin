@@ -124,18 +124,33 @@ for the org ID instead — it's in the `/api/orgs/<org-id>/...` request URL in C
 **c. Is it receiving data?**
 
 ```bash
-python3 $SCRIPTS/cardinal_catalog.py --env-file .env.cardinal --check
+python3 $SCRIPTS/cardinal_catalog.py --env-file .env.cardinal --check [--instance <slug>]
 ```
 
-With a `telemetry:query` connection this works for any of the user's orgs (no login
-token). Connected without it, only the connected org can be checked; for another org it
-exits 6 — either reconnect with the three scopes (`--rotate`, where SKILL.md's connect
-can grant them) or run it again right
-after the user adds the login token (before step 2).
+"Receiving data" means a collector (OpenTelemetry Collector, Alloy, any OTLP
+SDK/exporter) sent a metric in the last 15 minutes. Two things don't count, and the
+script ignores them: metric names stored from an earlier send (Cardinal keeps them
+after the source stops), and the agent's own usage telemetry, which connecting
+switches on (series with an `agent_runtime` label). So a freshly connected org with
+nothing else sending fails the check, as it should.
 
-- **Receiving data** (`Cardinal is receiving data: …`): continue to step 1.
-- **Not receiving data** (no data lake, or no metrics on it): **pause the migration** —
-  migrated dashboards would all be empty. The user's services need to send telemetry
+It needs the `telemetry:query` scope (with it, it works for any of the user's orgs,
+no login token) or the login token. Connected without it: exit 4 — reconnect with
+`--rotate` and the three scopes (SKILL.md's **Connect**); for an org that isn't the
+connected one it exits 6 — reconnect the same way, or run it again right after the
+user adds the login token.
+
+**Several data lakes** (exit 7): the script lists each one and whether it is receiving
+data. **Ask the user which data lake their collector sends to** — never pick one
+yourself, not even the only one with data: another lake's data may belong to
+someone else (a demo, another team), and the migrated dashboards would show it.
+Then re-run `--check --instance <their choice>` and use the same `--instance` in
+step 2.
+
+- **Receiving data** (`Cardinal is receiving data on …`): continue to step 1.
+- **Not receiving data** (exit 1: no data lake, no metrics, or nothing current from a
+  collector): **pause the migration** — migrated dashboards would all be empty. Don't
+  get around it by checking a data lake the user didn't choose. The user's services need to send telemetry
   to Cardinal first; that is a data-onboarding step, not a migration one. What to tell
   them depends on where their Cardinal runs:
   - **Cardinal SaaS** (the hostname of the connection's host / `CARDINAL_URL` is
@@ -183,10 +198,9 @@ python3 $SCRIPTS/cardinal_catalog.py --env-file .env.cardinal --export export --
     [--instance <slug>]
 ```
 
-If the org has more than one data lake, the script says so and uses the first; ask
-the user which one holds the data (names are in `catalog/instance.json`) and re-run
-with `--instance <slug>` if it's another. The alert rules are created on this data
-lake too.
+Pass the data lake the user chose in step 0 as `--instance` (with several data lakes
+and no `--instance` it exits 7, as in step 0). The alert rules are created on this
+data lake too.
 
 This lists Cardinal's real metric and label names and writes
 `catalog/mapping.suggested.json`: for every metric the Grafana queries use, the
