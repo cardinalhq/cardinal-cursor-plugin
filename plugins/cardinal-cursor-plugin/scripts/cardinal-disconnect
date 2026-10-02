@@ -214,6 +214,18 @@ def main() -> int:
             print(f"Could not revoke MCP key server-side ({msg}).")
             print(f"Visit {host}/settings/api-keys to revoke it manually.")
 
+    # The control-plane token acts as the user across their orgs: revoke it
+    # before its key_id and plaintext leave the state and secrets files.
+    act_key_id = state.get("act_key_id")
+    if act_key_id:
+        plaintext = secrets.get("act_api_key")
+        ok, msg = revoke_key(host, act_key_id, plaintext if isinstance(plaintext, str) else None)
+        if ok:
+            print(f"Revoked control-plane token {state.get('act_key_prefix') or act_key_id} server-side ({msg})")
+        else:
+            print(f"Could not revoke control-plane token server-side ({msg}).")
+            print(f"Visit {host}/settings/api-keys to revoke it manually.")
+
     # User-level configs first.
     if not remove_mcp_entry(USER_MCP_PATH):
         print(f"No managed Cardinal MCP entry found in {USER_MCP_PATH}")

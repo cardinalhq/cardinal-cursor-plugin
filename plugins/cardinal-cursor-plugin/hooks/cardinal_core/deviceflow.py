@@ -76,6 +76,84 @@ def start_device_code(host: str, scopes: list[str], client_id: str) -> dict:
     return body
 
 
+# Scopes on the user-owned control-plane token beyond maestro:act. Every
+# adapter's connect requests them by default so one connect covers the skills
+# that write as the user (migrate-from-grafana); --minimal-scopes opts out.
+# The writes stay bounded by the user's org role server-side (Member:
+# dashboards + alert rules; Viewer: neither); telemetry:query is read-only.
+ACT_EXTRA_SCOPES = ("dashboards:write", "alerts:write", "telemetry:query")
+
+
+def parse_act_scopes(raw: list[str]) -> list[str]:
+    """Scopes named on the command line (space- or comma-separated), deduped
+    in order. Raises ValueError naming the first one that isn't an extra."""
+    named: list[str] = []
+    for arg in raw:
+        for scope in filter(None, (s.strip() for s in arg.split(","))):
+            if scope not in ACT_EXTRA_SCOPES:
+                raise ValueError(
+                    f"unknown scope {scope!r} (choose from: {', '.join(ACT_EXTRA_SCOPES)})"
+                )
+            if scope not in named:
+                named.append(scope)
+    return named
+
+
+def default_act_scopes(named: list[str], minimal: bool) -> list[str]:
+    """The extra scopes to request: the named ones, plus every other extra
+    unless --minimal-scopes."""
+    return named if minimal else named + [s for s in ACT_EXTRA_SCOPES if s not in named]
+
+
+def act_scope_warnings(extra: list[str]) -> list[str]:
+    """Consent-time lines telling the user what the extra scopes let the token do."""
+    lines = []
+    writes = [s for s in extra if s.endswith(":write")]
+    if writes:
+        lines += [f"⚠ {' + '.join(writes)} lets that same token create, edit and",
+                  "  delete them as you (bounded by your org role)."]
+    if "telemetry:query" in extra:
+        lines += ["⚠ telemetry:query lets that same token read logs, metrics and",
+                  "  traces in every org you belong to (read-only)."]
+    return lines
+
+
+def start_device_code_with_fallback(
+    host: str, required: list[str], optional: list[str], client_id: str,
+    log: Callable[[str], None] = print,
+) -> tuple[dict, list[str]]:
+    """start_device_code for required + optional scopes. A Cardinal server that
+    doesn't know an optional scope rejects the whole request ("unknown
+    scope"); optional scopes are defaults, not requirements, so retry once
+    with the required ones rather than not connecting at all.
+
+    Returns (grant, the scopes actually requested). Raises DeviceFlowError
+    when the required scopes alone are rejected too.
+    """
+    scopes = required + [s for s in optional if s not in required]
+    try:
+        return start_device_code(host, scopes, client_id), scopes
+    except DeviceFlowError as exc:
+        if scopes == required:
+            raise
+        log(f"⚠ {exc}")
+        log(f"Retrying with scopes: {', '.join(required)}")
+        return start_device_code(host, required, client_id), list(required)
+
+
+def act_credential(bundle: dict | None) -> dict | None:
+    """The bundle's control-plane (maestro:act) token, or None. A partial act
+    block (metadata, no plaintext) counts as no grant."""
+    act = (bundle or {}).get("act")
+    return act if isinstance(act, dict) and act.get("api_key") else None
+
+
+def act_granted_scopes(act: dict) -> list[str]:
+    """What the act token was stamped with. Older maestro doesn't echo scopes,
+    and then it only minted maestro:act."""
+    return act.get("scopes") or ["maestro:act"]
+
+
 def poll_device_token(
     host: str,
     device_code: str,

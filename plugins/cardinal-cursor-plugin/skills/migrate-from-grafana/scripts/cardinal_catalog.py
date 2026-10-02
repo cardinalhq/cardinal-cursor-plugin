@@ -87,7 +87,7 @@ def connect_info():
     """What the agent's Cardinal connect saved: {host, org_id, user_email, mcp_url,
     mcp_key, act_key, act_endpoint, act_scopes} (missing keys absent), or {} when not
     connected. The MCP key reads data and can enable/disable alert rules; the act
-    key (Claude Code's connect only) can list the user's orgs, and — when connected
+    key (maestro:act, from every agent's connect) can list the user's orgs, and — when connected
     with `dashboards:write` / `alerts:write` / `telemetry:query` — create and update
     dashboards / alert rules and run the catalog and validation queries."""
     home = agent_home()
@@ -110,6 +110,26 @@ def connect_info():
 def connect_can(conn, scopes):
     """Does the cardinal-connect act token carry every scope in `scopes`?"""
     return bool(conn.get("act_key")) and set(scopes) <= set(conn.get("act_scopes") or [])
+
+
+# Every step of the migration together needs these. Reconnect hints always ask for all
+# of them: --rotate replaces the token, so asking for one step's scope would only move
+# the failure to the next step.
+MIGRATION_SCOPES = ["dashboards:write", "alerts:write", "telemetry:query"]
+
+
+def missing_scopes_message(conn, connect_scopes):
+    """Why there's no usable credential, and the one command that fixes it."""
+    alt = "or put CARDINAL_TOKEN (or CARDINAL_API_KEY) in .env.cardinal"
+    if not connect_scopes:
+        return "no Cardinal login token: put CARDINAL_TOKEN (or CARDINAL_API_KEY) in .env.cardinal"
+    scopes = " ".join(MIGRATION_SCOPES)
+    if not conn:
+        return f"not connected to Cardinal: run `cardinal-connect {scopes}`, {alt}"
+    have = set(conn.get("act_scopes") or []) if conn.get("act_key") else set()
+    missing = [s for s in connect_scopes if s not in have]
+    return (f"the cardinal-connect token lacks {', '.join(missing)} (this step needs it): reconnect "
+            f"with `cardinal-connect --rotate {scopes}` so every migration step is covered, {alt}")
 
 
 def list_orgs(conn):
@@ -187,10 +207,7 @@ class Cardinal:
             key, url = conn["act_key"], url or conn.get("act_endpoint")
             print(f"using the cardinal-connect token ({', '.join(connect_scopes)})", file=sys.stderr)
         if not (key or token):
-            hint = (f" or reconnect with `cardinal-connect --rotate {' '.join(connect_scopes)}`"
-                    if connect_scopes else "")
-            sys.exit("no Cardinal login token: put CARDINAL_TOKEN (or CARDINAL_API_KEY) in .env.cardinal"
-                     f"{hint}. Writing dashboards and alert rules needs it.")
+            sys.exit(missing_scopes_message(conn, connect_scopes))
         if not url or not org:
             sys.exit("CARDINAL_URL and CARDINAL_ORG_ID must be set (or run cardinal-connect to fill them in)")
         if token and token.lower().startswith("bearer "):
@@ -282,6 +299,142 @@ class NativeQuery:
         if errs:
             return 0, json.dumps(errs[0].get("data", errs[0]))[:200]
         return sum(1 for e in ev if e.get("type") == "result"), None
+
+    def series(self, signal, expr, step=60, rng=None):
+        """Return ({series key: {unix seconds: value}}, error or None). The key is the
+        series' labels without Cardinal's internal ones (see series_key)."""
+        body = dict(rng or self.range, q=expr, step=step)
+        code, resp = self.c.req("POST", f"{self.base}/{signal}/query", body=body)
+        if code != 200:
+            return {}, f"HTTP {code}: {str(resp)[:200]}"
+        out = {}
+        for e in self.events(resp):
+            if e.get("type") == "error":
+                return {}, json.dumps(e.get("data", e))[:200]
+            d = e.get("data", {})
+            if e.get("type") == "result" and isinstance(d, dict) and isinstance(d.get("value"), (int, float)):
+                out.setdefault(series_key(d.get("tags") or {}), {})[int(d["timestamp"]) // 1000] = float(d["value"])
+        return out, None
+
+    def values(self, signal, expr, step=60):
+        """All numeric values the query returns, across series (for the probes)."""
+        s, err = self.series(signal, expr, step)
+        return [v for pts in s.values() for v in pts.values()], err
+
+
+# Labels Cardinal adds to raw series (not the user's): left out when comparing series.
+INTERNAL_LABELS = re.compile(r"^(__name__|name|chq_.*|cardinalhq_.*|_cardinalhq.*)$")
+
+
+def series_key(labels):
+    """A stable key for a series: its user labels, sorted, without Cardinal's internal ones."""
+    return tuple(sorted((k, str(v)) for k, v in labels.items() if not INTERNAL_LABELS.match(k)))
+
+
+def median(xs):
+    xs = sorted(xs)
+    if not xs:
+        return None
+    mid = len(xs) // 2
+    return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+
+def quantile_usable(q50, q99, err=None):
+    """Does histogram_quantile give sane answers on this histogram? Lakerunner returns
+    negative values (-1, -1.0005) for histograms of zero-valued observations, and an
+    engine without the function errors; either way the converter falls back to the average."""
+    if err or not q50 or not q99:
+        return False
+    if any(v != v or v < 0 or v in (float("inf"), float("-inf")) for v in q50 + q99):
+        return False
+    return median(q50) <= median(q99) * (1 + 1e-9)
+
+
+# How Cardinal answers histogram_count(rate(h[w])) (the request rate):
+#   per_second  Prometheus semantics: requests/s at any step
+#   per_minute  the count in each 60s rollup bucket, whatever [w] says (lakerunner on
+#               delta OTLP histograms): /60 gives requests/s, but only at <= 60s steps
+#   unknown     not measurable (no data at one of the steps)
+RATE_BUCKET_SECONDS = 60
+
+
+def rate_mode(at60, at120, err=None):
+    """Classify the engine from histogram_count(rate(h[5m])) at step 60 and step 120:
+    a per-bucket count doubles when the step doubles, a per-second rate doesn't."""
+    a, b = median(at60 or []), median(at120 or [])
+    if err or not a or not b:
+        return "unknown"
+    r = b / a
+    if 0.8 <= r <= 1.25:
+        return "per_second"
+    if 1.6 <= r <= 2.4:
+        return "per_minute"
+    return "unknown"
+
+
+def probe_histograms(native, fams):
+    """{family: cardinal name} -> how this Cardinal instance answers the histogram
+    functions the converter uses: per-family histogram_quantile usability, and the
+    engine's request-rate semantics (measured once, on the first family with data)."""
+    out = {"histogram_quantile_ok": {}, "histogram_rate_mode": "unknown"}
+    for fam, m in sorted(fams.items()):
+        q50, e1 = native.values("metrics", f"histogram_quantile(0.5, sum(rate({m}[5m])))")
+        q99, e2 = native.values("metrics", f"histogram_quantile(0.99, sum(rate({m}[5m])))")
+        out["histogram_quantile_ok"][fam] = quantile_usable(q50, q99, e1 or e2)
+        if out["histogram_rate_mode"] == "unknown":
+            expr = f"sum(histogram_count(rate({m}[5m])))"
+            a, ea = native.values("metrics", expr, step=60)
+            b, eb = native.values("metrics", expr, step=120)
+            out["histogram_rate_mode"] = rate_mode(a, b, ea or eb)
+    return out
+
+
+def probe_or_vector(native, metric):
+    """Does `<empty> or vector(0)` answer 0? Lakerunner answers nothing when the left
+    side has no series, so a Grafana panel that shows 0 shows no data in Cardinal."""
+    vals, err = native.values("metrics", f'sum(rate({metric}{{migrate_probe="none"}}[5m])) or vector(0)')
+    return bool(vals) and not err
+
+
+def decide_label_drops(matchers, used, metric_labels, log_labels, values, renames=None):
+    """Which label filters to remove, per signal.
+
+    matchers: {"metrics"|"logs": {(label, value), ...}} literal `label="value"` filters
+    used:     {"metrics"|"logs": {label, ...}} every label the queries reference
+    values:   (signal, label) -> set of values Cardinal has for it (or None)
+    renames:  {grafana label: cardinal label} applied before checking
+    A filter is removed only from the signal that lacks it: a label that exists on
+    logs but not on these metrics stays on the log queries.
+    Returns ({"metrics": set, "logs": set}, review notes)."""
+    have = {"metrics": metric_labels, "logs": log_labels}
+    renames = renames or {}
+    drops, review = {"metrics": set(), "logs": set()}, []
+    for sig in ("metrics", "logs"):
+        for label, value in sorted(matchers.get(sig, ())):
+            if label in ("detected_level", "__name__") or label in drops[sig]:
+                continue
+            name = renames.get(label, label)
+            if name not in have[sig]:
+                drops[sig].add(label)
+                review.append({"label": label, "value": value, "signal": sig,
+                               "issue": f"label not on the {sig} in Cardinal: this filter is removed from {sig} "
+                                        "queries, which widens them (edit drop_labels / drop_log_labels if wrong)",
+                               "present_on_other_signal": label in have["logs" if sig == "metrics" else "metrics"]})
+                continue
+            seen = values(sig, name) or set()
+            if seen and value not in seen:
+                drops[sig].add(label)
+                review.append({"label": label, "value": value, "signal": sig,
+                               "issue": f"value not found on the {sig} in Cardinal: this filter is removed from "
+                                        f"{sig} queries, which widens them", "values_in_cardinal": sorted(seen)[:10]})
+        for label in sorted(used.get(sig, ())):
+            if (label in ("detected_level", "__name__", "le") or label in drops[sig]
+                    or renames.get(label, label) in have[sig]):
+                continue
+            drops[sig].add(label)
+            review.append({"label": label, "signal": sig,
+                           "issue": f"label not on the {sig} in Cardinal: filters on it are removed from {sig} queries"})
+    return drops, review
 
 
 class CardinalMCP:
@@ -448,9 +601,64 @@ def exact_matchers(export):
     """(label, value) pairs for literal equality matchers without variables."""
     out = set()
     for e in all_exprs(export):
-        for label, value in re.findall(r'([a-zA-Z_][\w.]*)\s*=\s*"([^"$]*)"', e):
-            if value:
-                out.add((label, value))
+        out |= matchers_in(e)
+    return out
+
+
+def matchers_in(expr):
+    return {(label, value) for label, value in re.findall(r'([a-zA-Z_][\w.]*)\s*=\s*"([^"$]*)"', expr) if value}
+
+
+def labels_in(expr):
+    """Label names an expression filters or groups on."""
+    stripped = re.sub(r'"(?:[^"\\]|\\.)*"', '""', expr)
+    labels = set()
+    for block in re.findall(r"\{([^}]*)\}", stripped):
+        labels.update(re.findall(r"([a-zA-Z_][\w.]*)\s*(?:=~|!~|!=|=)", block))
+    for grp in re.findall(r"\b(?:by|without|on|ignoring)\s*\(([^)]*)\)", stripped):
+        labels.update(x.strip() for x in grp.split(",") if x.strip())
+    labels.update(re.findall(r'\| *([a-zA-Z_]\w*) *(?:=~|!~|!=|=)', stripped))
+    return labels - {"le", "__name__"}
+
+
+def is_log_query(expr, ds_kind=None):
+    if ds_kind:
+        return ds_kind == "loki"
+    s = expr.strip()
+    return s.startswith("{") or bool(re.search(r"(_over_time|rate)\s*\(\s*\{", s) and ("|" in s or "_over_time" in s))
+
+
+def exprs_by_signal(export):
+    """{"metrics": [...], "logs": [...]}: every query, by the datasource it ran on."""
+    try:
+        ds = json.load(open(os.path.join(export, "datasources.json")))
+    except (OSError, ValueError):
+        ds = {}
+
+    def kind(ref, fallback=None):
+        uid = ref.get("uid") if isinstance(ref, dict) else ref
+        t = ref.get("type") if isinstance(ref, dict) else None
+        return t or (ds.get(uid) or {}).get("type") or fallback
+
+    out = {"metrics": [], "logs": []}
+    ddir = os.path.join(export, "dashboards")
+    for fn in os.listdir(ddir):
+        stack = list(json.load(open(os.path.join(ddir, fn))).get("panels", []))
+        while stack:
+            p = stack.pop()
+            stack.extend(p.get("panels", []))
+            pk = kind(p.get("datasource"))
+            for t in p.get("targets", []):
+                if t.get("expr"):
+                    out["logs" if is_log_query(t["expr"], kind(t.get("datasource"), pk)) else "metrics"].append(t["expr"])
+    apath = os.path.join(export, "alerts.json")
+    if os.path.exists(apath):
+        for g in json.load(open(apath)):
+            for r in g["rules"]:
+                for d in r.get("grafana_alert", {}).get("data", []):
+                    e = d.get("model", {}).get("expr")
+                    if e:
+                        out["logs" if is_log_query(e, kind(d.get("datasourceUid"))) else "metrics"].append(e)
     return out
 
 
@@ -550,7 +758,8 @@ def main():
     if args.check and not has_token:
         if not conn.get("mcp_key"):
             print("not connected to Cardinal" + (" (connected for telemetry only)" if conn else "")
-                  + ": run cardinal-connect" + (" --rotate" if conn else ""), file=sys.stderr)
+                  + ": run cardinal-connect" + (" --rotate" if conn else "") + " "
+                  + " ".join(MIGRATION_SCOPES), file=sys.stderr)
             sys.exit(EXIT_CONNECT_REJECTED if conn else EXIT_NOT_CONNECTED)
         return check_via_mcp(conn, args.instance)
     c = Cardinal.from_env(connect_scopes=["telemetry:query"])
@@ -623,32 +832,25 @@ def main():
     for l in sorted(cardinal_labels | log_labels):
         label_norm.setdefault(norm(l), l)
         label_norm.setdefault(norm(re.sub(r"^resource[._]", "", l)), l)
-    # Exact-value filters (label="value") must match data that exists in Cardinal,
-    # or every panel using them goes blank: e.g. an environment label whose value
-    # differs between the old and new pipelines.
-    for label, value in sorted(exact_matchers(args.export)):
-        if label in ("detected_level", "__name__") or label in mapping["drop_labels"]:
-            continue
-        present = [sig for sig, names in (("metrics", cardinal_labels), ("logs", log_labels)) if label in names]
-        seen_values = set()
-        for sig in present:
-            seen_values.update(native.tag_values(sig, label) or [])
-        if label not in cardinal_labels or (seen_values and value not in seen_values):
-            mapping["drop_labels"].append(label)
-            mapping["_review"].append({"label": label, "value": value,
-                                       "issue": "filter value not found in Cardinal: the filter will be removed "
-                                                "(keep it by editing drop_labels if that is wrong)",
-                                       "values_in_cardinal": sorted(seen_values)[:10]})
     for l in used_labels:
-        if l == "detected_level" or l in mapping["drop_labels"]:
+        if l == "detected_level":
             continue
         target = label_norm.get(norm(l)) or label_norm.get(norm(re.sub(r"^resource[._]", "", l)))
         if target and target != l:
             mapping["labels"][l] = target
-        elif not target:
-            mapping["drop_labels"].append(l)
-            mapping["_review"].append({"label": l, "issue": "label not present in Cardinal: filters on it "
-                                       "will be removed (edit drop_labels / labels if it exists under another name)"})
+    # Filters must match data that exists in Cardinal, or every panel using them goes
+    # blank (e.g. an environment label whose value differs between the old and new
+    # pipelines). Decided per signal: a label missing from the metrics but present on
+    # the logs is removed from metric queries only, so log panels stay scoped.
+    by_sig = exprs_by_signal(args.export)
+    matchers = {sig: set().union(*map(matchers_in, ex)) if ex else set() for sig, ex in by_sig.items()}
+    used = {sig: set().union(*map(labels_in, ex)) if ex else set() for sig, ex in by_sig.items()}
+    drops, review = decide_label_drops(
+        matchers, used, cardinal_labels, log_labels,
+        lambda sig, label: set(native.tag_values(sig, label) or []), mapping["labels"])
+    mapping["drop_labels"] = sorted(drops["metrics"])
+    mapping["drop_log_labels"] = sorted(drops["logs"])
+    mapping["_review"] += review
     # Loki's `detected_level` is a Grafana-side derived field; lakerunner keeps severity on `level`.
     if "detected_level" in used_labels:
         mapping["log_labels"]["detected_level"] = "level"
@@ -657,8 +859,7 @@ def main():
     json.dump(sorted(cardinal_labels), open(os.path.join(args.out, "labels.json"), "w"), indent=1)
     json.dump(sorted(log_labels), open(os.path.join(args.out, "log_labels.json"), "w"), indent=1)
 
-    # histogram_quantile: native histograms have no buckets, so it can't work;
-    # otherwise probe it on a classic histogram.
+    # histogram_quantile on classic histograms (Cardinal keeps the _bucket series): probe it.
     supports_hq = False
     if hist_families and not mapping["native_histograms"]:
         probe = next((mapping["metrics"][f] for f in hist_families if mapping["metrics"].get(f)), None)
@@ -666,14 +867,35 @@ def main():
             n, err = native.query("metrics", f"histogram_quantile(0.95, sum by (le) (rate({probe}_bucket[5m])))")
             supports_hq = n > 0 and not err
     mapping["supports_histogram_quantile"] = supports_hq
+    # Histograms Cardinal keeps under their base name: measure how this instance
+    # answers the functions the converter needs instead of assuming.
+    native_fams = {f: mapping["metrics"][f] for f in mapping["native_histograms"] if mapping["metrics"].get(f)}
+    if native_fams:
+        mapping.update(probe_histograms(native, native_fams))
+        for fam, ok in sorted(mapping["histogram_quantile_ok"].items()):
+            if not ok:
+                mapping["_review"].append({"metric": fam, "issue": "histogram_quantile gives no usable answer on this "
+                                           "histogram in Cardinal (e.g. negative values): percentile panels will "
+                                           "show the average instead, retitled 'avg'"})
+        if mapping["histogram_rate_mode"] != "per_second":
+            mapping["_review"].append({"issue": f"request rate from histograms: Cardinal answers "
+                                       f"'{mapping['histogram_rate_mode']}' (not per second at every step); "
+                                       "see the report notes on request-rate panels"})
+    any_metric = next((v for v in mapping["metrics"].values() if v), None)
+    if any_metric:
+        mapping["supports_or_vector"] = probe_or_vector(native, any_metric)
     json.dump(mapping, open(os.path.join(args.out, "mapping.suggested.json"), "w"), indent=2)
 
     print(json.dumps({
         "instance": inst, "native_histograms": mapping["native_histograms"],
-        "drop_labels": mapping["drop_labels"], "cardinal_metrics": len(cardinal_metrics), "grafana_metric_families": len(families),
+        "drop_labels": mapping["drop_labels"], "drop_log_labels": mapping["drop_log_labels"],
+        "cardinal_metrics": len(cardinal_metrics), "grafana_metric_families": len(families),
         "matched": sum(1 for v in mapping["metrics"].values() if v), "unmatched": [k for k, v in mapping["metrics"].items() if not v],
         "renamed": {k: v for k, v in mapping["metrics"].items() if v and v != k},
         "label_renames": mapping["labels"], "supports_histogram_quantile": supports_hq,
+        "histogram_quantile_ok": mapping.get("histogram_quantile_ok"),
+        "histogram_rate_mode": mapping.get("histogram_rate_mode"),
+        "supports_or_vector": mapping.get("supports_or_vector"),
     }, indent=2))
 
 

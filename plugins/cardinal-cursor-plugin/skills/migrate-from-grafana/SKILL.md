@@ -28,37 +28,37 @@ never print either.
 
 ## Connect (step 0a)
 
-Cursor's `cardinal-connect` grants an MCP key, but **not** the control-plane token
-Claude Code's connect mints with `dashboards:write alerts:write telemetry:query`.
-What that means for CORE.md:
-
-- **`--orgs` can't list orgs** — it exits 4 even when connected. Ask the user for the
-  org ID instead (CORE.md step 0b) and write it into `.env.cardinal`.
-- **`--check`** works through the MCP key for the connected org only; for another
-  org it exits 6 and needs the login token.
-- **Writing dashboards and alert rules always needs the login token** (or an
-  `admin:all` API key) in `.env.cardinal` — ask for it right before step 2, as
-  CORE.md describes. Ignore CORE.md's `--rotate <scopes>` advice; it doesn't apply here.
-- **Switching alert rules on/off** goes through the MCP key, so it works for the
-  connected org.
+Cursor's `cardinal-connect` grants an MCP key and a control-plane token with
+`dashboards:write alerts:write telemetry:query`, so with it the whole migration runs
+without a login token, for any org the user belongs to, and `--orgs` lists them.
+A connection made before the plugin requested that token (or with
+`--minimal-scopes`) lacks it: `--orgs` exits 4 — reconnect as in step 2 below with
+`--rotate`.
 
 The connection is optional: if the user doesn't want it, take CORE.md's
-`.env.cardinal` route. If they do and `--orgs` exits 3 (not connected):
+`.env.cardinal` route. If they do and `--orgs` exits 3 (not connected) or 4:
 
 1. Find the connect script — `CONNECT=$(command -v cardinal-connect || find ~/.cursor . \
    -path '*/scripts/cardinal-connect' 2>/dev/null | head -1)`. If there is none, use
    the `.env.cardinal` route.
-2. `rm -f ~/.cursor/cardinal-pending.json`, then start `python3 "$CONNECT"` so it
-   doesn't block you (in the background if your shell tool supports it, else
-   `nohup python3 "$CONNECT" > cardinal-connect.log 2>&1 &`) — it waits up to 10
+2. `rm -f ~/.cursor/cardinal-pending.json`, then start
+   `python3 "$CONNECT" dashboards:write alerts:write telemetry:query` (exit 3) or,
+   after the user agrees, `python3 "$CONNECT" --rotate dashboards:write alerts:write telemetry:query`
+   (exit 4; it replaces the current keys) so it doesn't block you (in the background
+   if your shell tool supports it, else
+   `nohup python3 "$CONNECT" ... > cardinal-connect.log 2>&1 &`) — it waits up to 10
    minutes for approval. Add `--host <their Cardinal URL>` for a self-hosted Cardinal.
 3. Within a few seconds it writes `~/.cursor/cardinal-pending.json`; read
    `verification_uri` from it (retry a few times, 1 s apart) and show it: "To connect
    Cursor to Cardinal, open this link, log in, pick an org, and click **Approve**:
    `<verification_uri>`". Mention that approving also sends Cursor's usage
    telemetry to that Cardinal org, and that `cardinal-disconnect` undoes it.
-4. Wait for it to finish, then continue with CORE.md step 0b. On failure, show its
-   error verbatim; for "already connected", ask before re-running with `--rotate`.
+4. Wait for it to finish, then run `--orgs` again and continue with CORE.md step 0b.
+   On failure, show its error verbatim; for "already connected", ask before
+   re-running with `--rotate`. If it reports the scopes as not granted, the Cardinal
+   server doesn't offer them yet: take the `.env.cardinal` route for the writes.
+
+`cardinal-status` lists the granted scopes under Actions.
 
 ## Report
 

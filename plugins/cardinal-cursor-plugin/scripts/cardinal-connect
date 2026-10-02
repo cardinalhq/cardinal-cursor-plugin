@@ -254,6 +254,12 @@ def write_secrets(bundle: dict) -> None:
         "mcp_api_key": mcp.get("api_key"),
         "written_at": datetime.now(timezone.utc).isoformat(),
     }
+    # The control-plane token acts as the user across their orgs; it lives only
+    # here (0600). migrate-from-grafana reads act_api_key / act_endpoint.
+    act = deviceflow.act_credential(bundle)
+    if act:
+        payload["act_api_key"] = act["api_key"]
+        payload["act_endpoint"] = act.get("endpoint")
     atomic_write_secret(SECRETS_PATH, json.dumps(payload, indent=2) + "\n")
 
 
@@ -301,6 +307,12 @@ def write_state(
         state["mcp_key_id"] = mcp.get("key_id")
         state["mcp_key_prefix"] = mcp.get("key_prefix") or (mcp.get("api_key") or "")[:8]
         state["mcp_created_at"] = mcp.get("created_at")
+    act = deviceflow.act_credential(bundle)
+    if act:
+        state["act_key_id"] = act.get("key_id")
+        state["act_key_prefix"] = act.get("key_prefix")
+        state["act_created_at"] = act.get("created_at")
+        state["act_scopes"] = deviceflow.act_granted_scopes(act)
     limits = bundle.get("limits")
     if isinstance(limits, dict) and limits.get("status_url"):
         state["limits"] = {
@@ -316,6 +328,34 @@ def write_state(
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
+
+def revoke_dropped_act_token(host: str, act: dict | None) -> None:
+    """A re-connect whose bundle carries no control-plane token revokes the
+    prior one server-side before its key_id leaves the state file — otherwise
+    a live "acts as you" token orbits un-revokable."""
+    if act:
+        return
+    def read(path: Path) -> dict:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    prior = read(STATE_PATH)
+    key_id = prior.get("act_key_id")
+    if not key_id:
+        return
+    # Without the plaintext the server answers 403 and we point at the UI.
+    plaintext = read(SECRETS_PATH).get("act_api_key")
+    ok, msg = deviceflow.revoke_maestro_key(host, key_id, plaintext)
+    prefix = prior.get("act_key_prefix") or key_id
+    if ok:
+        print(f"Revoked prior control-plane token {prefix} server-side ({msg})")
+    else:
+        print(f"Could not revoke prior control-plane token {prefix} ({msg}).")
+        print(f"Visit {host}/settings/api-keys to revoke it manually.")
+
 
 def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
     expires_in = int(grant.get("expires_in") or DEFAULT_POLL_TIMEOUT_SECS)
@@ -338,6 +378,7 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
     user = bundle.get("user", {})
     ingest = bundle.get("ingest")
     mcp = bundle.get("mcp")
+    act = deviceflow.act_credential(bundle)
 
     # Set when the server granted the other scopes but minted no ingest key
     # (org has no Lakerunner, or no ingest endpoint configured). Connect goes
@@ -388,6 +429,7 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
                     "ingest_endpoint": (ingest or {}).get("endpoint"),
                     "ingest_unavailable_reason": ingest_reason,
                     "mcp_url": (mcp or {}).get("url"),
+                    "act_scopes": deviceflow.act_granted_scopes(act) if act else None,
                 },
             },
             indent=2,
@@ -418,6 +460,7 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
         if b:
             print(f"MCP backup: {b}")
 
+    revoke_dropped_act_token(args.host, act)
     write_secrets(bundle)
     print(f"Wrote Cardinal local secrets to {SECRETS_PATH}")
 
@@ -449,6 +492,16 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
         print("     Re-run cardinal-connect --rotate once telemetry ingest is available.")
     if mcp:
         print(f"MCP endpoint: {mcp['url']}")
+    if act:
+        granted = deviceflow.act_granted_scopes(act)
+        print(f"Actions: enabled ({', '.join(granted)}, key {act.get('key_prefix')})")
+        missing = [s for s in getattr(args, "extra_scopes", []) if s not in granted]
+        if missing:
+            print(f"WARN Not granted: {', '.join(missing)} — the server didn't grant them "
+                  "(your org role, or this Cardinal server doesn't offer them yet).")
+    elif getattr(args, "act_requested", False):
+        print("WARN Cardinal returned no control-plane token: skills that write dashboards or")
+        print("     alert rules as you (migrate-from-grafana) need a login token or API key.")
     if project_paths:
         print(f"Project install root: {project_paths['root']}")
         print(
@@ -499,7 +552,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run the device-code flow and print what would be written.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "scopes", nargs="*", metavar="SCOPE",
+        help="Extra scopes for the control-plane token: "
+             f"{', '.join(deviceflow.ACT_EXTRA_SCOPES)} (space- or comma-separated). "
+             "All are requested by default; naming them only matters with "
+             "--minimal-scopes. They let agents create/edit dashboards and alert "
+             "rules, and query telemetry (read-only), as you — within your org role.",
+    )
+    parser.add_argument(
+        "--minimal-scopes", action="store_true",
+        help="Don't request the control-plane token and its extra scopes by default — "
+             "only those named as positional args (none: no token). Skills that write "
+             "dashboards or alert rules as you (migrate-from-grafana) then need a "
+             "reconnect or an org API key.",
+    )
+    args = parser.parse_args()
+    try:
+        args.named_scopes = deviceflow.parse_act_scopes(args.scopes)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
 def main() -> int:
@@ -520,9 +593,25 @@ def main() -> int:
     scopes = ["ingest:write"]
     if not args.telemetry_only:
         scopes.append("mcp:invoke")
-    print(f"Requesting Cardinal consent for scopes: {', '.join(scopes)}")
+    # The control-plane token (maestro:act) and its extra scopes, so skills can
+    # write dashboards / alert rules and query telemetry as the user. Requested
+    # by default; scopes the user named are required, the rest are dropped by a
+    # Cardinal server that doesn't offer them yet.
+    named = args.named_scopes
+    extra = deviceflow.default_act_scopes(named, args.minimal_scopes)
+    act_scopes = ["maestro:act", *extra] if extra else []
+    required = scopes + (["maestro:act", *named] if named else [])
+    print(f"Requesting Cardinal consent for scopes: {', '.join(scopes + act_scopes)}")
+    if act_scopes:
+        print("WARN maestro:act grants a long-lived token that acts as you across your orgs.")
+        print(f"     It is stored 0600 in {SECRETS_PATH}; cardinal-disconnect revokes it.")
+        for line in deviceflow.act_scope_warnings(extra):
+            print(line)
     try:
-        grant = deviceflow.start_device_code(args.host, scopes, CLIENT_ID)
+        grant, requested = deviceflow.start_device_code_with_fallback(
+            args.host, required, act_scopes, CLIENT_ID)
+        args.act_requested = "maestro:act" in requested
+        args.extra_scopes = [s for s in extra if s in requested]
     except deviceflow.DeviceFlowError as exc:
         sys.exit(str(exc))
     write_pending(grant)
