@@ -44,14 +44,33 @@ Cardinal's "All" substitutes `.+`, so `label=~"$var"` keeps working.
   A metric mapped to `null` → the panel/rule is skipped ("metric not found in Cardinal").
 - Label names are renamed in matchers, `by/without/on/ignoring` lists and legends.
 - **Native histograms** (Cardinal has the histogram under its base name only, listed
-  in `native_histograms`): `rate(M_count[w])` → `rate(M[w])` (request rate);
-  `histogram_quantile(q, sum by (le, X)(rate(M_bucket[w])))` and
-  `sum(rate(M_sum))/sum(rate(M_count))` → `max by (X) (M{sel})`, the histogram's own
-  value, which is what Cardinal's built-in dashboards chart. Panels still titled
-  "p95"/"p99" are flagged. Queries needing raw buckets (heatmaps) are skipped.
-- `drop_labels`: matchers on labels/values absent from Cardinal are removed (an
-  empty LogQL selector becomes `{service_name=~".+"}`).
-- LogQL `... or vector(0)` is removed (Cardinal's log engine rejects it).
+  in `native_histograms`). On such a histogram `rate(M)` and `sum(M)` read the **sum
+  of the observed values** (seconds of request time, for a duration), not the request
+  count, so each Prometheus idiom maps to the histogram function that answers it.
+  `cardinal_catalog.py` measures how the instance answers them; the converter follows
+  the measurement:
+
+  | Grafana | Cardinal |
+  |---|---|
+  | `rate(M_count[w])` (request rate) | `histogram_count(rate(M[w]))`. When `histogram_rate_mode` is `per_minute` (lakerunner counts per 60s rollup, whatever `[w]` says), `(histogram_count(rate(M[w])) / 60)`: right at 1-minute resolution or finer, overstated in zoomed-out views; flagged |
+  | `increase(M_count[w])` | `histogram_count(increase(M[w]))`, or `/ 60 * w` in `per_minute` mode |
+  | `rate(M_sum[w])` | `rate(M[w])` |
+  | `sum(rate(M_sum))/sum(rate(M_count))` (average) | `histogram_avg(sum by (X) (rate(M[w])))` |
+  | `histogram_quantile(q, sum by (le, X)(rate(M_bucket[w])))` | `histogram_quantile(q, sum by (X) (rate(M[w])))` where `histogram_quantile_ok` says it works on that histogram (an estimate at bucket resolution); otherwise `histogram_avg(...)`, and the panel title and legend say **avg** instead of pNN |
+  | other `M_count` (counting series) | `M` (series presence) |
+
+  Queries needing raw buckets (heatmaps) are skipped. Never `max by (X) (M)`: lakerunner
+  doesn't support `max`/`min`/`avg` over a histogram and answers a merged-sketch value
+  unrelated to the series (and `-1` for zero-valued observations).
+- `drop_labels` / `drop_log_labels`: matchers on labels or values absent from Cardinal
+  are removed, **per signal**: a label missing from the metrics but present on the
+  logs stays on the log queries. Removing a filter widens the query. (An empty LogQL
+  selector becomes `{service_name=~".+"}`.) Mappings from older versions have only
+  `drop_labels`, which then applies to both.
+- LogQL `... or vector(0)` is removed (Cardinal's log engine rejects it). PromQL
+  `... or vector(0)` is kept, but when `supports_or_vector` is false lakerunner answers
+  nothing instead of 0 when the left side has no series: flagged, and validation treats
+  that empty panel as "nothing to report".
 - `histogram_quantile(q, sum by (le, X) (rate(M_bucket[w])))` on classic histograms — if the instance
   doesn't support it, rewritten to `sum by (X)(rate(M_sum[w])) / sum by (X)(rate(M_count[w]))`
   (the **average**, not the quantile). Other `histogram_quantile` shapes are skipped.

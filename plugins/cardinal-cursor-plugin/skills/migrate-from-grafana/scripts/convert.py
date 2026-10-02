@@ -15,7 +15,12 @@ mapping.json (built by the skill workflow from cardinal_catalog.py output):
     "log_labels": {"detected_level": "level", ...},                     # LogQL labels
     "supports_histogram_quantile": true|false,
     "native_histograms": ["<grafana histogram family>", ...],   # Cardinal has no _bucket/_sum/_count
-    "drop_labels": ["<grafana label not present in Cardinal>", ...] # matchers on these are removed
+    "histogram_quantile_ok": {"<family>": true|false},          # probed per native histogram
+    "histogram_rate_mode": "per_second"|"per_minute"|"unknown", # how histogram_count(rate()) answers
+    "supports_or_vector": true|false,                            # does `<empty> or vector(0)` give 0
+    "drop_labels": ["<label>", ...],     # matchers removed from metric queries
+    "drop_log_labels": ["<label>", ...]  # matchers removed from log queries (older mappings:
+                                         # absent, and drop_labels applies to both)
   }
   A metric mapped to null means "not in Cardinal" -> panels/rules using it are skipped.
   Metrics missing from the mapping are passed through unchanged (and reported).
@@ -122,6 +127,15 @@ def drop_matchers(q, labels):
     return q, dropped
 
 
+# Note texts other code keys on (panel retitling, the Grafana value comparison).
+PCT_AS_AVG = "shows the average, not the percentile"
+PCT_ESTIMATE = "percentile estimated from Cardinal's histogram sketch"
+RATE_PER_MINUTE = "request rate from Cardinal's per-minute histogram count"
+OR_VECTOR_NOOP = "'or vector(0)' has no effect in Cardinal"
+# lakerunner's rollup bucket: its per-minute histogram count / this = per second.
+RATE_BUCKET_SECONDS = 60
+
+
 class Translator:
     def __init__(self, mapping):
         self.metrics = mapping.get("metrics", {})
@@ -129,10 +143,15 @@ class Translator:
         self.log_labels = mapping.get("log_labels", {})
         self.hq = mapping.get("supports_histogram_quantile", True)
         # "native": Cardinal stores a histogram under its base name only (no
-        # _bucket/_sum/_count series); rate(M) is the request rate and
-        # max by (...) (M) is the latency value Cardinal's own dashboards use.
+        # _bucket/_sum/_count series). There rate(M) and sum(M) read the sum of the
+        # observed values (seconds of request time, for a duration), not the request
+        # count: requests need histogram_count(), averages histogram_avg().
         self.native_hist = set(mapping.get("native_histograms", []))
+        self.hq_ok = mapping.get("histogram_quantile_ok", {})
+        self.rate_mode = mapping.get("histogram_rate_mode", "unknown")
+        self.or_vector = mapping.get("supports_or_vector", True)
         self.drop_labels = set(mapping.get("drop_labels", []))
+        self.drop_log_labels = set(mapping.get("drop_log_labels", mapping.get("drop_labels", [])))
         self.const_vars = {}
 
     def resolve_metric(self, name):
@@ -164,12 +183,15 @@ class Translator:
             q, dropped = drop_matchers(q, self.drop_labels)
             if dropped:
                 notes.append(f"filter on label(s) not present in Cardinal removed: {', '.join(sorted(dropped))}")
+        if not self.or_vector and re.search(r"\bor\s+vector\(", q):
+            notes.append(f"{OR_VECTOR_NOOP}: the panel shows no data where Grafana shows 0")
         if self.native_hist:
             q, hnotes, ok = self._rewrite_native_histograms(q)
             notes += hnotes
             if not ok:
                 return None, notes
-        if not self.hq and "histogram_quantile" in q:
+        # Classic histograms only: a native one was already rewritten above (no _bucket left).
+        if not self.hq and "histogram_quantile" in q and "_bucket" in q:
             new = self._rewrite_histogram_quantile(q)
             if new is None:
                 return None, notes + ["histogram_quantile is not supported by this Cardinal instance and could not be rewritten"]
@@ -214,32 +236,68 @@ class Translator:
         return q, notes
 
     def _rewrite_native_histograms(self, q):
-        """Rewrite Prometheus classic-histogram idioms for Cardinal native histograms."""
+        """Rewrite Prometheus classic-histogram idioms for histograms Cardinal keeps
+        under their base name. On such a histogram rate(M)/sum(M) read the sum of the
+        observed values, so each idiom maps to the histogram function that answers it:
+        requests -> histogram_count, averages -> histogram_avg, percentiles ->
+        histogram_quantile where the catalog probe found it usable, else histogram_avg."""
         notes, fams = [], "|".join(sorted((re.escape(f) for f in self.native_hist), key=len, reverse=True))
         if not fams:
             return q, notes, True
-        sel = r"(\{[^}]*\})?"
-        # histogram_quantile(φ, sum by (le, X) (rate(M_bucket{sel}[w])))  ->  max by (X) (M{sel})
-        pat_hq = re.compile(r"histogram_quantile\(\s*([\d.]+)\s*,\s*sum\s*(?:by)?\s*\(([^)]*)\)\s*\(\s*(?:rate|irate|increase)\(\s*("
-                            + fams + r")_bucket" + sel + r"\s*\[[^\]]+\]\s*\)\s*\)\s*\)")
+        sel, win, fn = r"(\{[^}]*\})?", r"\s*\[([^\]]+)\]", r"(?:rate|irate|increase)"
+        # histogram_quantile(φ, sum by (le, X) (rate(M_bucket{sel}[w])))
+        pat_hq = re.compile(r"histogram_quantile\(\s*([\d.]+)\s*,\s*sum\s*(?:by)?\s*\(([^)]*)\)\s*\(\s*" + fn + r"\(\s*("
+                            + fams + r")_bucket" + sel + win + r"\s*\)\s*\)\s*\)")
+
         def hq(m):
+            phi, fam, s, w = m.group(1), m.group(3), m.group(4) or "", m.group(5)
             by = [g.strip() for g in m.group(2).split(",") if g.strip() and g.strip() != "le"]
-            notes.append(f"p{round(float(m.group(1)) * 100)} (histogram_quantile) not available in Cardinal: "
-                         f"uses the histogram's own value (max by ...), like Cardinal's built-in dashboards")
-            return f"max{' by (' + ', '.join(by) + ')' if by else ''} ({m.group(3)}{m.group(4) or ''})"
+            grp = f" by ({', '.join(by)})" if by else ""
+            pct = f"p{float(phi) * 100:g}"
+            if self.hq_ok.get(fam):
+                notes.append(f"{pct}: {PCT_ESTIMATE} (bucket resolution, so it can differ from Grafana's interpolation)")
+                return f"histogram_quantile({phi}, sum{grp} (rate({fam}{s}[{w}])))"
+            notes.append(f"{pct}: histogram_quantile gives no usable answer on this histogram in Cardinal; "
+                         f"{PCT_AS_AVG} (title says avg)")
+            return f"histogram_avg(sum{grp} (rate({fam}{s}[{w}])))"
         q = pat_hq.sub(hq, q)
-        # sum by (X)(rate(M_sum[w])) / sum by (X)(rate(M_count[w]))  (average)  ->  max by (X) (M{sel})
-        pat_avg = re.compile(r"\(?\s*sum\s*(?:by\s*\(([^)]*)\))?\s*\(\s*(?:rate|irate|increase)\(\s*(" + fams + r")_sum" + sel
-                             + r"\s*\[[^\]]+\]\s*\)\s*\)\s*/\s*sum\s*(?:by\s*\([^)]*\))?\s*\(\s*(?:rate|irate|increase)\(\s*\2_count"
+        # sum by (X)(rate(M_sum[w])) / sum by (X)(rate(M_count[w]))  (the average)
+        pat_avg = re.compile(r"\(?\s*sum\s*(?:by\s*\(([^)]*)\))?\s*\(\s*" + fn + r"\(\s*(" + fams + r")_sum" + sel + win
+                             + r"\s*\)\s*\)\s*/\s*sum\s*(?:by\s*\([^)]*\))?\s*\(\s*" + fn + r"\(\s*\2_count"
                              + sel + r"\s*\[[^\]]+\]\s*\)\s*\)\s*\)?")
+
         def avg(m):
-            notes.append("average (sum/count) rewritten to the histogram's own value (max by ...)")
-            return f"max{' by (' + m.group(1).strip() + ')' if m.group(1) else ''} ({m.group(2)}{m.group(3) or ''})"
+            notes.append("average (sum/count) computed with histogram_avg")
+            grp = f" by ({m.group(1).strip()})" if m.group(1) else ""
+            return f"histogram_avg(sum{grp} (rate({m.group(2)}{m.group(3) or ''}[{m.group(4)}])))"
         q = pat_avg.sub(avg, q)
-        # M_count -> M (rate()/increase() of a Cardinal histogram counts observations)
+        # rate(M_count[w]) is the request rate: histogram_count(rate(M[w])).
+        pat_cnt = re.compile(r"\b(rate|irate|increase)\(\s*(" + fams + r")_count" + sel + win + r"\s*\)")
+
+        def cnt(m):
+            f, fam, s, w = m.group(1), m.group(2), m.group(3) or "", m.group(4)
+            if self.rate_mode == "per_minute":
+                notes.append(f"{RATE_PER_MINUTE} (/60): correct at 1-minute resolution or finer; "
+                             "zoomed-out views overstate it until lakerunner answers per second")
+                per_s = f"histogram_count(rate({fam}{s}[{w}])) / {RATE_BUCKET_SECONDS}"
+                return f"({per_s} * {dur_seconds(w)})" if f == "increase" else f"({per_s})"
+            if self.rate_mode != "per_second":
+                notes.append("request rate as histogram_count(rate(...)): Cardinal's scale for it could not be "
+                             "measured; check the values against Grafana")
+            return f"histogram_count({'increase' if f == 'increase' else 'rate'}({fam}{s}[{w}]))"
+        q2 = pat_cnt.sub(cnt, q)
+        if q2 != q:
+            q = q2
+        # rate(M_sum[w]): the sum of observed values per second, which is what rate(M) reads.
+        q2 = re.sub(r"\b(rate|irate|increase)\(\s*(" + fams + r")_sum" + sel + win + r"\s*\)",
+                    lambda m: f"{m.group(1)}({m.group(2)}{m.group(3) or ''}[{m.group(4)}])", q)
+        if q2 != q:
+            notes.append("rate of the histogram's sum: rate() on a Cardinal histogram reads the sum of observed values")
+            q = q2
+        # Any other M_count (e.g. counting series): the histogram's series, presence only.
         q2 = re.sub(r"\b(" + fams + r")_count\b", r"\1", q)
         if q2 != q:
-            notes.append("histogram _count series replaced by the histogram itself (rate() counts requests in Cardinal)")
+            notes.append("histogram _count series replaced by the histogram itself (series presence, not a count)")
             q = q2
         left = re.findall(r"\b(?:" + fams + r")_(bucket|sum)\b", q)
         if left:
@@ -279,10 +337,10 @@ class Translator:
         if q2 != q:
             notes.append("'or vector(0)' fallback removed (not supported on log queries in Cardinal)")
             q = q2
-        if self.drop_labels:
-            q, dropped = drop_matchers(q, self.drop_labels)
+        if self.drop_log_labels:
+            q, dropped = drop_matchers(q, self.drop_log_labels)
             if dropped:
-                notes.append(f"filter on label(s) not present in Cardinal removed: {', '.join(sorted(dropped))}")
+                notes.append(f"filter on label(s) not present on Cardinal's logs removed: {', '.join(sorted(dropped))}")
             # A LogQL stream selector can't be empty; match every service instead.
             q = re.sub(r"\{\s*\}", '{service_name=~".+"}', q)
         before = q
@@ -377,19 +435,28 @@ def convert_variables(dash, tr, datasources):
     return variables, notes
 
 
+def avg_title(text):
+    """'p95 latency' -> 'avg latency'; a title without a pNN gets ' (avg)'."""
+    new, n = re.subn(r"\b[pP](50|75|90|95|99|999)\b", "avg", text or "")
+    if not n:
+        new, n = re.subn(r"(?i)\bpercentiles?\b", "average", new)
+    return new if n else f"{text} (avg)"
+
+
 def convert_panel(p, tr, datasources, pid):
-    """Return (cardinal_panel | None, status, notes)."""
+    """Return (cardinal_panel | None, status, notes, refs): refs are the Grafana refIds
+    of the panel's Cardinal queries, in order (for the Grafana value comparison)."""
     gtype = p.get("type")
     title = p.get("title") or "Untitled"
     notes = []
     panel_ds = ds_type(p.get("datasource"), datasources)
 
     if gtype in ("text", "news", "dashlist", "alertlist", "annolist", "welcome", "gettingstarted"):
-        return None, "skipped", [f"'{gtype}' panels have no Cardinal equivalent"]
+        return None, "skipped", [f"'{gtype}' panels have no Cardinal equivalent"], []
     if gtype in ("traces", "nodeGraph", "flamegraph") or panel_ds in ("tempo", "jaeger", "zipkin", "grafana-pyroscope-datasource"):
-        return None, "skipped", ["trace/profile panels are not supported in Cardinal dashboards; use Cardinal's trace explorer"]
+        return None, "skipped", ["trace/profile panels are not supported in Cardinal dashboards; use Cardinal's trace explorer"], []
 
-    queries, logs_exprs = [], []
+    queries, logs_exprs, refs, log_refs = [], [], [], []
     for t in p.get("targets", []):
         if t.get("hide"):
             continue
@@ -410,34 +477,43 @@ def convert_panel(p, tr, datasources, pid):
         notes += n
         if new is None:
             continue
+        legend = t.get("legendFormat")
+        if any(PCT_AS_AVG in x for x in n) and legend:
+            legend = avg_title(legend) if re.search(r"\b[pP]\d+\b", legend) else legend
         if t.get("format") == "heatmap":
             notes.append("heatmap-format query kept as a plain series")
         q = {"query": new, "queryKind": kind}
-        legend = t.get("legendFormat")
         if legend and legend != "__auto":
             renames = {**tr.labels, **tr.log_labels} if kind == "loki" else tr.labels
             q["name"] = re.sub(r"\{\{\s*([\w.]+)\s*\}\}", lambda m: "{{" + renames.get(m.group(1), m.group(1)) + "}}", legend)
         if kind == "loki" and not re.search(r"(_over_time|rate)\s*\(", new):
             logs_exprs.append(new)
+            log_refs.append(t.get("refId"))
+        elif any(x["query"] == new for x in queries):
+            # p50/p95/p99 that all became the same average: one series, not three.
+            notes.append("queries that became identical were merged")
         else:
             queries.append(q)
+            refs.append(t.get("refId"))
 
     fc = (p.get("fieldConfig") or {}).get("defaults", {}) or {}
     unit = UNIT_MAP.get(fc.get("unit", ""), fc.get("unit", ""))
+    if any(PCT_AS_AVG in x for x in notes):
+        title = avg_title(title)
     base = {"id": pid, "title": title}
     if p.get("description"):
         base["description"] = p["description"]
 
     if gtype == "logs" or (logs_exprs and not queries):
         if not logs_exprs:
-            return None, "skipped", notes + ["no usable log query"]
+            return None, "skipped", notes + ["no usable log query"], []
         panel = dict(base, kind="log-events", queries=[], rawLogql=logs_exprs[0], limit=100)
         if len(logs_exprs) > 1:
             notes.append("only the first log query was kept")
-        return panel, ("adapted" if notes else "migrated"), notes
+        return panel, ("adapted" if notes else "migrated"), notes, log_refs[:1]
 
     if not queries:
-        return None, "skipped", notes + ["no query could be migrated"]
+        return None, "skipped", notes + ["no query could be migrated"], []
 
     custom = fc.get("custom", {}) or {}
     calc = CALC_MAP.get(((p.get("options") or {}).get("reduceOptions") or {}).get("calcs", ["lastNotNull"])[0:1][0] if ((p.get("options") or {}).get("reduceOptions") or {}).get("calcs") else "lastNotNull", "last")
@@ -494,7 +570,9 @@ def convert_panel(p, tr, datasources, pid):
         panel = dict(base, kind="timeseries", queries=queries)
         notes.append(f"unknown panel type '{gtype}' shown as a time series chart")
 
-    return panel, ("adapted" if notes else "migrated"), notes
+    if panel["kind"] == "stat":
+        refs = refs[:1]
+    return panel, ("adapted" if notes else "migrated"), notes, refs
 
 
 def flatten_sections(dash):
@@ -526,9 +604,14 @@ def convert_dashboard(dash, tr, datasources):
         for p in sec["panels"]:
             n += 1
             pid = f"p{n}"
-            cp, status, notes = convert_panel(p, tr, datasources, pid)
-            report["panels"].append({"title": p.get("title"), "grafana_type": p.get("type"),
-                                     "status": status, "notes": sorted(set(notes))})
+            cp, status, notes, refs = convert_panel(p, tr, datasources, pid)
+            entry = {"title": p.get("title"), "grafana_type": p.get("type"), "grafana_id": p.get("id"),
+                     "status": status, "notes": sorted(set(notes))}
+            if cp:
+                entry.update(cardinal_id=pid, query_refs=refs)
+                if cp["title"] != p.get("title"):
+                    entry["cardinal_title"] = cp["title"]
+            report["panels"].append(entry)
             if not cp:
                 continue
             gp = p.get("gridPos", {}) or {}

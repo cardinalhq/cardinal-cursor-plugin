@@ -9,9 +9,14 @@ with `.+` ("All"). Each item ends with a RESULT line:
   WARN  in Cardinal, but some queries return no data or an error
   FAIL  not in Cardinal, or no query returns data
 
+With --grafana-env, each dashboard's values are also compared with the Grafana panels
+they came from (grafana_compare.py): a panel that returns data but disagrees with
+Grafana (counts something else, reads other series) makes the dashboard WARN.
+
 Usage:
   cardinal_verify.py --plan ./plan --catalog ./catalog [--dashboard <uid> ...] [--alert <name-or-number> ...]
                      [--window 1h] [--env-file .env.cardinal]
+                     [--grafana-env .env.grafana-migrate --export ./export --mapping ./mapping.json]
 
 Writes plan/verify.json (merged across runs). Exits 1 if any item FAILs.
 """
@@ -24,6 +29,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cardinal_apply import load_applied, plan_alerts, plan_dashboards, select  # noqa: E402
 from cardinal_catalog import Cardinal, NativeQuery, load_env_file, rule_states  # noqa: E402
+from grafana_compare import PROBLEMS, GrafanaQuery, cardinal_expr, compare_dashboard  # noqa: E402
 
 
 def window_ms(w):
@@ -31,20 +37,49 @@ def window_ms(w):
     return n * {"m": 60_000, "h": 3_600_000, "d": 86_400_000}[u]
 
 
-def verdict(present, rows):
-    ok = sum(1 for r in rows if r["points"] and not r["error"])
+def has_data(r):
+    # `X or vector(0)` with no X answers nothing in lakerunner where Grafana shows 0:
+    # that's "nothing to report", not a broken panel.
+    return bool((r["points"] and not r["error"]) or (not r["error"] and (
+        re.search(r"\bor\s+vector\(", r["query"]) or r.get("grafana_empty_too"))))
+
+
+def agreed_empty(rows, compared):
+    """Mark queries with no data in Cardinal that Grafana has no data for either (no 5xx
+    errors to show, a service with no traffic): nothing is wrong with the panel."""
+    empty = {(r["panel"], cardinal_expr(r.get("query", ""))) for r in compared if r["verdict"] in ("empty", "zero")}
+    for r in rows:
+        r["grafana_empty_too"] = (r["panel"], r["query"]) in empty
+
+
+def verdict(present, rows, compared=()):
+    ok = sum(1 for r in rows if has_data(r))
     if not present or (rows and ok == 0):
         return "FAIL"
+    if any(r["verdict"] in PROBLEMS for r in compared):
+        return "WARN"
     return "PASS" if ok == len(rows) else "WARN"
 
 
 def report_rows(rows):
-    ok = sum(1 for r in rows if r["points"] and not r["error"])
+    ok = sum(1 for r in rows if has_data(r))
     mark = "✓" if ok == len(rows) else "⚠"
     print(f"  {mark} {ok}/{len(rows)} queries return data")
     for r in rows:
         if r["error"] or not r["points"]:
-            print(f"    - {r['panel']}: {'ERROR ' + r['error'] if r['error'] else 'no data'}")
+            what = "ERROR " + r["error"] if r["error"] else \
+                "no data (Grafana has none either)" if r.get("grafana_empty_too") else \
+                "no data (Grafana's `or vector(0)` shows 0 here)" if has_data(r) else "no data"
+            print(f"    - {r['panel']}: {what}")
+
+
+def report_compared(rows):
+    counted = [r for r in rows if r["verdict"] not in ("skipped",)]
+    bad = [r for r in counted if r["verdict"] in PROBLEMS]
+    print(f"  {'⚠' if bad else '✓'} values match Grafana for {len(counted) - len(bad)}/{len(counted)} compared queries")
+    for r in rows:
+        if r["verdict"] in PROBLEMS or r["verdict"] == "estimate":
+            print(f"    - {r['panel']}: {r['verdict']}: {r['detail']}")
 
 
 def main():
@@ -55,8 +90,21 @@ def main():
     ap.add_argument("--alert", action="append", help="alert rule name or number from --list (repeatable)")
     ap.add_argument("--window", default="1h")
     ap.add_argument("--env-file")
+    ap.add_argument("--grafana-env", help="compare values with Grafana (GRAFANA_URL, GRAFANA_TOKEN)")
+    ap.add_argument("--export", default="export", help="the Grafana export (with --grafana-env)")
+    ap.add_argument("--mapping", default="mapping.json", help="the reviewed mapping (with --grafana-env)")
     args = ap.parse_args()
     load_env_file(args.env_file)
+    gq = None
+    if args.grafana_env:
+        load_env_file(args.grafana_env)
+        if not (os.environ.get("GRAFANA_URL") and os.environ.get("GRAFANA_TOKEN")):
+            sys.exit(f"--grafana-env: GRAFANA_URL and GRAFANA_TOKEN must be set in {args.grafana_env}")
+        gq = GrafanaQuery(os.environ["GRAFANA_URL"], os.environ["GRAFANA_TOKEN"],
+                          json.load(open(os.path.join(args.export, "datasources.json"))))
+        mapping = json.load(open(args.mapping)) if os.path.exists(args.mapping) else {}
+        report = json.load(open(os.path.join(args.plan, "report.json")))
+        report_by_uid = {d["uid"]: d for d in report.get("dashboards", [])}
 
     dashboards, alerts = plan_dashboards(args.plan), plan_alerts(args.plan)
     picking = args.dashboard is not None or args.alert is not None
@@ -102,13 +150,22 @@ def main():
                 expr = re.sub(r"\$\{?\w+\}?", ".+", expr)
                 points, err = nq.query("logs" if kind == "loki" else "metrics", expr)
                 rows.append({"panel": p["title"], "query": expr, "points": points, "error": err})
+        compared = []
+        if gq:
+            compared = compare_dashboard(uid, d, report_by_uid.get(uid, {}), args.export, gq,
+                                         NativeQuery(c, inst["id"]), mapping)
+            agreed_empty(rows, compared)
         report_rows(rows)
-        v = verdict(present, rows)
+        if gq:
+            report_compared(compared)
+        v = verdict(present, rows, compared)
         failed += v == "FAIL"
         print(f"  RESULT: {v}")
         results["dashboards"][uid] = {"name": d["name"], "present": present, "result": v, "rows": rows,
                                       "queries": len(rows),
-                                      "with_data": sum(1 for r in rows if r["points"] and not r["error"])}
+                                      "with_data": sum(1 for r in rows if has_data(r))}
+        if gq:
+            results["dashboards"][uid]["grafana_comparison"] = compared
 
     states_by_lake = {}
     for n, a in alert_sel:

@@ -95,6 +95,9 @@ def main() -> int:
     print(f"Mode:        {state.get('mode', 'unknown')}")
     print(f"User:        {state.get('user_email')}")
     print(f"Org:         {state.get('org_slug') or state.get('org_id')}")
+    if state.get("act_key_id"):
+        scopes = state.get("act_scopes") or ["maestro:act"]
+        print(f"Actions:     enabled ({', '.join(scopes)})")
     print(f"Host:        {state.get('host')}")
     print(f"Plugin ver:  {state.get('plugin_version')}")
 

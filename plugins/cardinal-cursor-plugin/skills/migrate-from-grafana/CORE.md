@@ -158,8 +158,11 @@ lake too.
 This lists Cardinal's real metric and label names and writes
 `catalog/mapping.suggested.json`: for every metric the Grafana queries use, the
 Cardinal name it most likely corresponds to (Prometheus-style names in Grafana
-carry `_total` / unit suffixes that lakerunner may not). It also probes whether
-this Cardinal instance supports `histogram_quantile`.
+carry `_total` / unit suffixes that lakerunner may not). It also measures how this
+Cardinal instance answers the queries the converter will write, instead of assuming:
+`histogram_quantile` per histogram (`histogram_quantile_ok`), how it counts requests
+from a histogram (`histogram_rate_mode`) and whether `or vector(0)` works
+(`supports_or_vector`).
 
 Then **review the mapping** — this is where migrations go wrong silently, because a
 wrong name produces a dashboard that renders but shows "No data":
@@ -173,12 +176,24 @@ wrong name produces a dashboard that renders but shows "No data":
   tell the user — that's a data-onboarding gap, not a migration problem.
 - Copy the reviewed result to `mapping.json` (drop the `_review` key).
 
-Also check `native_histograms` (Cardinal stores these histograms under the base name
-only — no `_bucket/_sum/_count`; the converter rewrites the queries) and `drop_labels`
-(labels or exact filter values the Grafana queries use that don't exist in Cardinal,
-e.g. an environment label whose value differs between the two pipelines; those
-filters are removed). Confirm with the user that removing a filter is right — it
-widens what the panel shows.
+Also check:
+- `native_histograms`: Cardinal stores these histograms under the base name only (no
+  `_bucket/_sum/_count`). There `rate()`/`sum()` read the sum of observed values, not
+  the request count; the converter uses `histogram_count`, `histogram_avg` and
+  `histogram_quantile` instead (`references/translation-rules.md`).
+- `histogram_rate_mode`: `per_second` is Prometheus semantics. `per_minute` means
+  lakerunner counts per 60s rollup: request-rate panels divide by 60 and are right at
+  1-minute resolution or finer but overstated in zoomed-out views. Tell the user.
+- `histogram_quantile_ok`: `false` for a histogram means Cardinal gives no usable
+  percentile for it (e.g. negative values when observations are 0): its p50/p95/p99
+  panels show the average and are retitled "avg". Tell the user which ones.
+- `drop_labels` (metric queries) and `drop_log_labels` (log queries): filters on labels
+  or exact values that don't exist on that signal in Cardinal, e.g. an environment
+  label whose value differs between the two pipelines. Those filters are removed,
+  per signal. Removing a filter **widens** the query, possibly to other sources in the
+  org (a log panel can start showing every service's logs): confirm each with the
+  user, and prefer an equivalent filter that does exist (e.g. a cluster label) by
+  adding it to the mapping's `labels`.
 
 If the catalog comes back empty, the org isn't receiving data yet; stop and say so.
 
@@ -196,10 +211,14 @@ dropped — read it when a result looks surprising or the user asks why somethin
 changed.
 
 Summarise the report for the user before writing anything: counts per status, and
-every **adapted** item whose meaning changed (the important one: when Cardinal doesn't
-support `histogram_quantile`, p50/p95/p99 panels and alerts use the histogram's own
-value instead of a true percentile — the title still says "p95", so call these out and
-offer to rename them) and every **skipped** item with its reason.
+every **adapted** item whose meaning changed, especially:
+- percentile panels showing the **average** (retitled "avg"), and percentiles Cardinal
+  estimates from its sketch (bucket resolution, so they can differ from Grafana's);
+- request rates divided by 60 (`per_minute` mode): right at 1-minute resolution only;
+- removed filters (wider queries);
+- `or vector(0)` panels that show no data instead of 0.
+Alert rules get the same translations, and their names are kept: say when a rule that
+says "p95" now compares the average. List every **skipped** item with its reason.
 
 ### 4. Dry run
 
@@ -241,13 +260,19 @@ Then, for each dashboard `i` of `N` in that order (`<uid>` from the list):
 3. Say one line: **Dashboard i/N — "<name>": validating…**
 4. Validate it (command description: `Validate dashboard i/N: <name>`):
    ```bash
-   python3 $SCRIPTS/cardinal_verify.py --env-file .env.cardinal --plan plan --catalog catalog --dashboard <uid>
+   python3 $SCRIPTS/cardinal_verify.py --env-file .env.cardinal --plan plan --catalog catalog --dashboard <uid> \
+       --grafana-env .env.grafana-migrate --export export --mapping mapping.json
    ```
-   It checks the dashboard exists in Cardinal and runs every panel query (variables
-   set to "All"), ending with `RESULT: PASS | WARN | FAIL`.
+   It checks the dashboard exists in Cardinal, runs every panel query (variables
+   set to "All") and **compares the values with the Grafana panels they came from**
+   over the last 15 minutes. A query that returns data can still count the wrong
+   thing; this catches it. Ends with `RESULT: PASS | WARN | FAIL`. A panel that
+   disagrees with Grafana (`differs`), lacks series Grafana has (`missing`) or has
+   series Grafana doesn't (`extra`, e.g. a removed filter let other sources in) makes
+   it WARN. No data where Grafana has none either is fine.
 5. Say one line with the outcome and the link, e.g.
-   `✓ PASS — 8/8 panels have data → <link>` or
-   `⚠ WARN — 4/5 panels have data ("Refund p99": no data) → <link>`,
+   `✓ PASS — 8/8 panels have data, 8/8 match Grafana → <link>` or
+   `⚠ WARN — 8/8 have data, "Requests / sec" is ×0.14 of Grafana → <link>`,
    then go straight on to the next dashboard.
 
 Then the alert rules, the same way, with `--alert <number>` (from `--list`) and
@@ -283,7 +308,10 @@ Rules for the loop:
 After the loop, for items with problems: a query **ERROR** is a translation problem —
 fix the mapping or query, re-run `convert.py`, then migrate + validate just that item
 again (it updates in place). **No data** while Grafana has data usually means a wrong
-metric/label mapping or data that isn't flowing to Cardinal; say which.
+metric/label mapping or data that isn't flowing to Cardinal; say which. **`differs`**
+means the query measures something else (wrong function or metric) or the data
+differs; **`extra`** usually means a removed filter widened the query. Never call a
+dashboard correct on "returns data" alone when the comparison disagrees.
 
 Note: Cardinal's query API is not the Prometheus HTTP API. Queries go to
 `POST /api/lakerunner/<instance>/query/{metrics|logs}/query` with `{q, s, e, step}`
@@ -298,7 +326,8 @@ Give the user a short migration report, built from `plan/applied.json`,
 - Dashboards: name → Cardinal link (`{CARDINAL_URL}/dashboards/{id}`), panels migrated/adapted/skipped
 - Alerts: name → created/updated, enabled or disabled, which data lake, and any meaning changes
 - Everything skipped, and why
-- Validation result per item (PASS / WARN / FAIL) and the panels that returned no data
+- Validation result per item (PASS / WARN / FAIL), the panels that returned no data, and
+  every panel whose values don't match Grafana (from `grafana_comparison` in verify.json)
 - Follow-ups: rotate/delete the Grafana token if it was created for this; alert
   notification routing (Grafana contact points / policies do **not** carry over —
   the user sets up Cardinal notification groups, then attaches them to the rules)
