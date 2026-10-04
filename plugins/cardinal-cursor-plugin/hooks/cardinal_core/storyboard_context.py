@@ -10,7 +10,7 @@ actor email and PR resolver (Claude Code: bin/cardinal-storyboard context).
 
 Contract (conductor packages/maestro/src/storyboard/context.ts sanitizes the
 same fields again, server-side; this side only avoids sending junk):
-  - Keys come from CONTEXT_FIELDS only. A key whose value is unknown or
+  - Keys come from CONTEXT_FIELDS (plus `paths`) only. A key whose value is unknown or
     invalid is omitted, never sent as null.
   - Never an absolute path. `repo_path` is relative to the git toplevel
     ("." at the root); the directory itself is identified only by
@@ -18,6 +18,13 @@ same fields again, server-side; this side only avoids sending junk):
   - Never raises: a failing git, a slow `gh`, a resolver that throws, each
     just drops the fields it would have produced.
   - Labels only, never authorization: maestro decides who may update what.
+  - `branch` is omitted on a protected branch (main, master, develop,
+    trunk): find never looks a default branch up, and a storyboard written
+    on main is not "about" main.
+  - `paths`: the repo-relative files this session edited in this repo
+    (storyboard_files), only when the caller knows the session
+    (`edited_paths`). They are where the act was written from, never what it
+    is about.
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ import re
 import socket
 from typing import Any, Callable, Optional
 
-from .initiative import canonical_repo, git
+from .initiative import PROTECTED_BRANCHES, canonical_repo, git
 
 # The context fields maestro stores (conductor storyboard/context.ts). There is
 # deliberately no cwd: an absolute path is PII and not needed for matching.
@@ -44,8 +51,12 @@ CLIENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}(/[A-Za-z0-9._+-]{1,64})?$")
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 BRANCH_BAD_RE = re.compile(r"[\s\x00-\x1f\x7f]")
 PR_MAX = 2 ** 31 - 1
+# conductor storyboard/context.ts MAX_CONTEXT_PATHS.
+MAX_PATHS = 50
 
 PrResolver = Callable[[str, str, str], Any]
+# edited_paths(repo) -> the repo-relative files this session edited in repo.
+EditedPaths = Callable[[str], Any]
 
 
 def workdir_hash(realpath: str, hostname: Optional[str] = None) -> str:
@@ -83,6 +94,24 @@ def _branch(cwd: str) -> Optional[str]:
     if not branch or branch == "HEAD" or len(branch) > 255 or BRANCH_BAD_RE.search(branch):
         return None
     return branch
+
+
+def _paths(edited_paths: EditedPaths, repo: str) -> Optional[list]:
+    from .storyboard_files import valid_rel_path
+
+    try:
+        found = edited_paths(repo)
+    except Exception:
+        return None
+    if not isinstance(found, (list, tuple)):
+        return None
+    out: list = []
+    for p in found:
+        if valid_rel_path(p) and p not in out:
+            out.append(p)
+        if len(out) == MAX_PATHS:
+            break
+    return out or None
 
 
 def _head_sha(cwd: str) -> Optional[str]:
@@ -129,12 +158,15 @@ def collect(
     actor_email: Optional[str] = None,
     hostname: Optional[str] = None,
     pr_resolver: Optional[PrResolver] = None,
+    edited_paths: Optional[EditedPaths] = None,
 ) -> dict:
     """The context dict for cwd (see the module docstring). Never raises.
 
     pr_resolver(cwd, repo, branch) -> (number, url) looks up the branch's PR;
     None skips the lookup. decisions.resolve_pr (gh, cached) is the usual one,
-    see default_pr_resolver."""
+    see default_pr_resolver. edited_paths(repo) -> [repo-relative path]: the
+    files this session edited (storyboard_files.for_repo); None (the session
+    is unknown) sends no `paths`."""
     ctx: dict = {}
     try:
         real = os.path.realpath(cwd)
@@ -149,6 +181,8 @@ def collect(
         if git(["rev-parse", "--is-inside-work-tree"], cwd) == "true":
             repo = _repo(cwd)
             branch = _branch(cwd)
+            if branch in PROTECTED_BRANCHES:
+                branch = None
             ctx.update({
                 "repo": repo,
                 "repo_path": _repo_path(cwd),
@@ -159,13 +193,19 @@ def collect(
                 ctx["pr_number"], ctx["pr_url"] = _pr(pr_resolver, cwd, repo, branch)
     except Exception:
         pass
+    paths = None
+    if edited_paths is not None and isinstance(ctx.get("repo"), str):
+        paths = _paths(edited_paths, ctx["repo"])
     if isinstance(client, str) and CLIENT_RE.match(client):
         ctx["client"] = client
     ctx["actor_email"] = _email(actor_email)
     ctx = {k: ctx[k] for k in CONTEXT_FIELDS if ctx.get(k) is not None}
     if "workdir_hash" in ctx and not WORKDIR_HASH_RE.match(ctx["workdir_hash"]):
         del ctx["workdir_hash"]
-    return _no_paths(ctx, real)
+    out = _no_paths(ctx, real)
+    if paths and "repo" in out:
+        out["paths"] = paths
+    return out
 
 
 def default_pr_resolver(cache_dir) -> PrResolver:

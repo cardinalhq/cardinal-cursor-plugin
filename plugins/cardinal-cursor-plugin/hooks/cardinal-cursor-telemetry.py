@@ -1188,7 +1188,42 @@ def decision_context(conv_id: str) -> str | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Storyboard associations (cardinal_core.storyboard_agent): the session id +
+# discovery block at sessionStart, and the files the agent edited
+# (afterFileEdit). Cursor's beforeMCPExecution answers with a permission only
+# (allow / deny / ask) and cannot rewrite the call's input, so there is no
+# automatic context stamping here: the sessionStart text names
+# `cardinal-storyboard context` for the agent to pass as `context`.
+# afterFileEdit's shape is Cursor's documented one (file_path absolute,
+# edits [{old_string, new_string}]); no payload was captured from a live
+# Cursor (tests/test_cursor_storyboard.py, "from docs, unverified").
+# ---------------------------------------------------------------------------
+
+STORYBOARD_CLI = Path(__file__).resolve().parent.parent / "scripts" / "cardinal-storyboard"
+
+
+def storyboard_wiring():
+    from cardinal_core import storyboard_agent
+
+    return storyboard_agent.Wiring("cursor", PATHS, PLUGIN_VERSION, cli=str(STORYBOARD_CLI))
+
+
+def handle_after_file_edit(payload: dict[str, Any]) -> None:
+    """Record the edited file in storyboard_files (`context.paths`). Local
+    only, no output."""
+    dump_debug_payload("afterFileEdit", payload)
+    path = payload.get("file_path") or payload.get("filePath")
+    if not isinstance(path, str) or not path:
+        return
+    from cardinal_core import storyboard_agent
+
+    storyboard_agent.record_edits(storyboard_wiring(), conv_id_from_payload(payload), [path],
+                                  cwd_from_payload(payload))
+
+
 def handle_session_start(payload: dict[str, Any]) -> None:
+    started = time.monotonic()
     cwd = cwd_from_payload(payload)
     conv_id = conv_id_from_payload(payload)
     parts: list[str] = []
@@ -1208,6 +1243,17 @@ def handle_session_start(payload: dict[str, Any]) -> None:
                 parts.append(decision)
         except Exception:
             pass
+    try:
+        # The session id line (any directory) + the storyboards that may
+        # relate to this checkout, bounded well inside the hook's 5 s.
+        from cardinal_core import storyboard_agent
+
+        storyboard = storyboard_agent.session_start_text(
+            storyboard_wiring(), cwd, conv_id, deadline=min(started + 3.5, time.monotonic() + 2.0))
+        if storyboard:
+            parts.append(storyboard)
+    except Exception:
+        pass
     if not parts:
         return
     sys.stdout.write(json.dumps({"additional_context": "\n\n".join(parts)}))
@@ -1227,6 +1273,7 @@ HANDLERS = {
     "beforeSubmitPrompt": handle_before_submit_prompt,
     "postToolUse": handle_post_tool_use,
     "postToolUseFailure": handle_post_tool_use_failure,
+    "afterFileEdit": handle_after_file_edit,
     "preCompact": handle_pre_compact,
     "stop": handle_stop,
     "subagentStop": handle_subagent_stop,
