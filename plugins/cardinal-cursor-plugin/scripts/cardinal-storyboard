@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""cardinal-storyboard — local facts for Cardinal Investigation Storyboards
+(Cursor adapter).
+
+  context [--cwd DIR] [--session-id ID]   {"context": {...}} for
+      storyboard__find / create / add_act: repo, branch, PR, HEAD, the
+      files this session edited (with --session-id), client
+      cursor/<plugin version>. Never an absolute path. Always exits 0.
+  discover [--cwd DIR] [--json]            the storyboards that may relate
+      to this PR, branch or commit (the block session start injects).
+
+At session start the plugin tells the agent this session's id and this
+command; pass its output as `context`. The fields are labels for finding a
+storyboard, never authorization. Logic: the vendored
+cardinal_core.storyboard_agent (shared with the Codex, Cursor and Gemini
+adapters).
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+HOOKS = Path(__file__).resolve().parent.parent / "hooks"
+sys.path.insert(0, str(HOOKS))
+
+SESSION_ENV = ()
+
+
+def plugin_version():
+    from _plugin_version import plugin_version as version
+    return version()
+
+
+if __name__ == "__main__":
+    try:
+        from cardinal_core import storyboard_agent
+    except Exception:  # fail open: an install without its vendored core
+        if sys.argv[1:2] == ["context"]:
+            sys.stdout.write('{"context":{}}\n')
+        sys.exit(0)
+
+    storyboard_agent.launcher_main("cursor", "Cursor", ".cursor", plugin_version,
+                                   str(Path(__file__).resolve()), SESSION_ENV)

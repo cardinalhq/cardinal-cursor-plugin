@@ -89,6 +89,36 @@ The `postToolUse` and `postToolUseFailure` hooks record every tool call (Cursor'
 
 `postToolUseFailure` is registered by `cardinal-connect` from this version on: re-run `cardinal-connect --rotate` (or `--project` for cloud agents) to pick it up. Its payload fields are not yet verified against a live Cursor build; the hook reads the error from `error` / `error_message` / `errorMessage` and falls back to `tool_output`, and `CARDINAL_CURSOR_DEBUG_PAYLOADS=1` dumps the real payload.
 
+## Storyboard associations
+
+Where a storyboard is written from (repo, branch, PR, HEAD, the files this
+conversation edited) is recorded on each act as its `context`, and
+storyboards that may relate to the checkout are shown at session start.
+Shared logic: `cardinal_core.storyboard_agent`.
+
+- **sessionStart** (the existing hook): when Cardinal MCP is connected,
+  `additional_context` names this conversation's id (for
+  `storyboard__create`, `storyboard__add_act` and `storyboard__find`
+  `session_id`) and `scripts/cardinal-storyboard context --bare --session-id
+  <id>`, which prints the `context` object itself to pass (without `--bare`
+  it is wrapped in `{"context": {…}}`), plus the storyboards that may
+  relate to this branch, PR or commit (at most 3, 2 KB, framed as data; gh
+  cache only, a 2 s network deadline, `X-Cardinal-Client: cursor/<plugin
+  version>`). Off: `CARDINAL_STORYBOARD_DISCOVERY=0` (the storyboards) or
+  `CARDINAL_STORYBOARD_SESSION_START=0` (all of it).
+- **Edited files**: `afterFileEdit` (registered by `cardinal-connect` from
+  this version on; re-run it) records the edited `file_path` for
+  `context.paths`. Local only, no output.
+- **Automatic context: not supported by Cursor's hook system; SessionStart +
+  CLI used.** `beforeMCPExecution` answers with a permission
+  (allow / deny / ask) and cannot rewrite the call's input, so nothing is
+  registered for it.
+
+No Cursor payload has been captured for these hooks (no Cursor build was
+available): the `afterFileEdit` shape (`file_path` absolute, `edits`) and the
+`beforeMCPExecution` limits are from Cursor's hooks documentation and are
+unverified. `CARDINAL_CURSOR_DEBUG_PAYLOADS=1` dumps the real payloads.
+
 ## Cloud agents
 
 Cursor cloud agents do **not** load `~/.cursor/hooks.json`. They only load `.cursor/hooks.json` at the repo root, plus team/enterprise hooks distributed centrally. To send Cardinal telemetry from cloud-agent runs:
@@ -140,6 +170,7 @@ python3 scripts/cardinal-connect --telemetry-only
 python3 scripts/cardinal-connect --project
 python3 scripts/cardinal-connect --dry-run
 python3 scripts/cardinal-status
+python3 scripts/cardinal-storyboard context --session-id <conversation id>
 python3 scripts/cardinal-disconnect
 python3 scripts/cardinal-disconnect --force
 ```
