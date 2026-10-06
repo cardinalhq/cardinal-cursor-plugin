@@ -42,6 +42,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from convert import guess_kind_from_query, post_parser_spans  # noqa: E402
+
 UNIT_SUFFIXES = ["_seconds", "_milliseconds", "_microseconds", "_nanoseconds", "_bytes", "_bits",
                  "_ratio", "_percent", "_celsius", "_meters", "_hertz", "_volts", "_amperes",
                  "_joules", "_grams", "_minutes", "_hours", "_days"]
@@ -274,9 +277,10 @@ class NativeQuery:
         return out
 
     def tags(self, signal, metric=None):
+        """Label names, or None when Cardinal didn't answer (not the same as "no labels")."""
         body = dict(self.range, **({"q": metric} if metric else {}))
         code, resp = self.c.req("POST", f"{self.base}/{signal}/tags", body=body)
-        return resp.get("tags", []) if code == 200 and isinstance(resp, dict) else []
+        return resp.get("tags", []) if code == 200 and isinstance(resp, dict) else None
 
     def tag_values(self, signal, tag):
         code, resp = self.c.req("POST", f"{self.base}/{signal}/tagvalues",
@@ -400,45 +404,61 @@ def probe_or_vector(native, metric):
     return bool(vals) and not err
 
 
+DROP_KEY = {"metrics": "drop_labels", "logs": "drop_log_labels"}
+
+
 def decide_label_drops(matchers, used, metric_labels, log_labels, values, renames=None):
-    """Which label filters to remove, per signal.
+    """Filters that can't match Cardinal's data, per signal: PROPOSALS for the user to
+    review, never applied by this script (the mapping's drop lists stay empty). Removing a
+    filter widens the query, possibly to other environments, services or status codes,
+    so it is the user's call; a kept filter at worst shows "no data", which validation
+    reports.
 
     matchers: {"metrics"|"logs": {(label, value), ...}} literal `label="value"` filters
-    used:     {"metrics"|"logs": {label, ...}} every label the queries reference
+    used:     {"metrics"|"logs": {label, ...}} labels the queries filter on (any operator)
+    metric_labels / log_labels: label names Cardinal has, or None when it couldn't be
+              asked (then nothing is proposed for that signal)
     values:   (signal, label) -> set of values Cardinal has for it (or None)
     renames:  {grafana label: cardinal label} applied before checking
-    A filter is removed only from the signal that lacks it: a label that exists on
-    logs but not on these metrics stays on the log queries.
-    Returns ({"metrics": set, "logs": set}, review notes)."""
+    A missing label proposes "label"; a label that exists but lacks the value proposes
+    "label=value" (that filter only). Values are only advisory: a value seen rarely (an
+    error status when nothing failed lately) is normal, not a reason to remove a filter.
+    Returns ({"metrics": set, "logs": set} of proposals, review notes)."""
     have = {"metrics": metric_labels, "logs": log_labels}
     renames = renames or {}
-    drops, review = {"metrics": set(), "logs": set()}, []
+    props, review = {"metrics": set(), "logs": set()}, []
     for sig in ("metrics", "logs"):
+        if not matchers.get(sig) and not used.get(sig):
+            continue
+        if have[sig] is None:
+            review.append({"signal": sig, "issue": f"Cardinal didn't list the labels on its {sig}: no {sig} filter "
+                                                   "was checked (all are kept as in Grafana)"})
+            continue
+        missing = set()
+        for label in sorted(set(used.get(sig, ())) | {lab for lab, _ in matchers.get(sig, ())}):
+            if label in ("detected_level", "__name__", "le") or renames.get(label, label) in have[sig]:
+                continue
+            missing.add(label)
+            props[sig].add(label)
+            review.append({"label": label, "signal": sig, "suggested_drop": label,
+                           "issue": f"label not on the {sig} in Cardinal: queries filtering on it show no data. "
+                                    "Prefer mapping it to an equivalent Cardinal label (mapping 'labels'); only "
+                                    f"if the user agrees to widen those queries, add it to {DROP_KEY[sig]}",
+                           "present_on_other_signal": bool(have["logs" if sig == "metrics" else "metrics"])
+                           and label in have["logs" if sig == "metrics" else "metrics"]})
         for label, value in sorted(matchers.get(sig, ())):
-            if label in ("detected_level", "__name__") or label in drops[sig]:
+            if label in missing or label in ("detected_level", "__name__"):
                 continue
-            name = renames.get(label, label)
-            if name not in have[sig]:
-                drops[sig].add(label)
-                review.append({"label": label, "value": value, "signal": sig,
-                               "issue": f"label not on the {sig} in Cardinal: this filter is removed from {sig} "
-                                        "queries, which widens them (edit drop_labels / drop_log_labels if wrong)",
-                               "present_on_other_signal": label in have["logs" if sig == "metrics" else "metrics"]})
-                continue
-            seen = values(sig, name) or set()
+            seen = values(sig, renames.get(label, label)) or set()
             if seen and value not in seen:
-                drops[sig].add(label)
+                props[sig].add(f"{label}={value}")
                 review.append({"label": label, "value": value, "signal": sig,
-                               "issue": f"value not found on the {sig} in Cardinal: this filter is removed from "
-                                        f"{sig} queries, which widens them", "values_in_cardinal": sorted(seen)[:10]})
-        for label in sorted(used.get(sig, ())):
-            if (label in ("detected_level", "__name__", "le") or label in drops[sig]
-                    or renames.get(label, label) in have[sig]):
-                continue
-            drops[sig].add(label)
-            review.append({"label": label, "signal": sig,
-                           "issue": f"label not on the {sig} in Cardinal: filters on it are removed from {sig} queries"})
-    return drops, review
+                               "suggested_drop": f"{label}={value}", "values_in_cardinal": sorted(seen)[:10],
+                               "issue": f"value not seen on the {sig} in Cardinal lately: the filter is kept, so "
+                                        "these queries show no data until it appears (normal for error codes "
+                                        "and other rare values). If Cardinal spells it differently, that's a "
+                                        f"pipeline difference to fix; widening ({DROP_KEY[sig]}) is a last resort"})
+    return props, review
 
 
 class CardinalMCP:
@@ -537,6 +557,7 @@ def set_rule_enabled(c, instance_slug, rule_id, enabled):
 # Every agent's own usage telemetry (what cardinal-connect switches on) carries this
 # resource attribute; a collector's data doesn't. Data with it doesn't count as flowing.
 AGENT_LABEL = "agent_runtime"
+LABEL_WINDOW_DAYS = 7  # how far back label names/values are looked up for the filter check
 LIVE_WINDOW_MIN = 15
 LIVE_PROBES = 40  # metric names probed per data lake, spread across the list
 PROM_NAME = re.compile(r"^[a-zA-Z_:][a-zA-Z0-9_:]*$")
@@ -631,23 +652,33 @@ def matchers_in(expr):
     return {(label, value) for label, value in re.findall(r'([a-zA-Z_][\w.]*)\s*=\s*"([^"$]*)"', expr) if value}
 
 
-def labels_in(expr):
-    """Label names an expression filters or groups on."""
+def labels_in(expr, grouping=True):
+    """Label names an expression filters on (and, with grouping, groups on)."""
     stripped = re.sub(r'"(?:[^"\\]|\\.)*"', '""', expr)
     labels = set()
     for block in re.findall(r"\{([^}]*)\}", stripped):
         labels.update(re.findall(r"([a-zA-Z_][\w.]*)\s*(?:=~|!~|!=|=)", block))
-    for grp in re.findall(r"\b(?:by|without|on|ignoring)\s*\(([^)]*)\)", stripped):
-        labels.update(x.strip() for x in grp.split(",") if x.strip())
+    if grouping:
+        for grp in re.findall(r"\b(?:by|without|on|ignoring)\s*\(([^)]*)\)", stripped):
+            labels.update(x.strip() for x in grp.split(",") if x.strip())
     labels.update(re.findall(r'\| *([a-zA-Z_]\w*) *(?:=~|!~|!=|=)', stripped))
     return labels - {"le", "__name__"}
 
 
+def stored_label_filters(expr):
+    """A LogQL query without the pipeline text after its parser stages (`| json`,
+    `| logfmt`, ...): filters there are on fields parsed from the line, which Cardinal
+    doesn't store as labels, so they must not be checked against its label list."""
+    for start, end in reversed(post_parser_spans(expr)):
+        expr = expr[:start] + expr[end:]
+    return expr
+
+
 def is_log_query(expr, ds_kind=None):
+    # Same guess as the converter's, so a query is checked as the signal it is converted as.
     if ds_kind:
         return ds_kind == "loki"
-    s = expr.strip()
-    return s.startswith("{") or bool(re.search(r"(_over_time|rate)\s*\(\s*\{", s) and ("|" in s or "_over_time" in s))
+    return guess_kind_from_query(expr) == "loki"
 
 
 def exprs_by_signal(export):
@@ -850,13 +881,20 @@ def main():
         if fam in hist_families and hit and (hit + "_bucket") not in cardinal_metrics:
             mapping["native_histograms"].append(fam)
 
-    # Labels actually present on the mapped metrics, and on logs.
+    # Labels present on the mapped metrics, and on logs, over a week: a label that only
+    # shows up now and then (an error path) still exists. None = Cardinal didn't answer.
+    meta = NativeQuery(c, inst["id"], window_ms=LABEL_WINDOW_DAYS * 86_400_000)
     cardinal_labels = set()
-    for target in {v for v in mapping["metrics"].values() if v}:
-        cardinal_labels.update(native.tags("metrics", target))
-    log_labels = set(native.tags("logs"))
+    for target in sorted({v for v in mapping["metrics"].values() if v}):
+        tags = meta.tags("metrics", target)
+        if tags is None:
+            cardinal_labels = None
+            break
+        cardinal_labels.update(tags)
+    log_labels = meta.tags("logs")
+    log_labels = set(log_labels) if log_labels is not None else None
     label_norm = {}
-    for l in sorted(cardinal_labels | log_labels):
+    for l in sorted((cardinal_labels or set()) | (log_labels or set())):
         label_norm.setdefault(norm(l), l)
         label_norm.setdefault(norm(re.sub(r"^resource[._]", "", l)), l)
     for l in used_labels:
@@ -865,26 +903,26 @@ def main():
         target = label_norm.get(norm(l)) or label_norm.get(norm(re.sub(r"^resource[._]", "", l)))
         if target and target != l:
             mapping["labels"][l] = target
-    # Filters must match data that exists in Cardinal, or every panel using them goes
-    # blank (e.g. an environment label whose value differs between the old and new
-    # pipelines). Decided per signal: a label missing from the metrics but present on
-    # the logs is removed from metric queries only, so log panels stay scoped.
+    # Filters that match nothing in Cardinal (e.g. an environment label whose value
+    # differs between the old and new pipelines) are listed for review, per signal, but
+    # never removed here: removing one widens the query, which is the user's call.
     by_sig = exprs_by_signal(args.export)
+    by_sig["logs"] = [stored_label_filters(e) for e in by_sig["logs"]]
     matchers = {sig: set().union(*map(matchers_in, ex)) if ex else set() for sig, ex in by_sig.items()}
-    used = {sig: set().union(*map(labels_in, ex)) if ex else set() for sig, ex in by_sig.items()}
-    drops, review = decide_label_drops(
+    used = {sig: set().union(*(labels_in(e, grouping=False) for e in ex)) if ex else set()
+            for sig, ex in by_sig.items()}
+    proposals, review = decide_label_drops(
         matchers, used, cardinal_labels, log_labels,
-        lambda sig, label: set(native.tag_values(sig, label) or []), mapping["labels"])
-    mapping["drop_labels"] = sorted(drops["metrics"])
-    mapping["drop_log_labels"] = sorted(drops["logs"])
+        lambda sig, label: set(meta.tag_values(sig, label) or []), mapping["labels"])
+    mapping["drop_labels"], mapping["drop_log_labels"] = [], []
     mapping["_review"] += review
     # Loki's `detected_level` is a Grafana-side derived field; lakerunner keeps severity on `level`.
     if "detected_level" in used_labels:
         mapping["log_labels"]["detected_level"] = "level"
 
     json.dump(sorted(cardinal_metrics), open(os.path.join(args.out, "metrics.json"), "w"), indent=1)
-    json.dump(sorted(cardinal_labels), open(os.path.join(args.out, "labels.json"), "w"), indent=1)
-    json.dump(sorted(log_labels), open(os.path.join(args.out, "log_labels.json"), "w"), indent=1)
+    json.dump(sorted(cardinal_labels or []), open(os.path.join(args.out, "labels.json"), "w"), indent=1)
+    json.dump(sorted(log_labels or []), open(os.path.join(args.out, "log_labels.json"), "w"), indent=1)
 
     # histogram_quantile on classic histograms (Cardinal keeps the _bucket series): probe it.
     supports_hq = False
@@ -915,7 +953,7 @@ def main():
 
     print(json.dumps({
         "instance": inst, "native_histograms": mapping["native_histograms"],
-        "drop_labels": mapping["drop_labels"], "drop_log_labels": mapping["drop_log_labels"],
+        "filters_to_review": {sig: sorted(p) for sig, p in proposals.items() if p},
         "cardinal_metrics": len(cardinal_metrics), "grafana_metric_families": len(families),
         "matched": sum(1 for v in mapping["metrics"].values() if v), "unmatched": [k for k, v in mapping["metrics"].items() if not v],
         "renamed": {k: v for k, v in mapping["metrics"].items() if v and v != k},

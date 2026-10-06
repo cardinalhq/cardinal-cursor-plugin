@@ -33,9 +33,18 @@ Units: `s ms bytes reqps ops Bps percent` etc. become Cardinal unit labels;
 |---|---|
 | `label_values(metric{sel}, label)` on Prometheus | query variable, `signal: metrics`, `scope` from the selector |
 | `label_values(label)` on Loki | query variable, `signal: logs` |
-| custom, constant, interval, textbox, other query forms | **inlined**: the current value is substituted into queries (`All` → `.+`) |
+| custom, constant, interval, textbox, other query forms | **inlined**: the current value is substituted into queries. `All` → the variable's `allValue`, else (custom) its own options, else `.+` (flagged: wider) |
+| ad-hoc filters | added as matchers to every query of that datasource kind; a filter Cardinal can't express (e.g. `>`) skips those queries |
 
-Cardinal's "All" substitutes `.+`, so `label=~"$var"` keeps working.
+Cardinal's "All" substitutes `.+`, so `label=~"$var"` keeps working. Where Grafana's
+"All" was narrower (an `allValue`, or a `regex` limiting the variable's values), the
+query also gets `label=~"<that>"` next to `label=~"$var"`. A regex with a capture group
+reshapes the values and can't be carried over: flagged. (With `allValue`, picking a
+single value outside it shows no data.)
+
+Not carried over, flagged on the panel: Grafana transformations (filtering ones can
+hide rows/series Cardinal then shows), series hidden by field overrides, and panel/row
+`repeat` (one panel for all values).
 
 ## Queries
 
@@ -62,11 +71,17 @@ Cardinal's "All" substitutes `.+`, so `label=~"$var"` keeps working.
   Queries needing raw buckets (heatmaps) are skipped. Never `max by (X) (M)`: lakerunner
   doesn't support `max`/`min`/`avg` over a histogram and answers a merged-sketch value
   unrelated to the series (and `-1` for zero-valued observations).
-- `drop_labels` / `drop_log_labels`: matchers on labels or values absent from Cardinal
-  are removed, **per signal**: a label missing from the metrics but present on the
-  logs stays on the log queries. Removing a filter widens the query. (An empty LogQL
-  selector becomes `{service_name=~".+"}`.) Mappings from older versions have only
+- Filters are kept as in Grafana. `drop_labels` / `drop_log_labels` are empty unless
+  the user chose to widen queries (the catalog only *suggests* entries, in `_review`).
+  An entry `"label"` removes every `=`/`=~` filter on that label, `"label=value"` only
+  `label="value"`; `!=`/`!~` filters always stay. Per signal: a label missing from the
+  metrics but present on the logs stays on the log queries. LogQL filters after a
+  parser stage (`| json`, `| logfmt`, …) are on parsed fields and are never removed,
+  nor are filters chained with `and`/`or`/`,`. A query whose selector would end up
+  empty is skipped (an empty log selector would read every service's logs). Alert
+  rules that would lose a filter are skipped. Mappings from older versions have only
   `drop_labels`, which then applies to both.
+- Label renames never touch text inside quoted values or line filters.
 - LogQL `... or vector(0)` is removed (Cardinal's log engine rejects it). PromQL
   `... or vector(0)` is kept, but when `supports_or_vector` is false lakerunner answers
   nothing instead of 0 when the left side has no series: flagged, and validation treats

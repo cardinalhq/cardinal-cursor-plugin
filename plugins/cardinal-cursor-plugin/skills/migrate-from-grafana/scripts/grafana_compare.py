@@ -239,3 +239,25 @@ def compare_dashboard(uid, plan_dash, report_dash, export_dir, gq, nq, mapping, 
                 continue
             rows.append(dict(row, **compare(g, c, renames, entry.get("notes", []))))
     return rows
+
+
+def compare_alert(alert, report_alert, gq, nq, mapping, now=None):
+    """Compare a migrated alert rule's query with the Grafana rule's query over the same
+    window, so a rule that reads other series (a widened filter) is caught: a wider
+    query returns *more* data, which a plain "has data" check would pass. Returns a row
+    like compare_dashboard's, or None when the plan predates recording the Grafana query."""
+    src, spec = alert.get("source") or {}, alert["rule_spec"]
+    if not src.get("grafana_expr"):
+        return None
+    kind = "loki" if spec["signal_type"] == "logs" else "prometheus"
+    start, end = window(now)
+    row = {"panel": "rule query", "query": spec["query"]["expr"], "grafana_query": src["grafana_expr"]}
+    g, gerr = gq.series(grafana_expr(src["grafana_expr"]), gq.resolve_ds(src.get("datasource_uid"), kind), start, end)
+    if gerr:
+        return dict(row, verdict="skipped", detail=f"Grafana query failed: {gerr}", ratio=None)
+    c, cerr = nq.series(spec["signal_type"], cardinal_expr(spec["query"]["expr"]), STEP_S,
+                        {"s": str(start * 1000), "e": str(end * 1000)})
+    if cerr:
+        return dict(row, verdict="differs", detail=f"Cardinal query failed: {cerr}", ratio=None)
+    renames = {**mapping.get("labels", {}), **mapping.get("log_labels", {})}
+    return dict(row, **compare(g, c, renames, (report_alert or {}).get("notes", [])))

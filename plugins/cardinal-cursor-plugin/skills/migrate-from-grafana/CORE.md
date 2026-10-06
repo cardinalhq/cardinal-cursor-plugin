@@ -234,13 +234,23 @@ Also check:
 - `histogram_quantile_ok`: `false` for a histogram means Cardinal gives no usable
   percentile for it (e.g. negative values when observations are 0): its p50/p95/p99
   panels show the average and are retitled "avg". Tell the user which ones.
-- `drop_labels` (metric queries) and `drop_log_labels` (log queries): filters on labels
-  or exact values that don't exist on that signal in Cardinal, e.g. an environment
-  label whose value differs between the two pipelines. Those filters are removed,
-  per signal. Removing a filter **widens** the query, possibly to other sources in the
-  org (a log panel can start showing every service's logs): confirm each with the
-  user, and prefer an equivalent filter that does exist (e.g. a cluster label) by
-  adding it to the mapping's `labels`.
+- **Filters are never removed for you.** `_review` entries with a `suggested_drop`
+  are filters that match nothing in Cardinal: a label that isn't on that signal
+  (`"cluster"`), or a value not seen there in the last 7 days (`"env=qa"`). As written,
+  those queries show no data, and validation reports them as `missing`. Values seen
+  rarely (an error status when nothing failed lately) are normal: leave those alone.
+  For each one, in this order:
+  1. The same thing under another name in Cardinal (e.g. `k8s_cluster_name`)? Map it
+     in the mapping's `labels`. That keeps the query as narrow as in Grafana.
+  2. Otherwise, **ask the user** whether to widen those queries. Removing a filter can
+     pull in other environments, services or status codes (a log panel can start
+     showing every service's logs). Only on a yes, add the `suggested_drop` value to
+     `drop_labels` (metric queries) or `drop_log_labels` (log queries). `"label"`
+     removes every `=`/`=~` filter on it, `"label=value"` only that one. Negative
+     filters (`!=`, `!~`) always stay.
+  Even then, alert rules that would lose a filter are **not migrated** (they would
+  fire on data the Grafana rule ignores), and a log query whose stream selector would
+  end up empty is skipped rather than reading every service's logs.
 
 If the catalog comes back empty, the org isn't receiving data yet; stop and handle it
 as in step 0c (SaaS: the API-key setup doc; self-hosted: install-site).
@@ -263,7 +273,11 @@ every **adapted** item whose meaning changed, especially:
 - percentile panels showing the **average** (retitled "avg"), and percentiles Cardinal
   estimates from its sketch (bucket resolution, so they can differ from Grafana's);
 - request rates divided by 60 (`per_minute` mode): right at 1-minute resolution only;
-- removed filters (wider queries);
+- removed filters (wider queries), and the alert rules skipped because of them;
+- ad-hoc filters added to every query, and variables whose "All" got an extra matcher
+  to stay as narrow as in Grafana;
+- Grafana transformations, hidden series and repeated panels/rows that don't carry
+  over (the panel can show more than in Grafana);
 - `or vector(0)` panels that show no data instead of 0.
 Alert rules get the same translations, and their names are kept: say when a rule that
 says "p95" now compares the average. List every **skipped** item with its reason.
@@ -329,11 +343,14 @@ apply command if the user chose disabled:
 
 ```bash
 python3 $SCRIPTS/cardinal_apply.py --env-file .env.cardinal --plan plan --catalog catalog --apply --alert <n> [--disable-alerts]
-python3 $SCRIPTS/cardinal_verify.py --env-file .env.cardinal --plan plan --catalog catalog --alert <n>
+python3 $SCRIPTS/cardinal_verify.py --env-file .env.cardinal --plan plan --catalog catalog --alert <n> \
+    --grafana-env .env.grafana-migrate --export export --mapping mapping.json
 ```
 
 Validation reads the rule back from Cardinal: it must exist, be enabled/disabled as
-chosen, and its query must return data. Switching a rule off goes through the
+chosen, and its query must return data. It also compares the rule's query with the
+Grafana rule's over the last 15 minutes: a wider query returns *more* data, so a rule
+reading other series (`extra` / `differs`) is WARN, not PASS. Switching a rule off goes through the
 `cardinal-connect` MCP key (a plain REST update is accepted but doesn't take effect),
 so when the target org isn't the connected one the apply line says the switch
 failed — tell the user to switch those rules off in Cardinal's Alerts page.
