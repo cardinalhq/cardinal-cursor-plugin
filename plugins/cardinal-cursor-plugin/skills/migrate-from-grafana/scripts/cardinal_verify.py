@@ -10,8 +10,9 @@ with `.+` ("All"). Each item ends with a RESULT line:
   FAIL  not in Cardinal, or no query returns data
 
 With --grafana-env, each dashboard's values are also compared with the Grafana panels
-they came from (grafana_compare.py): a panel that returns data but disagrees with
-Grafana (counts something else, reads other series) makes the dashboard WARN.
+they came from, and each alert rule's query with the Grafana rule's (grafana_compare.py):
+a query that returns data but disagrees with Grafana (counts something else, reads other
+series, e.g. a removed filter) makes the item WARN.
 
 Usage:
   cardinal_verify.py --plan ./plan --catalog ./catalog [--dashboard <uid> ...] [--alert <name-or-number> ...]
@@ -29,7 +30,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cardinal_apply import load_applied, plan_alerts, plan_dashboards, select  # noqa: E402
 from cardinal_catalog import Cardinal, NativeQuery, load_env_file, rule_states  # noqa: E402
-from grafana_compare import PROBLEMS, GrafanaQuery, cardinal_expr, compare_dashboard  # noqa: E402
+from grafana_compare import PROBLEMS, GrafanaQuery, cardinal_expr, compare_alert, compare_dashboard  # noqa: E402
 
 
 def window_ms(w):
@@ -105,6 +106,7 @@ def main():
         mapping = json.load(open(args.mapping)) if os.path.exists(args.mapping) else {}
         report = json.load(open(os.path.join(args.plan, "report.json")))
         report_by_uid = {d["uid"]: d for d in report.get("dashboards", [])}
+        report_by_alert = {a["title"]: a for a in report.get("alerts", [])}
 
     dashboards, alerts = plan_dashboards(args.plan), plan_alerts(args.plan)
     picking = args.dashboard is not None or args.alert is not None
@@ -189,12 +191,21 @@ def main():
         spec = a["rule_spec"]
         points, err = NativeQuery(c, lake["id"], window_ms(args.window)).query(spec["signal_type"], spec["query"]["expr"])
         rows = [{"panel": "rule query", "query": spec["query"]["expr"], "points": points, "error": err}]
+        compared = []
+        if gq:
+            row = compare_alert(a, report_by_alert.get(a["name"]), gq, NativeQuery(c, lake["id"]), mapping)
+            compared = [row] if row else []
+            agreed_empty(rows, compared)
         report_rows(rows)
-        v = "FAIL" if present and not state_ok else verdict(present, rows)
+        if compared:
+            report_compared(compared)
+        v = "FAIL" if present and not state_ok else verdict(present, rows, compared)
         failed += v == "FAIL"
         print(f"  RESULT: {v}")
         results["alerts"][a["name"]] = {"present": present, "enabled": state, "result": v,
                                         "points": points, "error": err}
+        if compared:
+            results["alerts"][a["name"]]["grafana_comparison"] = compared
 
     json.dump(results, open(vpath, "w"), indent=2)
     if failed:

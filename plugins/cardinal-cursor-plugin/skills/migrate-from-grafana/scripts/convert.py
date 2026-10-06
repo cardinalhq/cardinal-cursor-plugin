@@ -18,10 +18,13 @@ mapping.json (built by the skill workflow from cardinal_catalog.py output):
     "histogram_quantile_ok": {"<family>": true|false},          # probed per native histogram
     "histogram_rate_mode": "per_second"|"per_minute"|"unknown", # how histogram_count(rate()) answers
     "supports_or_vector": true|false,                            # does `<empty> or vector(0)` give 0
-    "drop_labels": ["<label>", ...],     # matchers removed from metric queries
-    "drop_log_labels": ["<label>", ...]  # matchers removed from log queries (older mappings:
-                                         # absent, and drop_labels applies to both)
+    "drop_labels": ["<label>" | "<label>=<value>", ...],  # filters removed from metric queries
+    "drop_log_labels": [...]   # the same for log queries (older mappings: absent, and
+                               # drop_labels applies to both)
   }
+  drop_*: empty unless the user chose to widen a query. "label" removes every positive
+  filter (=, =~) on it, "label=value" only label="value"; negative filters (!=, !~) are
+  always kept. Alert rules that would lose a filter are skipped, not widened.
   A metric mapped to null means "not in Cardinal" -> panels/rules using it are skipped.
   Metrics missing from the mapping are passed through unchanged (and reported).
 
@@ -61,11 +64,15 @@ PROMQL_WORDS = {
 
 def split_outside(s, opener, closer):
     """Yield (segment, inside) splitting s on bracket pairs, respecting quotes."""
-    out, buf, depth, quote = [], "", 0, None
+    out, buf, depth, quote, escaped = [], "", 0, None, False
     for ch in s:
         if quote:
             buf += ch
-            if ch == quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quote != "`":
+                escaped = True
+            elif ch == quote:
                 quote = None
             continue
         if ch in "\"'`":
@@ -89,11 +96,70 @@ def split_outside(s, opener, closer):
     return out
 
 
+QUOTED = r'"(?:[^"\\]|\\.)*"|`[^`]*`'
+MATCHER = re.compile(r'^\s*([a-zA-Z_][\w.]*)\s*(=~|!~|!=|=)\s*(' + QUOTED + r')\s*$', re.S)
+# LogQL stages that create labels from the line: a filter after one of these is on a
+# parsed field, not on a stored label.
+LOG_PARSER = re.compile(r"\|\s*(?:json|logfmt|regexp|pattern|unpack|label_format|unwrap)\b")
+
+
+def sub_outside_quotes(text, fn):
+    """Apply fn to the parts of text that aren't quoted strings."""
+    parts = re.split(r"(" + QUOTED + r")", text)
+    return "".join(p if i % 2 else fn(p) for i, p in enumerate(parts))
+
+
+def split_matchers(body):
+    """'a="x", b=~"y,z"' -> ['a="x"', 'b=~"y,z"'] (commas inside quotes kept)."""
+    out, buf, quote, escaped = [], "", None, False
+    for ch in body:
+        if quote:
+            buf += ch
+            if escaped:
+                escaped = False
+            elif ch == "\\" and quote == '"':
+                escaped = True
+            elif ch == quote:
+                quote = None
+            continue
+        if ch in "\"`":
+            quote = ch
+        if ch == ",":
+            out.append(buf)
+            buf = ""
+            continue
+        buf += ch
+    out.append(buf)
+    return [m.strip() for m in out if m.strip()]
+
+
+def unquote(v):
+    return v[1:-1]
+
+
+def map_selectors(q, fn):
+    """Rewrite every {...} selector (outside quoted strings): fn(matchers, named) returns
+    the new matcher list; named = the selector follows a metric name. Returns
+    (query, emptied) where emptied = a selector without a metric name ended up empty."""
+    pieces, out, emptied = split_outside(q, "{", "}"), [], False
+    for seg, inside in pieces:
+        if not inside or not seg.startswith("{") or not seg.endswith("}"):
+            out.append(seg)
+            continue
+        named = bool(re.search(r"[\w:]\s*$", out[-1] if out else ""))
+        before = split_matchers(seg[1:-1])
+        after = fn(before, named)
+        if before and not after and not named:
+            emptied = True
+        out.append("{" + ", ".join(after) + "}")
+    return "".join(out), emptied
+
+
 def rename_labels_in_matcher(block, labels):
-    # block is "{a="x", b=~"y"}" ; rename label keys only
+    # block is "{a="x", b=~"y"}" ; rename label keys only, never text inside a quoted value
     def sub(m):
         return labels.get(m.group(1), m.group(1)) + m.group(2)
-    return re.sub(r'([a-zA-Z_][a-zA-Z0-9_.]*)(\s*(?:=~|!~|!=|=))', sub, block)
+    return sub_outside_quotes(block, lambda s: re.sub(r'([a-zA-Z_][a-zA-Z0-9_.]*)(\s*(?:=~|!~|!=|=))', sub, s))
 
 
 def rename_labels_in_grouping(text, labels):
@@ -103,28 +169,161 @@ def rename_labels_in_grouping(text, labels):
     return re.sub(r'\b(by|without|on|ignoring|group_left|group_right)\s*\(([^)]*)\)', sub, text)
 
 
-def drop_matchers(q, labels):
-    """Remove `label op "value"` matchers for the given labels from {...} selectors
-    (and LogQL `| label op "value"` stages). Returns (query, dropped_labels)."""
+def parse_drops(entries):
+    """drop_labels entries -> (labels whose positive filters all go, {(label, value)} going
+    for that one value only). An entry is "label" or "label=value"."""
+    whole, pairs = set(), set()
+    for e in entries:
+        if "=" in e:
+            label, value = e.split("=", 1)
+            pairs.add((label.strip(), value))
+        else:
+            whole.add(e.strip())
+    return whole, pairs
+
+
+def post_parser_spans(q):
+    """(start, end) spans of LogQL pipeline text that comes after a parser stage
+    (`| json`, `| logfmt`, ...): label filters there are on parsed fields."""
+    masked = re.sub(QUOTED, lambda m: '"' + "_" * (len(m.group(0)) - 2) + '"', q)
+    spans, depth = [], 0
+    for i, ch in enumerate(masked):
+        if ch == "{":
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                # the selector's pipeline runs to its range, a closing paren or the next selector
+                m = re.search(r"[\[){]", masked[i + 1:])
+                end = i + 1 + m.start() if m else len(masked)
+                p = LOG_PARSER.search(masked, i + 1, end)
+                if p:
+                    spans.append((p.start(), end))
+    return spans
+
+
+def drop_matchers(q, entries):
+    """Remove the positive filters (`=`, `=~`) named by entries ("label" or "label=value")
+    from {...} selectors and from single-condition LogQL `| label op "value"` stages before
+    any parser. Negative filters (`!=`, `!~`) are never removed: on a label Cardinal
+    doesn't have they already match everything, and removing one widens the query.
+    Returns (query, dropped, emptied): dropped = {'label' or 'label="value"'} removed,
+    emptied = a selector without a metric name lost every matcher (it would match all)."""
+    whole, pairs = parse_drops(entries)
     dropped = set()
-    lab = "|".join(re.escape(l) for l in labels)
-    def clean_block(m):
-        inner = m.group(1)
-        parts = [p for p in re.findall(r'\s*([^,]+?"(?:[^"\\]|\\.)*"|[^,]+)\s*(?:,|$)', inner) if p.strip()]
+
+    def goes(label, op, value):
+        if op == "=" and (label, value) in pairs:
+            return f'{label}="{value}"'
+        if op in ("=", "=~") and label in whole:
+            return label
+        return None
+
+    def clean(matchers, named):
         keep = []
-        for p in parts:
-            if re.match(r"\s*(" + lab + r")\s*(=~|!~|!=|=)", p):
-                dropped.add(re.match(r"\s*([\w.]+)", p).group(1))
+        for mt in matchers:
+            m = MATCHER.match(mt)
+            hit = m and goes(m.group(1), m.group(2), unquote(m.group(3)))
+            if hit:
+                dropped.add(hit)
             else:
-                keep.append(p.strip())
-        return "{" + ", ".join(keep) + "}"
-    q = re.sub(r"\{([^{}]*)\}", clean_block, q)
-    def pipe(m):
-        dropped.add(m.group(1))
+                keep.append(mt)
+        return keep
+    q, emptied = map_selectors(q, clean)
+
+    parsed = post_parser_spans(q)
+    pipe = re.compile(r"\|\s*([a-zA-Z_][\w.]*)\s*(=~|=)\s*(" + QUOTED + r")(?!\s*(?:and\b|or\b|,))")
+
+    def stage(m):
+        hit = goes(m.group(1), m.group(2), unquote(m.group(3)))
+        if not hit or any(s <= m.start() < e for s, e in parsed):
+            return m.group(0)
+        dropped.add(hit)
         return ""
-    q = re.sub(r"\|\s*(" + lab + r')\s*(?:=~|!~|!=|=)\s*"(?:[^"\\]|\\.)*"', pipe, q)
-    q = re.sub(r"(\w)\{\}", r"\1", q)  # metric{} -> metric
-    return q, dropped
+    q = pipe.sub(stage, q)
+    q = re.sub(r"([\w:])\{\}", r"\1", q)  # metric{} -> metric
+    return q, dropped, emptied
+
+
+def inject_matchers(q, extra, logql=False):
+    """Add matchers to every selector of a query: into each {...}, and (PromQL) as a
+    selector after every bare metric name. Used for Grafana's ad-hoc filters, which
+    Grafana adds to every query of the dashboard."""
+    if not extra:
+        return q
+    q, _ = map_selectors(q, lambda ms, named: ms + [e for e in extra if e not in ms])
+    if logql:
+        return q
+    pieces, out = split_outside(q, "{", "}"), []
+    for i, (seg, inside) in enumerate(pieces):
+        if inside:
+            out.append(seg)
+            continue
+        followed = i + 1 < len(pieces) and pieces[i + 1][1]
+
+        def add(m, seg_len):
+            name = m.group(1)
+            if is_keyword(name) or (followed and m.end() == seg_len):
+                return name
+            return name + "{" + ", ".join(extra) + "}"
+        out.append(sub_metric_idents(seg, add))
+    return "".join(out)
+
+
+def is_keyword(name):
+    return name in PROMQL_WORDS or bool(re.fullmatch(r"\d+[smhdwy]?", name))
+
+
+def sub_metric_idents(seg, fn, grouping=lambda g: g):
+    """Apply fn(match, masked_len) to metric-name identifiers in a non-selector piece of
+    PromQL, leaving quoted strings, range selectors and grouping label lists alone
+    (grouping lists go through `grouping` instead). masked_len lets fn tell whether the
+    name ends the piece (i.e. a selector follows)."""
+    held = []
+
+    def hold(text):
+        held.append(text)
+        return f"\2{len(held) - 1}\3"
+    seg = re.sub(QUOTED, lambda m: hold(m.group(0)), seg)
+    seg = re.sub(r"\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)",
+                 lambda m: hold(grouping(m.group(0))), seg)
+    seg = re.sub(r"\[[^\]]*\]", lambda m: hold(m.group(0)), seg)
+    n = len(seg.rstrip())
+    seg = IDENT.sub(lambda m: fn(m, n), seg)
+    while "\2" in seg:
+        seg = re.sub("\x02(\\d+)\x03", lambda m: held[int(m.group(1))], seg)
+    return seg
+
+
+def var_ref(name):
+    """Regex for a reference to dashboard variable `name` ($x, ${x}, ${x:fmt}, [[x]])."""
+    n = re.escape(name)
+    return r"(?:\$\{" + n + r"(?::\w+)?\}|\$" + n + r"\b|\[\[" + n + r"\]\])"
+
+
+def constrain_variables(q, constraints):
+    """For `label=~"$var"` where var's "All" was narrower in Grafana than Cardinal's `.+`
+    (an allValue, or a regex limiting its values), add `label=~"<constraint>"`."""
+    if not constraints:
+        return q
+
+    def fn(matchers, named):
+        out = list(matchers)
+        for mt in matchers:
+            m = MATCHER.match(mt)
+            if not m or m.group(2) != "=~":
+                continue
+            for var, c in constraints.items():
+                if re.fullmatch(r"[\"`]" + var_ref(var) + r"[\"`]", m.group(3)):
+                    extra = f'{m.group(1)}=~"{c}"'
+                    if extra not in out:
+                        out.append(extra)
+        return out
+    q, _ = map_selectors(q, fn)
+    for var, c in constraints.items():
+        q = re.sub(r'(\|\s*([a-zA-Z_][\w.]*)\s*=~\s*"' + var_ref(var) + r'")',
+                   lambda m: f'{m.group(1)} | {m.group(2)}=~"{c}"', q)
+    return q
 
 
 # Note texts other code keys on (panel retitling, the Grafana value comparison).
@@ -132,6 +331,10 @@ PCT_AS_AVG = "shows the average, not the percentile"
 PCT_ESTIMATE = "percentile estimated from Cardinal's histogram sketch"
 RATE_PER_MINUTE = "request rate from Cardinal's per-minute histogram count"
 OR_VECTOR_NOOP = "'or vector(0)' has no effect in Cardinal"
+# A filter was removed (the mapping's drop_labels / drop_log_labels): the query is wider
+# than in Grafana. Alert rules with this note are not migrated.
+FILTER_REMOVED = "filter removed, so the query is wider than in Grafana"
+EMPTIED = "every filter of a selector was removed; skipped rather than match everything"
 # lakerunner's rollup bucket: its per-minute histogram count / this = per second.
 RATE_BUCKET_SECONDS = 60
 
@@ -152,7 +355,13 @@ class Translator:
         self.or_vector = mapping.get("supports_or_vector", True)
         self.drop_labels = set(mapping.get("drop_labels", []))
         self.drop_log_labels = set(mapping.get("drop_log_labels", mapping.get("drop_labels", [])))
-        self.const_vars = {}
+        self.reset_dashboard()
+
+    def reset_dashboard(self):
+        """Per-dashboard state, set by convert_variables."""
+        self.const_vars = {}    # variable -> value inlined into queries
+        self.constraints = {}   # variable -> regex its "All" was limited to in Grafana
+        self.adhoc = {"prometheus": [], "loki": []}  # Grafana ad-hoc filters, as matchers
 
     def resolve_metric(self, name):
         """Map a Grafana metric name (incl. histogram _bucket/_sum/_count) to Cardinal.
@@ -174,15 +383,17 @@ class Translator:
             if re.search(pat, q):
                 q = re.sub(pat, rep, q)
                 notes.append(f"Grafana macro replaced with fixed window ({rep})")
-        for name, value in self.const_vars.items():
-            if re.search(r"\$\{?" + re.escape(name) + r"\b\}?", q):
-                q = re.sub(r"\$\{" + re.escape(name) + r"\}|\$" + re.escape(name) + r"\b", value, q)
-                notes.append(f"variable ${name} inlined as '{value}'")
+        q, n = self._variables(q, logql=False)
+        notes += n
+        if q is None:
+            return None, notes
 
         if self.drop_labels:
-            q, dropped = drop_matchers(q, self.drop_labels)
+            q, dropped, emptied = drop_matchers(q, self.drop_labels)
             if dropped:
-                notes.append(f"filter on label(s) not present in Cardinal removed: {', '.join(sorted(dropped))}")
+                notes.append(f"{FILTER_REMOVED}: {', '.join(sorted(dropped))} (not in Cardinal's metrics)")
+            if emptied:
+                return None, notes + [EMPTIED]
         if not self.or_vector and re.search(r"\bor\s+vector\(", q):
             notes.append(f"{OR_VECTOR_NOOP}: the panel shows no data where Grafana shows 0")
         if self.native_hist:
@@ -204,10 +415,11 @@ class Translator:
             if inside:
                 pieces.append(rename_labels_in_matcher(seg, self.labels))
                 continue
-            # rename metric identifiers in the non-matcher part (outside quotes/brackets [..])
-            def sub(m):
+            # rename metric identifiers in the non-matcher part (outside quotes, range
+            # selectors and grouping clauses; grouping labels are renamed separately)
+            def sub(m, _n):
                 name = m.group(1)
-                if name in PROMQL_WORDS or re.fullmatch(r"\d+[smhdwy]?", name):
+                if is_keyword(name):
                     return name
                 target, known = self.resolve_metric(name)
                 if known and target is None:
@@ -216,18 +428,7 @@ class Translator:
                 if not known and re.fullmatch(r"[a-z][a-z0-9_:]*", name) and ("_" in name or ":" in name):
                     unknown.append(name)
                 return target
-            # Protect range selectors and grouping clauses (label lists) from
-            # metric renaming; grouping labels are renamed separately.
-            groups = []
-            def hold(m):
-                groups.append(rename_labels_in_grouping(m.group(0), self.labels))
-                return f"\2{len(groups) - 1}\3"
-            seg = re.sub(r"\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)", hold, seg)
-            seg = re.sub(r"\[[^\]]*\]", lambda m: "\0" + m.group(0)[1:-1] + "\1", seg)
-            seg = IDENT.sub(sub, seg)
-            seg = seg.replace("\0", "[").replace("\1", "]")
-            seg = re.sub("\x02(\\d+)\x03", lambda m: groups[int(m.group(1))], seg)
-            pieces.append(seg)
+            pieces.append(sub_metric_idents(seg, sub, lambda g: rename_labels_in_grouping(g, self.labels)))
         q = "".join(pieces)
         if missing:
             return None, notes + [f"metric not found in Cardinal: {', '.join(sorted(set(missing)))}"]
@@ -327,10 +528,10 @@ class Translator:
             if re.search(pat, q):
                 q = re.sub(pat, rep, q)
                 notes.append(f"Grafana macro replaced with fixed window ({rep})")
-        for name, value in self.const_vars.items():
-            q, n = re.subn(r"\$\{" + re.escape(name) + r"\}|\$" + re.escape(name) + r"\b", value, q)
-            if n:
-                notes.append(f"variable ${name} inlined as '{value}'")
+        q, n = self._variables(q, logql=True)
+        notes += n
+        if q is None:
+            return None, notes
         # lakerunner's LogQL engine rejects set operators against scalars
         # (`... or vector(0)`); drop the fallback, the panel just shows no data instead of 0.
         q2 = re.sub(r"\s+or\s+vector\(\s*[\d.]+\s*\)\s*$", "", q)
@@ -338,19 +539,45 @@ class Translator:
             notes.append("'or vector(0)' fallback removed (not supported on log queries in Cardinal)")
             q = q2
         if self.drop_log_labels:
-            q, dropped = drop_matchers(q, self.drop_log_labels)
+            q, dropped, emptied = drop_matchers(q, self.drop_log_labels)
             if dropped:
-                notes.append(f"filter on label(s) not present on Cardinal's logs removed: {', '.join(sorted(dropped))}")
-            # A LogQL stream selector can't be empty; match every service instead.
-            q = re.sub(r"\{\s*\}", '{service_name=~".+"}', q)
+                notes.append(f"{FILTER_REMOVED}: {', '.join(sorted(dropped))} (not on Cardinal's logs)")
+            # A stream selector left empty would read every service's logs: skip instead.
+            if emptied:
+                return None, notes + [EMPTIED]
         before = q
-        for src, dst in self.log_labels.items():
-            q = re.sub(r"(?<![\w.])" + re.escape(src) + r"(?=\s*(=~|!~|!=|=|\)|,))", dst, q)
-        for src, dst in self.labels.items():
-            if src not in self.log_labels:
-                q = re.sub(r"(?<=[{,\s(])" + re.escape(src) + r"(?=\s*(=~|!~|!=|=))", dst, q)
+
+        def rename(text):
+            for src, dst in self.log_labels.items():
+                text = re.sub(r"(?<![\w.])" + re.escape(src) + r"(?=\s*(=~|!~|!=|=|\)|,))", dst, text)
+            for src, dst in self.labels.items():
+                if src not in self.log_labels:
+                    text = re.sub(r"(?<=[{,\s(|])" + re.escape(src) + r"(?=\s*(=~|!~|!=|=))", dst, text)
+            return text
+        q = sub_outside_quotes(q, rename)  # never inside line filters or values
         if q != before:
             notes.append("log labels renamed for Cardinal")
+        return q, notes
+
+    def _variables(self, q, logql):
+        """Inline constant variables, add the dashboard's ad-hoc filters, and keep each
+        variable's "All" as narrow as it was in Grafana."""
+        notes = []
+        for name, value in self.const_vars.items():
+            q, n = re.subn(var_ref(name), lambda _m: value, q)
+            if n:
+                notes.append(f"variable ${name} inlined as '{value}'")
+        adhoc = self.adhoc["loki" if logql else "prometheus"]
+        if None in adhoc:
+            return None, notes + ["the dashboard's ad-hoc filter can't be expressed in Cardinal"]
+        if adhoc:
+            q = inject_matchers(q, adhoc, logql=logql)
+            notes.append(f"Grafana ad-hoc filter(s) added to the query: {', '.join(adhoc)}")
+        q2 = constrain_variables(q, self.constraints)
+        if q2 != q:
+            used = sorted(v for v in self.constraints if re.search(var_ref(v), q))
+            notes.append(f"'All' of ${', $'.join(used)} kept as narrow as in Grafana (extra matcher)")
+            q = q2
         return q, notes
 
 
@@ -392,15 +619,100 @@ def guess_kind_from_query(expr):
     return "prometheus"
 
 
+ADHOC_OPS = {"=", "!=", "=~", "!~"}
+
+
+def prom_string(s):
+    """s as the contents of a double-quoted PromQL/LogQL string."""
+    return str(s).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def regex_escape(s):
+    """A literal value inside a regex matcher (what Grafana does for multi-value variables)."""
+    return re.sub(r"([\\^$*+?.()|\[\]{}])", r"\\\1", str(s))
+
+
+def all_constraint(v):
+    """The regex a query variable's "All" was limited to in Grafana, as PromQL string
+    contents, or None when it wasn't (Cardinal's All is `.+`). Returns (constraint, note)."""
+    allv = v.get("allValue")
+    if allv not in (None, "", ".*", ".+"):
+        return allv, None  # Grafana pastes allValue into the query as it is
+    rx = v.get("regex") or ""
+    if not rx:
+        return None, None
+    m = re.fullmatch(r"/(.*)/([a-z]*)", rx, re.S)
+    body, flags = (m.group(1), m.group(2)) if m else (rx, "")
+    if re.search(r"(?<!\\)\((?!\?:)", body):
+        return None, (f"variable ${v.get('name')}: its regex {rx} reshapes the values (capture group); "
+                      "not carried over, so 'All' matches every value of the label")
+    # Grafana searches the regex anywhere in the value; PromQL regexes are anchored.
+    return prom_string(("(?i)" if "i" in flags else "") + f".*(?:{body}).*"), None
+
+
+def adhoc_matchers(v):
+    """Grafana ad-hoc filters -> matchers. Returns (matchers, unsupported filters)."""
+    out, bad = [], []
+    for f in v.get("filters") or []:
+        key, op, val = f.get("key"), f.get("operator", "="), f.get("value", "")
+        if not key or op not in ADHOC_OPS:
+            bad.append(f"{key} {op} {val}")
+            continue
+        out.append(f'{key}{op}"{prom_string(val)}"')
+    return out, bad
+
+
+def inline_value(v):
+    """The value a non-query variable is inlined as. Returns (value, note or None)."""
+    cur = v.get("current", {}) or {}
+    val = cur.get("value")
+    opts = [o.get("value") for o in v.get("options") or [] if o.get("value") not in (None, "$__all")]
+    is_all = val == "$__all" or (isinstance(val, list) and "$__all" in val)
+    if is_all:
+        if v.get("allValue"):
+            return v["allValue"], None
+        if v.get("type") == "custom" and opts:
+            # Grafana's All is the variable's own options, not every value.
+            return "|".join(regex_escape(o) for o in opts), None
+        return ".+", f"variable ${v.get('name')}: 'All' now matches every value (Grafana limited it to its options)"
+    if isinstance(val, list):
+        vals = [x for x in val if x != "$__all"]
+        return ("|".join(regex_escape(x) for x in vals) if len(vals) > 1 else (vals[0] if vals else ".+")), None
+    if val in (None, ""):
+        if v.get("includeAll"):
+            return v.get("allValue") or ".+", None
+        return (opts[0] if opts else (v.get("query") or "")), None
+    return str(val), None
+
+
 def convert_variables(dash, tr, datasources):
     variables, notes = [], []
     for v in dash.get("templating", {}).get("list", []):
         name, vtype = v.get("name"), v.get("type")
+        if vtype == "adhoc":
+            matchers, bad = adhoc_matchers(v)
+            kind = "loki" if ds_type(v.get("datasource"), datasources, "prometheus") == "loki" else "prometheus"
+            tr.adhoc[kind] += matchers
+            if matchers:
+                notes.append(f"ad-hoc filter ${name} added to every {kind} query: {', '.join(matchers)}")
+            if bad:
+                tr.adhoc[kind].append(None)  # marks: some filter can't be expressed
+                notes.append(f"ad-hoc filter ${name} has filters Cardinal can't express ({'; '.join(bad)}): "
+                             f"{kind} queries are skipped rather than shown unfiltered")
+            continue
         if vtype == "query":
             query = v.get("query")
             query = query.get("query") if isinstance(query, dict) else query
             m = re.match(r"\s*label_values\(\s*(?:([a-zA-Z_:][\w:]*)\s*(\{[^}]*\})?\s*,\s*)?([\w.]+)\s*\)\s*$", query or "")
             vt = ds_type(v.get("datasource"), datasources, "prometheus")
+            if m and (vt == "loki" or m.group(1)):
+                constraint, cnote = all_constraint(v)
+                if constraint:
+                    tr.constraints[name] = constraint
+                    notes.append(f"variable ${name}: its 'All' was limited to {constraint!r} in Grafana; "
+                                 "kept as an extra matcher next to it")
+                if cnote:
+                    notes.append(cnote)
             if m and vt == "prometheus" and m.group(1):
                 metric = tr.resolve_metric(m.group(1))[0] or m.group(1)
                 for fam in tr.native_hist:
@@ -424,14 +736,11 @@ def convert_variables(dash, tr, datasources):
                                   "multi": bool(v.get("multi")), "includeAll": bool(v.get("includeAll"))})
                 continue
         # custom / constant / interval / textbox / unsupported query -> inline current value
-        cur = v.get("current", {}) or {}
-        val = cur.get("value")
-        if isinstance(val, list):
-            val = "|".join(x for x in val if x != "$__all") or ".+"
-        if val in (None, "", "$__all"):
-            val = ".+" if v.get("includeAll") else (v.get("query") or "")
-        tr.const_vars[name] = str(val)
+        val, vnote = inline_value(v)
+        tr.const_vars[name] = val
         notes.append(f"variable ${name} ({vtype}) has no Cardinal equivalent; inlined as '{val}'")
+        if vnote:
+            notes.append(vnote)
     return variables, notes
 
 
@@ -441,6 +750,33 @@ def avg_title(text):
     if not n:
         new, n = re.subn(r"(?i)\bpercentiles?\b", "average", new)
     return new if n else f"{text} (avg)"
+
+
+# Grafana transformations that remove rows, series or fields from what the panel shows.
+FILTERING_TRANSFORMS = {"filterByValue", "filterFieldsByName", "filterByRefId", "filterByName", "limit"}
+
+
+def display_filter_notes(p):
+    """What Grafana does to a panel's results after the query that doesn't carry over."""
+    notes = []
+    for t in p.get("transformations") or []:
+        if t.get("disabled"):
+            continue
+        tid = t.get("id", "?")
+        hides = tid == "organize" and any((t.get("options") or {}).get("excludeByName", {}).values())
+        if tid in FILTERING_TRANSFORMS or hides:
+            notes.append(f"Grafana transformation '{tid}' is not carried over: the panel can show "
+                         "series or values Grafana filtered out")
+        else:
+            notes.append(f"Grafana transformation '{tid}' is not carried over")
+    for o in ((p.get("fieldConfig") or {}).get("overrides") or []):
+        for prop in o.get("properties") or []:
+            if prop.get("id") == "custom.hideFrom" and (prop.get("value") or {}).get("viz"):
+                notes.append("series hidden in Grafana (field override) are shown in Cardinal")
+                break
+    if p.get("repeat"):
+        notes.append(f"repeated per ${p['repeat']} in Grafana; one panel for all its values in Cardinal")
+    return notes
 
 
 def convert_panel(p, tr, datasources, pid):
@@ -496,6 +832,7 @@ def convert_panel(p, tr, datasources, pid):
             queries.append(q)
             refs.append(t.get("refId"))
 
+    notes += display_filter_notes(p)
     fc = (p.get("fieldConfig") or {}).get("defaults", {}) or {}
     unit = UNIT_MAP.get(fc.get("unit", ""), fc.get("unit", ""))
     if any(PCT_AS_AVG in x for x in notes):
@@ -583,7 +920,8 @@ def flatten_sections(dash):
             if current["panels"]:
                 sections.append(current)
             current = {"title": p.get("title") or "Row", "row_y": p.get("gridPos", {}).get("y", 0),
-                       "panels": list(p.get("panels", [])), "collapsed": bool(p.get("collapsed"))}
+                       "panels": list(p.get("panels", [])), "collapsed": bool(p.get("collapsed")),
+                       "repeat": p.get("repeat")}
             continue
         current["panels"].append(p)
     if current["panels"]:
@@ -594,7 +932,7 @@ def flatten_sections(dash):
 
 
 def convert_dashboard(dash, tr, datasources):
-    tr.const_vars = {}
+    tr.reset_dashboard()
     variables, var_notes = convert_variables(dash, tr, datasources)
     report = {"uid": dash.get("uid"), "title": dash.get("title"), "variables": var_notes, "panels": []}
     panels, sections = {}, []
@@ -605,6 +943,9 @@ def convert_dashboard(dash, tr, datasources):
             n += 1
             pid = f"p{n}"
             cp, status, notes, refs = convert_panel(p, tr, datasources, pid)
+            if sec.get("repeat") and cp:
+                notes = notes + [f"row repeated per ${sec['repeat']} in Grafana; one row for all its values in Cardinal"]
+                status = "adapted"
             entry = {"title": p.get("title"), "grafana_type": p.get("type"), "grafana_id": p.get("id"),
                      "status": status, "notes": sorted(set(notes))}
             if cp:
@@ -681,6 +1022,12 @@ def convert_rule(rule, group, tr, datasources):
     notes += n
     if new is None:
         return None, dict(report, status="skipped", notes=sorted(set(notes)))
+    if any(FILTER_REMOVED in x for x in n):
+        # A wider query fires on data the Grafana rule never looked at (other
+        # environments, other services, every status code): don't create it.
+        return None, dict(report, status="skipped", notes=sorted(set(notes)) + [
+            "not migrated: removing a filter would make the rule fire on data the Grafana rule ignores; "
+            "recreate it in Cardinal with a filter that exists there"])
 
     # Find the condition chain: threshold / classic_conditions / math over reduce.
     cond = exprs.get(ga.get("condition"))
@@ -750,7 +1097,8 @@ def convert_rule(rule, group, tr, datasources):
         notes.append("rule was paused in Grafana")
     status = "adapted" if notes else "migrated"
     return {"name": title, "rule_spec": rule_spec, "paused": bool(ga.get("is_paused")),
-            "source": {"grafana_uid": ga.get("uid"), "folder": group["folder"], "group": group["group"]}}, \
+            "source": {"grafana_uid": ga.get("uid"), "folder": group["folder"], "group": group["group"],
+                       "grafana_expr": expr, "datasource_uid": qd.get("datasourceUid")}}, \
         dict(report, status=status, notes=sorted(set(notes)))
 
 
@@ -782,7 +1130,7 @@ def main():
     apath = os.path.join(args.export, "alerts.json")
     for group in (json.load(open(apath)) if os.path.exists(apath) else []):
         for rule in group["rules"]:
-            tr.const_vars = {}
+            tr.reset_dashboard()
             out, rep = convert_rule(rule, group, tr, datasources)
             report["alerts"].append(rep)
             if out:
