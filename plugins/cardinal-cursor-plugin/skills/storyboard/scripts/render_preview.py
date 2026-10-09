@@ -1363,8 +1363,8 @@ def _problem_record(scene_id: str, reason: str) -> dict:
 
 def no_chromium_message(searched: list, reason: str | None = None) -> str:
     head = reason or "No usable local Chromium or Google Chrome (version 112+) was found, so the scenes were not rendered."
-    return (head + " Local preview is authoring feedback, not a publish requirement: tell the user, keep authoring, "
-            "and judge the scenes from their statements and the preview warnings. To enable it, install Google Chrome "
+    return (head + " Tell the user visual review is unavailable and keep authoring the draft. "
+            "Leave the storyboard unpublished until its previews can be rendered and reviewed. To enable it, install Google Chrome "
             "or set CARDINAL_CHROMIUM to a Chrome/Chromium binary. Searched: " + "; ".join(searched[:40]))
 
 

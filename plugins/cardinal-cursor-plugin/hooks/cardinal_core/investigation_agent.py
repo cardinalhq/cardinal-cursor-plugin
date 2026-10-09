@@ -15,7 +15,6 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .storyboard_offer import VISUALIZATION_OFFER
 from . import investigation_bootstrap as boot
 from . import investigation_events as ie
 from . import investigation_grants as grants
@@ -45,8 +44,8 @@ def describe(wiring, sid: str, binding: dict) -> str:
               f"and private Storyboard {facts['storyboard_id']}. {links} ")
     if not facts["is_author"]:
         return prefix + "You joined another author's investigation. Do not checkpoint, frame, or edit it."
-    return (prefix + "The storyboard visualization is authored in this session, only when the user asks or accepts your offer. " +
-            "Do not create another storyboard for this session. " + VISUALIZATION_OFFER + " " +
+    return (prefix + "The storyboard visualization is authored in this session, only when the user asks. " +
+            "Do not create another storyboard for this session. " +
             "Show the user the Storyboard link in your first progress update so they can follow the work. "
             "Publishing and sharing require the user's explicit request. "
             f"Use `{cmd} link {target}` to recover its link. "

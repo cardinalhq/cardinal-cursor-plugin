@@ -1,6 +1,6 @@
 ---
 name: cardinal-storyboard
-description: Author or update a Cardinal storyboard visualization in this session when the user asks or accepts the end-of-work offer. Includes evidence-bound scenes and rendered preview review. Updating visuals leaves the storyboard private; publishing and sharing need separate requests. Not needed to return a link or record investigation activity.
+description: Publish a Cardinal storyboard by updating its evidence-bound scenes and visualization, rendering and reviewing previews, then changing the draft status to published. Also use for explicitly requested private visualization updates. Not needed to return a link or record investigation activity.
 ---
 
 # Storyboard visualization
@@ -15,4 +15,4 @@ Run the script from this installed skill directory (not a similarly named file i
 python3 -I <this-skill-directory>/scripts/render_preview.py --runtime cursor --from-json <preview.json>
 ```
 
-Read the resulting PNGs before considering the visualization reviewed. If Chrome/Chromium is unavailable, report that preview could not be verified. Do not publish just because the visualization is complete, and do not repeat the update offer after this skill finishes.
+Read the resulting PNGs before considering the visualization reviewed. If Chrome/Chromium is unavailable, report that preview could not be verified. For a publish request, finish the shared publish workflow after reviewing the PNGs. Otherwise leave the result in draft.
