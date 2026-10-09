@@ -1,6 +1,6 @@
 # Session-owned storyboard visualization
 
-Use this workflow when the user asks for a storyboard visualization or accepts the end-of-work offer. Giving a link, recording findings, or finishing an investigation does not itself authorize visualization authoring.
+Use this workflow when the user asks for a storyboard visualization or asks to publish the storyboard. Giving a link, recording findings, or finishing an investigation does not itself authorize visualization authoring.
 
 ## Author the same storyboard
 
@@ -16,8 +16,12 @@ Draw what makes the finding understandable: a comparison, sequence, dependency, 
 
 Call `storyboard__preview`. Fix validation errors. Render the returned preview bundles using the adapter instructions in SKILL.md, then inspect every scene and reveal step. Check whether the point is clear, labels are readable, and nothing clips or overlaps. Revise and preview again as needed. Never claim visual review when rendering was unavailable; report that limitation.
 
-Keep the same storyboard and leave the result private. Updating a visualization does not authorize publishing or sharing. If every act is published, use `storyboard__add_act` to open a new draft on the same storyboard; preserve published acts. State the question and reviewed time window with `storyboard__set_frame` when needed for publication. Publish or share only when separately requested; preserve public-link and raw-evidence confirmations.
+Keep the same storyboard and leave the result private. Updating a visualization does not authorize publishing or sharing. If every act is published, use `storyboard__add_act` to open a new draft on the same storyboard; preserve published acts. State the question and reviewed time window with `storyboard__set_frame` when needed for publication. For a publish request, complete the workflow below; preserve public-link and raw-evidence confirmations.
 
-## Finish without another offer
+## Publish after updating
 
-Return the storyboard link and briefly describe the visualization update. Do not ask whether to update it again. If the user declined the offer, acknowledge that and do not author anything or repeat the offer. The next investigation work can end with a fresh offer; a visualization-only continuation cannot.
+A request to publish authorizes updating and reviewing the visualization, then publishing that reviewed draft. Refresh the scenes to reflect the latest findings and evidence before calling `storyboard__publish`; do not publish an empty or stale draft. Complete the preview and revision loop above first. If authoring, validation, or rendering fails, leave the storyboard in draft and report what remains.
+
+Call `storyboard__publish` only after those steps succeed, and verify that its response reports publication. Draft storyboards are visible only to their author. Publication makes the reviewed visualization visible to members of the organization; creating or extending public share links requires a separate explicit request. Honor any public-link and raw-evidence confirmations returned by the server.
+
+Return the storyboard link and briefly describe whether it was updated privately or published. Do not prompt for an update at the end of ordinary work or after completing this skill.

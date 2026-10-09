@@ -264,8 +264,7 @@ def session_start_text(wiring: Wiring, cwd: str, session_id: Optional[str], *,
         parts: List[str] = []
         line = session_line(session_id, wiring.cli, auto_context)
         if line and include_session_line:
-            from .storyboard_offer import VISUALIZATION_OFFER
-            parts.append(line + " " + VISUALIZATION_OFFER)
+            parts.append(line)
         if not wiring.discovery_disabled():
             try:
                 block = storyboard_discovery.discover(
