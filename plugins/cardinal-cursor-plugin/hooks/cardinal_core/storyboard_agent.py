@@ -247,7 +247,7 @@ def hooks_file_registers(path: Path, event: str, needle: str) -> bool:
 
 
 def session_start_text(wiring: Wiring, cwd: str, session_id: Optional[str], *,
-                       auto_context: bool = False, opener=None,
+                       auto_context: bool = False, include_session_line: bool = True, opener=None,
                        deadline: Optional[float] = None) -> Optional[str]:
     """The session id line and the discovery block (each only when it
     applies), joined by a blank line; None when there is neither. Nothing
@@ -263,8 +263,9 @@ def session_start_text(wiring: Wiring, cwd: str, session_id: Optional[str], *,
             return None
         parts: List[str] = []
         line = session_line(session_id, wiring.cli, auto_context)
-        if line:
-            parts.append(line)
+        if line and include_session_line:
+            from .storyboard_offer import VISUALIZATION_OFFER
+            parts.append(line + " " + VISUALIZATION_OFFER)
         if not wiring.discovery_disabled():
             try:
                 block = storyboard_discovery.discover(

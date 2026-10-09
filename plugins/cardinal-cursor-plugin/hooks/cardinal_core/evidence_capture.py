@@ -12,6 +12,9 @@ leaves the machine only when the author promotes it
       1  opt-out?  CARDINAL_EVIDENCE_CAPTURE=0 | <spool>/disabled  -> nothing
       2  dedupe:   source kind "cardinal" (Cardinal's own gateway already
                    minted a witnessed receipt)                      -> nothing
+         control plane: any input string runs `cardinal-storyboard
+                   investigation …` (the investigation's control log is
+                   never evidence)                                  -> nothing
       3  sensitivity gate over every key and string of tool_input
          (cardinal_core.evidence_gate; tool-neutral)          -> withheld stub
       4  normalize: the first matching pluggable normalizer, else generic
@@ -324,6 +327,15 @@ def redact_text_wide(s: str) -> str:
     return s
 
 
+def scrub_prompt(s: str) -> str:
+    """A prompt the owner typed (an Investigation's owner input), with the
+    same credential rules a captured plain-text result gets: the gateway's
+    plain-text pass (token shapes, URL userinfo, auth schemes, credential
+    key=value pairs) and redact_text_wide. Nothing else changes: no path
+    rewrites and no withheld lines, so the rest stays as typed."""
+    return redact_text_wide(evidence.redact_plain_text(s))
+
+
 def _looks_json(s: str) -> bool:
     t = s.lstrip()
     return bool(t) and t[0] in "{["
@@ -634,6 +646,27 @@ def context_line(entry: dict, first: bool, promote_cmd: str = "cardinal-evidence
 # The pipeline
 # ---------------------------------------------------------------------------
 
+# A command line that runs the investigation control-log CLI (any path to
+# it, any shell separator before it).
+_CONTROL_PLANE_RE = re.compile(r"(?:^|[\s/;&|(`'\"])cardinal-storyboard[\s'\"]+investigation(?:[\s'\"]|$)")
+
+
+def control_plane(tool_input: Any, _depth: int = 0) -> bool:
+    """Whether any string in a tool call's input runs `cardinal-storyboard
+    investigation …`: the investigation's control log (events, acks, the
+    question, links) is never evidence, so such a call is never captured.
+    Tool-neutral, like the sensitivity gate."""
+    if _depth > 20:
+        return False
+    if isinstance(tool_input, str):
+        return "cardinal-storyboard" in tool_input and bool(_CONTROL_PLANE_RE.search(tool_input))
+    if isinstance(tool_input, dict):
+        return any(control_plane(v, _depth + 1) for v in tool_input.values())
+    if isinstance(tool_input, list):
+        return any(control_plane(v, _depth + 1) for v in tool_input)
+    return False
+
+
 def capture_call(call: ToolCall, home: Path, *, env: Optional[dict] = None, rules: Optional[gate.Rules] = None,
                  promote_cmd: str = "cardinal-evidence", write: bool = True) -> Optional[Captured]:
     """Record one tool call. None when capture is off or the call is
@@ -648,6 +681,8 @@ def capture_call(call: ToolCall, home: Path, *, env: Optional[dict] = None, rule
     if evidence.capture_disabled(root, env):
         return None
     if isinstance(call.source, dict) and call.source.get("kind") == SOURCE_CARDINAL:
+        return None
+    if control_plane(call.tool_input):
         return None
     home_s = str(home) if home else None
     if rules is None:
