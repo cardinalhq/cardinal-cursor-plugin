@@ -281,12 +281,19 @@ def batches(items: list) -> list:
     return out
 
 
+CONTROL_LOG_NOT_EVIDENCE = "control_log_not_evidence"
+CONTROL_LOG_MESSAGE = ("an investigation's control log (its events, and `cardinal-storyboard investigation` calls) "
+                       "is never evidence and never public: it cannot be cited in a storyboard")
+
+
 def explain_status(status: int, body: dict, org: str, storyboard_id: str, auth: str,
                    adapter: Optional[PromoteAdapter] = None) -> str:
     connect = adapter.connect_hint if adapter else "cardinal-connect"
     reconnect = adapter.reconnect_hint if adapter else "cardinal-connect --rotate"
     code = str(body.get("error") or "")
     msg = clip(body.get("message"))
+    if code == CONTROL_LOG_NOT_EVIDENCE:
+        return CONTROL_LOG_MESSAGE
     if status == 400:
         return f"maestro rejected the upload ({code or 'bad request'}): {msg or 'upgrade the plugin'}"
     if status == 401:
@@ -522,6 +529,9 @@ def cmd_promote(args, adapter: PromoteAdapter, out=sys.stdout, err=sys.stderr, o
                 ledger.setdefault(entries[ev_id].get("session_id"), {})[ev_id] = r["receipt_id"]
             else:
                 e = r.get("error") if isinstance(r.get("error"), dict) else {}
+                if e.get("code") == CONTROL_LOG_NOT_EVIDENCE:
+                    results[ev_id] = ("error", CONTROL_LOG_NOT_EVIDENCE, CONTROL_LOG_MESSAGE)
+                    continue
                 results[ev_id] = ("error", clip(e.get("code") or "rejected", 60), clip(e.get("message")))
     for session, receipts in ledger.items():
         try:
