@@ -1288,7 +1288,11 @@ def _downgrade(state: dict, sessions: Optional[dict]) -> tuple:
 # ---------------------------------------------------------------------------
 
 class FetchError(Exception):
-    pass
+    def __init__(self, message, *, ambiguous=False, network=False):
+        super().__init__(message)
+        self.ambiguous = ambiguous
+        self.network = network
+
 
 
 def fetch_storyboard(conn: dict, storyboard_id: str, *, client: str, opener: Optional[Any] = None,

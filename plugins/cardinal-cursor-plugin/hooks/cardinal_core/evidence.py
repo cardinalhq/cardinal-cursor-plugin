@@ -1562,7 +1562,7 @@ def read_promoted(root: Path, session_id: Any) -> dict:
         return {}
     out = {}
     for sb, recs in sbs.items():
-        if isinstance(sb, str) and STORYBOARD_ID_RE.match(sb) and isinstance(recs, dict):
+        if isinstance(sb, str) and re.fullmatch(r"(?:sb|inv)_[0-9a-f]{24}", sb) and isinstance(recs, dict):
             good = {ev_id: rec for ev_id, rec in recs.items() if _valid_promotion(ev_id, rec)}
             if good:
                 out[sb] = good
@@ -1586,8 +1586,8 @@ def record_promoted(root: Path, session_id: Any, storyboard_id: str, receipts: d
     """Add {evidence_id: receipt_id} for one storyboard to the session's
     ledger (atomic, 0600). At most MAX_PROMOTED_STORYBOARDS storyboards are
     kept, most recently promoted first."""
-    if not STORYBOARD_ID_RE.match(storyboard_id or ""):
-        raise ValueError("bad storyboard id")
+    if not re.fullmatch(r"(?:sb|inv)_[0-9a-f]{24}", storyboard_id or ""):
+        raise ValueError("bad storyboard or investigation id")
     now = time.time() if now is None else now
     stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     new = {ev_id: {"receipt_id": r, "promoted_at": stamp} for ev_id, r in receipts.items()}

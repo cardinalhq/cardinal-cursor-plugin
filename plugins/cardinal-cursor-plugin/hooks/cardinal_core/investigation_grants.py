@@ -42,7 +42,8 @@ from . import investigation_state_sync as sync
 READ = "read"
 OWNER_INPUT_READ = "owner_input:read"
 ADVISE = "advise"
-SCOPES = (READ, OWNER_INPUT_READ, ADVISE)
+EVIDENCE_READ = "evidence:read"
+SCOPES = (READ, OWNER_INPUT_READ, ADVISE, EVIDENCE_READ)
 DEFAULT_SCOPES = (READ, ADVISE)
 TTL_DEFAULT = 14400
 TTL_MIN = 300
@@ -87,6 +88,8 @@ def parse_scopes(raw: Optional[str], owner_input: bool = False) -> list:
         raise ValueError("at least one scope")
     if OWNER_INPUT_READ in got and READ not in got:
         raise ValueError("owner input needs the read scope too")
+    if EVIDENCE_READ in got and READ not in got:
+        raise ValueError("evidence:read requires read")
     return [x for x in SCOPES if x in got]
 
 
@@ -105,6 +108,8 @@ def grant(conn: dict, investigation_id: str, scopes: list, *, ttl_seconds: Optio
         raise ist.FetchError(f"not an investigation id: {investigation_id!r}")
     if not scopes or any(s not in SCOPES for s in scopes):
         raise ist.FetchError(f"the scopes are one or more of {', '.join(SCOPES)}")
+    if EVIDENCE_READ in scopes and READ not in scopes:
+        raise ValueError("evidence:read requires read")
     body: dict = {"investigation_id": investigation_id, "scopes": list(scopes)}
     if ttl_seconds is not None:
         if not TTL_MIN <= int(ttl_seconds) <= TTL_MAX:
@@ -118,7 +123,7 @@ def grant(conn: dict, investigation_id: str, scopes: list, *, ttl_seconds: Optio
     tok = out.get("token")
     if out.get("investigation_id") != investigation_id or not valid_grant_id(out.get("grant_id")) \
             or not isinstance(tok, str) or not _TOKEN_RE.fullmatch(tok):
-        raise ist.FetchError("grant-investigation-access answered for another investigation or without a token")
+        raise ist.FetchError("grant-investigation-access answered for another investigation or without a token", ambiguous=True)
     return out
 
 
