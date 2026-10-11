@@ -105,10 +105,13 @@ def clear_pending() -> None:
 def build_mcp_entry(mcp_url: str, api_key: str) -> dict:
     """A Cursor MCP entry the plugin owns end-to-end. The `cardinalManaged`
     field is metadata for disconnect — Cursor ignores unknown keys inside
-    mcpServers entries."""
+    mcpServers entries. X-Cardinal-Client names this agent on every MCP
+    request: Cardinal records it as the producing client of the
+    investigation events posted through its MCP tools (a display claim,
+    never identity)."""
     return {
         "url": mcp_url,
-        "headers": {"X-CardinalHQ-API-Key": api_key},
+        "headers": {"X-CardinalHQ-API-Key": api_key, "X-Cardinal-Client": f"cursor/{PLUGIN_VERSION}"},
         "cardinalManaged": True,
         "cardinalPluginVersion": PLUGIN_VERSION,
     }

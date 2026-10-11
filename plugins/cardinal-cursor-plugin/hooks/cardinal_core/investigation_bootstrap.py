@@ -49,6 +49,8 @@ from typing import Any, Optional
 from . import investigation_events as ie
 from . import investigation_state as ist
 from . import investigation_state_sync as sync
+from .paths import read_json
+from .storyboard_context import CONTEXT_FIELDS
 
 TIMEOUT = 3.0               # SessionStart's request (hooks.json gives the hook 6 s)
 RETRY_FIRST = 30.0
@@ -205,7 +207,34 @@ def _bootstrap_lock(home: Path, sid: str, wait: float):
         os.close(fd)
 
 
+def context_path(home: Path, sid: str) -> Path:
+    return ie.sessions_dir(home) / f"{ie.binding_path(home, sid).stem}.context.json"
+
+
+def session_context(home: Path, sid: str, conn: dict, context: Optional[dict] = None) -> dict:
+    """Keep the first repo snapshot for retries and background resume repair.
+
+    Only the collector's path-free labels are retained. An explicit empty
+    context clears the snapshot (context opt-out); None reads it. A session
+    first started outside Git can acquire its first repo on resume.
+    Called under the bootstrap lock when writing.
+    """
+    path = context_path(home, sid)
+    saved = read_json(path)
+    previous = saved.get("context", {}) if saved.get("org") == conn.get("org") else {}
+    previous = previous if isinstance(previous, dict) else {}
+    if context is None:
+        return previous
+    clean = {k: context[k] for k in CONTEXT_FIELDS if context.get(k) is not None}
+    if clean and previous.get("repo"):
+        clean = previous
+    ie._ensure_dirs(home)
+    ie.write_json(path, {"org": conn.get("org"), "context": clean})
+    return clean
+
+
 def ensure(home: Path, sid: str, conn: dict, client: str, *, wanted: Optional[str] = None,
+           context: Optional[dict] = None,
            started_at: Optional[str] = None, opener=None, timeout: float = TIMEOUT, force: bool = False,
            now: Optional[float] = None) -> dict:
     """Make sure session `sid` is bound to its Investigation and live
@@ -223,13 +252,13 @@ def ensure(home: Path, sid: str, conn: dict, client: str, *, wanted: Optional[st
     `binding` is the session's binding afterwards (None when unbound).
     Never raises."""
     try:
-        return _ensure(home, sid, conn, client, wanted, started_at, opener, timeout, force,
+        return _ensure(home, sid, conn, client, wanted, started_at, context, opener, timeout, force,
                        time.time() if now is None else now)
     except Exception as e:  # fail open
         return {"status": "failed", "binding": None, "error": _describe(e)}
 
 
-def _ensure(home, sid, conn, client, wanted, started_at, opener, timeout, force, now) -> dict:
+def _ensure(home, sid, conn, client, wanted, started_at, context, opener, timeout, force, now) -> dict:
     if not ie.valid_session(sid) or not (conn and conn.get("origin") and conn.get("org") and conn.get("key")):
         return {"status": "invalid", "binding": None, "error": None}
     if wanted is not None and not ie.valid_investigation(wanted):
@@ -238,6 +267,7 @@ def _ensure(home, sid, conn, client, wanted, started_at, opener, timeout, force,
         b = ie.read_binding(home, sid)
         if not got:
             return {"status": "busy", "binding": b, "error": None}
+        context = session_context(home, sid, conn, context)
         if reusable(b, conn, wanted):
             # No request on the session-start path: the background poller asks
             # again for what the server advertises (refresh_capabilities), so a
@@ -254,7 +284,7 @@ def _ensure(home, sid, conn, client, wanted, started_at, opener, timeout, force,
             return {"status": "backoff", "binding": b, "error": st.get("last_error"), "reason": st.get("reason")}
         try:
             out = sync.ensure_session_investigation(conn, sid, investigation_id=join, started_at=started_at,
-                                                    client=client, opener=opener, timeout=timeout)
+                                                    context=context, client=client, opener=opener, timeout=timeout)
         except Exception as e:
             if isinstance(e, sync.ServerError) and sync.unsupported(e):
                 # An older Maestro: behave as before (an explicit join still binds
@@ -376,7 +406,7 @@ def refresh_capabilities(home: Path, sid: str, conn: dict, client: str, *, opene
     refused = False
     try:
         out = sync.ensure_session_investigation(conn, sid, investigation_id=inv, client=client, opener=opener,
-                                                timeout=timeout)
+                                                context=session_context(home, sid, conn), timeout=timeout)
         caps = capabilities(out)
     except sync.ServerError as e:
         if not (sync.unsupported(e) or (400 <= e.status < 500 and e.status not in (408, 429))):

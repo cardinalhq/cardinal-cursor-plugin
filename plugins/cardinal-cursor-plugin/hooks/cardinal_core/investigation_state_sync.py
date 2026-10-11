@@ -423,7 +423,7 @@ def attach_storyboard(conn: dict, investigation_id: str, storyboard_id: str, *, 
 
 
 def ensure_session_investigation(conn: dict, session_id: str, *, investigation_id: Optional[str] = None,
-                                 started_at: Optional[str] = None, client: str, opener=None,
+                                 started_at: Optional[str] = None, context: Optional[dict] = None, client: str, opener=None,
                                  timeout: float = 30.0) -> dict:
     """maestro ensure-session-investigation: this session's Investigation and
     its live Storyboard, created on the first call and returned on every
@@ -440,7 +440,22 @@ def ensure_session_investigation(conn: dict, session_id: str, *, investigation_i
         body["investigation_id"] = investigation_id
     if started_at is not None:
         body["started_at"] = started_at
-    out = _post(conn, "ensure-session-investigation", body, client=client, opener=opener, timeout=timeout)
+    if context:
+        body["context"] = context
+    try:
+        out = _post(conn, "ensure-session-investigation", body, client=client, opener=opener, timeout=timeout)
+    except ServerError as err:
+        # Servers predating session context reject the new top-level key.
+        # Retry only that precise schema refusal; never hide a real error.
+        issues = err.body.get("issues")
+        if not (context and err.status == 400 and err.body.get("error") == "invalid_body"
+                and isinstance(issues, list) and any(
+                    isinstance(i, dict) and i.get("path") in ("", None, [])
+                    and re.fullmatch(r'''Unrecognized key(?:s|\(s\) in object)?: ["']context["']''',
+                                     i.get("message", "")) for i in issues)):
+            raise
+        del body["context"]
+        out = _post(conn, "ensure-session-investigation", body, client=client, opener=opener, timeout=timeout)
     inv, sb = out.get("investigation_id"), out.get("storyboard_id")
     if not isinstance(inv, str) or not ist.INVESTIGATION_ID_RE.match(inv) \
             or (investigation_id is not None and inv != investigation_id):
