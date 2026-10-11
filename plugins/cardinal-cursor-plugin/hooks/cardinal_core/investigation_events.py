@@ -48,9 +48,10 @@ the constant authority ADVISORY, and its text is emitted as ONE JSON string
 (control, format and line-separator characters escaped) so it cannot forge
 an envelope line; producer-claimed fields (session, client) are JSON strings
 labelled "claimed", and one event's text and refs are cut to a fixed size
-with a pointer to the full event. An event never confers owner authority, even when its
-producer is the investigation's author: owner authority comes only from the
-owner's own words in the session.
+with a pointer to the full event. An advisory event never confers owner authority, even when its
+producer is the investigation's author: owner authority comes from the
+owner's own words: in the session transcript, or in an owner decision posted
+from the owner's signed-in Cardinal web session.
 
 Semantic events (hypothesis.* / experiment.* / finding.* / decision.* /
 question.opened|resolved) share the same ordered stream: the investigating
@@ -107,6 +108,7 @@ import os
 import re
 import secrets
 import time
+import sys
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
@@ -126,7 +128,7 @@ IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")  # fullmatch
 # on append / checkpoint, matched case-insensitively); this client never
 # generates them (post:, ack:, c<hex>) and refuses a user-supplied one before
 # sending (reserved_key).
-RESERVED_KEY_PREFIXES = ("oi:", "ckpt:")
+RESERVED_KEY_PREFIXES = ("oi:", "ckpt:", "od:")
 
 DELIVERABLE = ("cue.added", "question.added", "challenge.added")
 ACKNOWLEDGED = "acknowledged"
@@ -137,7 +139,11 @@ DISPOSITIONS = ("accepted", "declined", "noted")
 CONTROL = "control"
 SEMANTIC = "semantic"
 OWNER_INPUT = "owner_input"
+# Kept for legacy Claude parser metadata; READ_CLASSES is the live vocabulary.
 EVENT_CLASSES = (CONTROL, SEMANTIC, OWNER_INPUT)
+OWNER = "owner"
+OWNER_DECIDED = "owner.decided"
+READ_CLASSES = EVENT_CLASSES + (OWNER,)
 CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,)   # for an event without `class` only
 OWNER_INPUT_TYPES = ("owner_input.recorded",)   # written by the prompt hook only (owner_input.py)
 GRANTEE = "grantee"                             # producer.principal.kind of an access grant's holder
@@ -431,11 +437,11 @@ def read_events(conn: dict, investigation_id: str, *, after: int = 0, limit: int
     (fewer than `limit` events) and next_after is past the last event
     returned (rows the server scanned but does not show this caller) and not
     past the head; else the last event's seq. class_: only one class
-    (EVENT_CLASSES)."""
+    (READ_CLASSES)."""
     if not valid_investigation(investigation_id):
         raise ist.FetchError(f"not an investigation id: {investigation_id!r}")
-    if class_ is not None and class_ not in EVENT_CLASSES:
-        raise ist.FetchError(f"the class is one of {', '.join(EVENT_CLASSES)}")
+    if class_ is not None and class_ not in READ_CLASSES:
+        raise ist.FetchError(f"the class is one of {', '.join(READ_CLASSES)}")
     body: dict = {"investigation_id": investigation_id, "after": int(after), "limit": int(limit)}
     if to_session_id is not None:
         body["to_session_id"] = to_session_id
@@ -463,7 +469,8 @@ def read_events(conn: dict, investigation_id: str, *, after: int = 0, limit: int
     if len(events) < int(limit) and isinstance(nxt, int) and not isinstance(nxt, bool) and last < nxt <= head:
         last = nxt   # a short page: the server scanned past what it showed
     return {"investigation_id": investigation_id, "events": kept, "last_seq": last, "page_size": len(events),
-            "head_seq": head}
+            "head_seq": head, "principals": principals,
+            "viewer": out.get("viewer") if isinstance(out.get("viewer"), dict) else {}}
 
 
 def read_all(conn: dict, investigation_id: str, *, after: int, to_session_id: Optional[str] = None, client: str,
@@ -575,7 +582,7 @@ def text_payload(text: str, refs: Optional[list] = None) -> dict:
 # a producer, an authority, a seq or a time. The checks below only turn a
 # malformed request into a usable message before anything is sent.
 
-SEMANTIC_TYPES = ("hypothesis.proposed", "hypothesis.resolved", "experiment.started", "experiment.completed",
+SEMANTIC_TYPES = ("hypothesis.proposed", "hypothesis.resolved", "experiment.started", "experiment.completed", "experiment.revised",
                   "finding.proposed", "finding.revised", "finding.retracted", "decision.proposed",
                   "decision.revised", "question.opened", "question.resolved")
 _ID_PREFIX = {"hypothesis": "hyp_", "experiment": "exp_", "finding": "finding_", "decision": "decision_",
@@ -586,6 +593,7 @@ SEMANTIC_FIELDS = {
     "hypothesis.resolved": ("outcome", ("statement",), ("evidence", "refs")),
     "experiment.started": ("statement", (), ("tests", "refs")),
     "experiment.completed": ("outcome", (), ("evidence", "refs")),
+    "experiment.revised": ("outcome", (), ("evidence", "refs")),
     "finding.proposed": ("statement", (), ("evidence", "refs")),
     "finding.revised": ("statement", (), ("evidence", "refs")),
     "finding.retracted": ("reason", (), ("evidence", "refs")),
@@ -716,6 +724,73 @@ def _list_item(name: str, x: Any, where: str) -> str:
     raise CheckpointInputError(f"{where}: {name} items are {' / '.join(prefixes)} ids, not {_claimed(x)}")
 
 
+STRUCTURED_TYPES = ("finding.proposed", "finding.revised", "experiment.completed", "experiment.revised",
+                    "hypothesis.resolved", "decision.proposed", "decision.revised", "question.resolved")
+
+
+def capability(binding: dict, name: str) -> bool:
+    caps = binding.get("capabilities") or {}
+    value = caps.get(name) if isinstance(caps, dict) else None
+    return value is True or (isinstance(value, dict) and value.get("enabled") is True)
+
+
+def refresh_binding_capabilities(home, sid, conn, client, *, opener=None):
+    """Refresh on explicit link or a refused client gate; keep stale data on transient errors."""
+    from . import investigation_bootstrap as boot
+    binding = read_binding(home, sid)
+    if not binding or binding.get("org") != conn.get("org"):
+        return binding
+    try:
+        boot.refresh_path(home, sid).touch()
+        boot.refresh_capabilities(home, sid, conn, client, opener=opener)
+    except (OSError, ValueError, ist.FetchError, sync.ServerError) as error:
+        print("warning: could not refresh investigation capabilities: " + _one_line(error), file=sys.stderr)
+    return read_binding(home, sid) or binding
+
+
+def validate_structured(name: str, value: Any, where: str = "checkpoint") -> Any:
+    if name == "artifacts":
+        if not isinstance(value, list) or len(value) > 20:
+            raise CheckpointInputError(f"{where}: artifacts is a list of at most 20 objects")
+        out = []
+        for a in value:
+            if not isinstance(a, dict) or set(a) - {"path", "sha256", "role"}:
+                raise CheckpointInputError(f"{where}: artifact takes path, sha256 and optional role")
+            path = a.get("path")
+            if not isinstance(path, str) or not 1 <= len(path) <= 512 or path.startswith(("/", "~", "\\")) \
+                    or ".." in re.split(r"[/\\]", path) or re.match(r"^[A-Za-z]:", path) \
+                    or any(ord(c) < 32 or 127 <= ord(c) <= 159 or unicodedata.category(c) == "Cs" for c in path):
+                raise CheckpointInputError(f"{where}: artifact path must be repo-relative, without ~, .. or controls")
+            if not isinstance(a.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", a["sha256"]):
+                raise CheckpointInputError(f"{where}: artifact sha256 is 64 lowercase hex characters")
+            if "role" in a and a["role"] not in ("input", "output", "report"):
+                raise CheckpointInputError(f"{where}: artifact role is input, output or report")
+            out.append(dict(a))
+        return out
+    if not isinstance(value, dict) or set(value) - {"name", "result", "detail"} \
+            or not isinstance(value.get("name"), str) or not 1 <= len(value["name"]) <= 100 \
+            or value.get("result") not in ("pass", "fail", "skip") \
+            or ("detail" in value and (not isinstance(value["detail"], str) or len(value["detail"]) > 500)):
+        raise CheckpointInputError(f"{where}: gate takes name (1-100 chars), result pass|fail|skip, detail (<=500)")
+    return dict(value)
+
+
+def checkpoint_capabilities(events: list, binding: dict) -> list:
+    if any(e["type"] == "experiment.revised" for e in events) and not capability(binding, "experiment_revised"):
+        raise CheckpointInputError("this Cardinal server does not support experiment.revised yet")
+    if not capability(binding, "checkpoint_artifacts"):
+        stripped = False
+        for e in events:
+            for field in ("artifacts", "gate"):
+                if field in e["payload"]:
+                    stripped = True
+                    e["payload"].pop(field)
+        if stripped:
+            print("warning: this Cardinal server does not support checkpoint artifacts/gate; fields stripped",
+                  file=sys.stderr)
+    return events
+
+
 def _semantic_event(e: Any, i: int) -> dict:
     where = f"event {i}"
     if not isinstance(e, dict):
@@ -742,7 +817,8 @@ def _semantic_event(e: Any, i: int) -> dict:
     if not isinstance(sid, str) or not sid.startswith(prefix) or not SEMANTIC_ID_RE.fullmatch(sid):
         raise CheckpointInputError(f"{where}: \"id\" is {_id_shape((prefix,))}, the same id in its later events")
     required, texts, lists = SEMANTIC_FIELDS[t]
-    unknown = sorted(str(k) for k in set(fields) - {required, *texts, *lists})
+    structured = {"artifacts", "gate"} if t in STRUCTURED_TYPES else set()
+    unknown = sorted(str(k) for k in set(fields) - {required, *texts, *lists} - structured)
     if unknown:
         takes = ", ".join(("id", required) + texts + lists)
         named = ", ".join(_claimed(k) for k in unknown)
@@ -777,6 +853,9 @@ def _semantic_event(e: Any, i: int) -> dict:
         if len(items) > LIST_CAPS[name]:
             raise CheckpointInputError(f"{where}: at most {LIST_CAPS[name]} {name} items")
         payload[name] = items
+    for name in structured:
+        if name in fields:
+            payload[name] = validate_structured(name, fields[name], where)
     return {"type": t, "payload": payload}
 
 
@@ -896,6 +975,16 @@ def upload_cited(conn: dict, investigation_id: str, session_id: str, ids: list, 
             rid = r.get("receipt_id")
             if isinstance(rid, str) and RECEIPT_REF_RE.fullmatch(rid):
                 out[ev_id] = rid
+                entry = evidence.read_entry(root, ev_id)
+                if entry:
+                    # Upload succeeded even if a later item or checkpoint fails.
+                    try:
+                        evidence.record_promoted(root, entry.get("session_id"), investigation_id, {ev_id: rid})
+                    except OSError as err:
+                        # A sandbox can read the spool but forbid writing its ledger.
+                        # Do not prevent the checkpoint after a successful evidence upload.
+                        print("warning: evidence uploaded; local receipt map could not be saved: " + _one_line(err),
+                              file=sys.stderr)
                 continue
             err = r.get("error") if isinstance(r.get("error"), dict) else {}
             failed.append(f"{ev_id}: {_tok(err.get('code') or 'no_result')}"
@@ -943,6 +1032,10 @@ def checkpoint(conn: dict, investigation_id: str, session_id: str, events: Any, 
         raise CheckpointInputError(f"checkpoint keys starting {' or '.join(RESERVED_KEY_PREFIXES)} are reserved by "
                                    "Cardinal")
     events = checkpoint_events(events)
+    binding = read_binding(home or home_dir(), session_id) or {}
+    if any(e["type"] == "experiment.revised" for e in events) and not capability(binding, "experiment_revised"):
+        binding = refresh_binding_capabilities(home or home_dir(), session_id, conn, client, opener=opener) or binding
+    events = checkpoint_capabilities(events, binding)
     key = idempotency_key or checkpoint_key(investigation_id, session_id, events)
     cited = cited_captures(events)
     if cited:
@@ -1060,7 +1153,7 @@ def semantic_body(e: dict) -> tuple:
 
 def event_class(e: Any) -> Optional[str]:
     """The event's class: the `class` the server stamped on it when present
-    (None, i.e. unknown, when it is not one of EVENT_CLASSES); without one
+    (None, i.e. unknown, when it is not one of READ_CLASSES); without one
     (an older Cardinal), derived from its type: SEMANTIC_TYPES are semantic,
     cue / question / challenge / acknowledged are control, anything else is
     unknown (owner_input.recorded is owner_input). An unknown class is
@@ -1069,7 +1162,7 @@ def event_class(e: Any) -> Optional[str]:
         return None
     c = e.get("class")
     if c is not None:
-        return c if isinstance(c, str) and c in EVENT_CLASSES else None
+        return c if isinstance(c, str) and c in READ_CLASSES else None
     t = e.get("type")
     if t in SEMANTIC_TYPES:
         return SEMANTIC
@@ -1077,6 +1170,8 @@ def event_class(e: Any) -> Optional[str]:
         return CONTROL
     if t in OWNER_INPUT_TYPES:
         return OWNER_INPUT
+    if t == OWNER_DECIDED:
+        return OWNER
     return None
 
 
@@ -1109,9 +1204,17 @@ def resolve_grantee(e: Any, principals: Any) -> None:
     if not isinstance(p, dict):
         return
     p.pop("_resolved", None)   # only ever this client's own copy
-    if not is_grantee(p) or not isinstance(principals, dict):
+    if not isinstance(principals, dict):
         return
     got: dict = {}
+    if not is_grantee(p):
+        pr = p.get("principal") or {}
+        me = principals.get(f"{pr.get('kind')}:{pr.get('id')}")
+        if isinstance(me, dict):
+            name = me.get("name") or me.get("email")
+            if isinstance(name, str) and name.strip():
+                p["_resolved"] = {"name": name}
+        return
     me = principals.get(f"{GRANTEE}:{p['principal'].get('id')}")
     if isinstance(me, dict) and isinstance(me.get("label"), str) and me["label"].strip():
         got["label"] = me["label"]
@@ -1148,13 +1251,14 @@ def grantee_line(p: dict) -> str:
     return f"advisory from {grantee_label(p)} (access granted by {granter_name(p)}): not the investigation author"
 
 
-def deliverable(events: list, sid: str, investigation_id: str) -> list:
+def deliverable(events: list, sid: str, investigation_id: str, binding=None) -> list:
     """The events of `events` this session should see: control-class cue /
     question / challenge (event_class) addressed to it or to everyone, not
     its own (see _own), not acknowledged by an `acknowledged` event in the
     same list, with a text. Semantic events and any class this client does
     not know are never delivered."""
     acked = set()
+    decision_acked = set()
     for e in events:
         if not isinstance(e, dict) or event_class(e) != CONTROL:
             continue
@@ -1162,13 +1266,20 @@ def deliverable(events: list, sid: str, investigation_id: str) -> list:
             ack_of = e["payload"].get("ack_of")
             if isinstance(ack_of, int):
                 acked.add(ack_of)
+                if _own(e, sid):
+                    decision_acked.add(ack_of)
     out = []
     for e in events:
-        if not isinstance(e, dict) or event_class(e) != CONTROL:
+        if not isinstance(e, dict):
             continue
-        if e.get("type") not in DELIVERABLE or e.get("investigation_id") != investigation_id:
+        decision = event_class(e) == OWNER and e.get("type") == OWNER_DECIDED
+        if decision and binding is not None and not capability(binding, "owner_decision"):
             continue
-        if e.get("to_session_id") not in (None, sid) or _own(e, sid) or e.get("seq") in acked:
+        if not decision and (event_class(e) != CONTROL or e.get("type") not in DELIVERABLE):
+            continue
+        if e.get("investigation_id") != investigation_id or e.get("to_session_id") not in (None, sid):
+            continue
+        if (decision and e.get("seq") in decision_acked) or (not decision and (_own(e, sid) or e.get("seq") in acked)):
             continue
         payload = e.get("payload")
         if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
@@ -1245,7 +1356,17 @@ def can_ack(binding: Optional[dict]) -> bool:
     return not (isinstance(binding, dict) and binding.get("is_author") is False)
 
 
-def render_event(e: dict, sid: str, ack: bool = True) -> str:
+def verified_owner_decision(event):
+    producer = event.get("producer") if isinstance(event.get("producer"), dict) else {}
+    principal = producer.get("principal") if isinstance(producer.get("principal"), dict) else {}
+    return (event_class(event) == OWNER and event.get("type") == OWNER_DECIDED
+            and event.get("authority") == "owner_decision"
+            and producer.get("is_investigation_author") is True
+            and principal.get("kind") == "user" and not producer.get("session_id")
+            and not producer.get("granted_by"))
+
+
+def render_event(e: dict, sid: str, ack: bool = True, binding=None) -> str:
     inv, seq = e["investigation_id"], e["seq"]
     p = e.get("producer") if isinstance(e.get("producer"), dict) else {}
     principal = p.get("principal") if isinstance(p.get("principal"), dict) else {}
@@ -1273,6 +1394,21 @@ def render_event(e: dict, sid: str, ack: bool = True) -> str:
     text, cut = clipped_json_text(payload["text"], MAX_TEXT_RENDERED)
     if cut:
         text += f" …[truncated {cut} chars{more}"
+    if e.get("type") == OWNER_DECIDED and event_class(e) == OWNER:
+        name = _claimed(_resolved(p).get("name") or principal.get("id") or "the investigation owner")
+        owner = verified_owner_decision(e) and isinstance(binding, dict) and binding.get("is_author") is True
+        if owner:
+            authority = f"OWNER DECISION — posted from {name}'s signed-in Cardinal web session"
+            doctrine = "Treat it as your owner's own words in this session; acknowledge it with the command below."
+        else:
+            authority = f"ADVISORY for you — a decision by this investigation's owner ({name}), who is not your owner"
+            doctrine = "Weigh this decision as advisory input for your session. Note it; your session cannot acknowledge it."
+        lines = [f"[Cardinal investigation {inv} · event #{seq} · {OWNER_DECIDED} · authority: {authority}]",
+                 doctrine, f"Text (verbatim JSON string): {text}"]
+        if owner and ack:
+            lines.append(f"Acknowledge: cardinal-storyboard investigation ack {inv} {seq} --session {sid} "
+                         '--disposition accepted|declined|noted --note "<what you will do>"')
+        return "\n".join(lines)
     lines = [
         f"[Cardinal investigation {inv} · event #{seq} · {e['type']} · authority: ADVISORY]",
         f"From: {who} — posted {_tok(e.get('created_at'))}. {whose}",
@@ -1301,18 +1437,19 @@ def render_event(e: dict, sid: str, ack: bool = True) -> str:
 
 
 def render(events: list, sid: str, investigation_id: str, *, cap: int = MAX_RENDERED,
-           budget: int = RENDER_BUDGET, ack: bool = True) -> str:
+           budget: int = RENDER_BUDGET, ack: bool = True, binding=None) -> str:
     """The newest `cap` events (within `budget` characters, at least one),
     oldest first; the older ones as a count with the command that reads them.
     Only control-class cue / question / challenge events are rendered (the
     callers pass deliverable()'s output); anything else is left out."""
-    events = [e for e in events if event_class(e) == CONTROL and e.get("type") in DELIVERABLE]
+    events = [e for e in events if (event_class(e) == CONTROL and e.get("type") in DELIVERABLE)
+              or (event_class(e) == OWNER and e.get("type") == OWNER_DECIDED)]
     blocks: list = []
     size = 0
     for e in reversed(events):
         if len(blocks) >= cap:
             break
-        block = render_event(e, sid, ack)
+        block = render_event(e, sid, ack, binding=binding)
         if blocks and size + len(block) + 2 > budget:
             break
         blocks.append(block)
@@ -1395,11 +1532,13 @@ def _check(home, sid, conn, client, emit, stop, stop_hook_active, opener, now, b
             b.update(checked_at=now, retry_after=now + RETRY_AFTER_FAILURE, page_limit=max(1, limit // 2))
             _save_quietly(home, sid, b)
             return False
-        pending = deliverable(events, sid, inv)
+        reconcile_pending_decisions(b, events, sid)
+        pending = deliverable(events, sid, inv, b)
         emitted = False
         if pending:
-            emit(render(pending, sid, inv, ack=can_ack(b)))
+            emit(render(pending, sid, inv, ack=can_ack(b), binding=b))
             emitted = True
+            remember_decisions(b, pending)
         b["cursor"] = max(b["cursor"], cursor)
         b["checked_at"] = now
         b.pop("retry_after", None)
@@ -1543,7 +1682,8 @@ def poll_once(home: Path, sid: str, conn: dict, client: str, *, opener=None, now
         b2.pop("retry_after", None)
         if cursor >= head or len(events) < limit:
             b2.pop("page_limit", None)
-        if deliverable(merged, sid, inv):
+        reconcile_pending_decisions(b2, merged, sid)
+        if deliverable(merged, sid, inv, b2):
             write_json(inbox_path(home, sid), {"investigation_id": inv, "after": b2["cursor"],
                                                "through": max(after, cursor), "head_seq": head,
                                                "events": merged, "written_at": _now_iso(now)})
@@ -1580,11 +1720,13 @@ def deliver_inbox(home: Path, sid: str, emit: Callable[[str], None], *, stop: bo
                 if int(_num(b.get("stop_blocks"))) >= MAX_STOP_BLOCKS:
                     return False
             inv = b["investigation_id"]
-            pending = deliverable(box["events"], sid, inv)
+            reconcile_pending_decisions(b, box["events"], sid)
+            pending = deliverable(box["events"], sid, inv, b)
             emitted = False
             if pending:
-                emit(render(pending, sid, inv, ack=can_ack(b)))
+                emit(render(pending, sid, inv, ack=can_ack(b), binding=b))
                 emitted = True
+                remember_decisions(b, pending)
             b["cursor"] = max(b["cursor"], box["through"])
             if stop:
                 b["stop_blocks"] = int(_num(b.get("stop_blocks"))) + 1 if emitted else 0
@@ -1593,3 +1735,71 @@ def deliver_inbox(home: Path, sid: str, emit: Callable[[str], None], *, stop: bo
             return emitted
     except Exception:
         return False
+
+
+MAX_PENDING_DECISIONS = 10
+MAX_DECISION_REMINDERS = 2
+
+
+def _pending_decisions(binding):
+    pending = binding.get("pending_decisions")
+    return [p for p in pending if isinstance(p, dict)] if isinstance(pending, list) else []
+
+
+def reconcile_pending_decisions(binding, events, sid):
+    acked = set()
+    for event in events or []:
+        if (isinstance(event, dict) and event_class(event) == CONTROL
+                and event.get("type") == ACKNOWLEDGED and _own(event, sid)):
+            payload = event.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("ack_of"), int):
+                acked.add(payload["ack_of"])
+    binding["pending_decisions"] = [p for p in _pending_decisions(binding) if p.get("seq") not in acked]
+
+
+def remember_decisions(binding, events):
+    if binding.get("is_author") is not True:
+        return
+    pending = _pending_decisions(binding)
+    for event in events:
+        if verified_owner_decision(event) and not any(p.get("seq") == event["seq"] for p in pending):
+            pending.append({"seq": event["seq"], "reminders": 0})
+    binding["pending_decisions"] = pending[-MAX_PENDING_DECISIONS:]
+
+
+def remove_pending_decision(home, sid, seq):
+    if not valid_session(sid):
+        return
+    with locked(home, sid) as got:
+        if not got:
+            return
+        binding = read_binding(home, sid)
+        if binding:
+            binding["pending_decisions"] = [p for p in _pending_decisions(binding) if p.get("seq") != seq]
+            write_binding(home, sid, binding)
+
+
+def remind_decisions(home, sid, emit):
+    """Stop-only reminders. The one delivery cursor is never changed."""
+    if not valid_session(sid):
+        return False
+    with locked(home, sid) as got:
+        if not got:
+            return False
+        binding = read_binding(home, sid)
+        if not binding or binding.get("is_author") is not True or not capability(binding, "owner_decision"):
+            return False
+        pending = [p for p in _pending_decisions(binding)
+                   if isinstance(p.get("seq"), int) and not isinstance(p["seq"], bool) and p["seq"] > 0
+                   and _num(p.get("reminders")) < MAX_DECISION_REMINDERS]
+        if not pending:
+            return False
+        inv = _tok(binding["investigation_id"])
+        emit("\n".join(
+            f"Pending investigation decision #{p['seq']}; read it with: "
+            f"cardinal-storyboard investigation events {inv} --after {p['seq'] - 1}"
+            for p in pending))
+        for p in pending:
+            p["reminders"] = _num(p.get("reminders")) + 1
+        write_binding(home, sid, binding)
+        return True

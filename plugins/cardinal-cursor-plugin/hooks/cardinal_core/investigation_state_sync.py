@@ -38,6 +38,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import http.client
+import socket
+import ssl
 import re
 import urllib.error
 import urllib.parse
@@ -139,6 +142,48 @@ def _retry_after(headers: Any) -> Optional[float]:
         return None
 
 
+def ambiguous_transport(err: Exception) -> bool:
+    """urllib cannot expose whether a timed-out write reached the peer.
+
+    Only known pre-send errors are definite. Timeouts/resets/disconnects are
+    conservative: preserve a grant reservation until list/revoke resolves it.
+    Any HTTP response is handled separately as a definite refusal.
+    """
+    reason = err.reason if isinstance(err, urllib.error.URLError) else err
+    if isinstance(reason, (ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+        return True
+    if isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLError)):
+        return False
+    return isinstance(reason, (TimeoutError, ConnectionError, http.client.HTTPException))
+
+
+def _grant_connection(connection_class, request):
+    """Mark the write phase only after TCP/TLS connect, before sending POST.
+
+    A failed socket write can be partial, so an attempted POST is ambiguous.
+    Proxy CONNECT traffic is not a grant request and does not set the marker.
+    """
+    class Connection(connection_class):
+        def send(self, data):
+            if self.sock is None:
+                self.connect()
+            if isinstance(data, (bytes, bytearray)) and data.startswith(b"POST "):
+                request._cardinal_write_started = True
+            return super().send(data)
+    return Connection
+
+
+class _GrantHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_grant_connection(http.client.HTTPConnection, req), req)
+
+
+class _GrantHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_grant_connection(http.client.HTTPSConnection, req), req, context=self._context)
+
+
+
 def _post(conn: dict, tool: str, payload: dict, *, client: str, opener=None, timeout: float = 30.0) -> dict:
     """POST maestro's direct tool route with the MCP key; the JSON body, or
     ServerError carrying the server's status and body.
@@ -150,9 +195,11 @@ def _post(conn: dict, tool: str, payload: dict, *, client: str, opener=None, tim
     token = conn.get("token")
     if not (conn.get("origin") and conn.get("org") and (token or conn.get("key"))):
         raise ist.FetchError("not connected to Cardinal (run /cardinal:connect)")
+    tracked_grant = opener is None and tool == "grant-investigation-access"
     if opener is None:
-        from .evidence_promote import no_redirect_opener
-        opener = no_redirect_opener()
+        from .evidence_promote import _NoRedirect, no_redirect_opener
+        opener = (urllib.request.build_opener(_NoRedirect(), _GrantHTTPHandler(), _GrantHTTPSHandler())
+                  if tracked_grant else no_redirect_opener())
     url = conn["origin"] + "/api/orgs/" + urllib.parse.quote(conn["org"], safe="") + "/storyboards/mcp-tools/" + tool
     headers = {
         "Content-Type": "application/json",
@@ -165,12 +212,16 @@ def _post(conn: dict, tool: str, payload: dict, *, client: str, opener=None, tim
         headers["X-CardinalHQ-API-Key"] = conn["key"]
     req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), method="POST",
                                  headers=headers)
+    if tracked_grant:
+        req._cardinal_write_started = False
     try:
         with opener.open(req, timeout=timeout) as resp:
             raw = resp.read(MAX_RESPONSE_BYTES)
     except urllib.error.HTTPError as e:
         try:
             text = e.read(MAX_RESPONSE_BYTES).decode("utf-8", "replace")
+        except (OSError, http.client.HTTPException):
+            text = "could not read the HTTP error body"
         finally:
             e.close()
         try:
@@ -179,14 +230,19 @@ def _post(conn: dict, tool: str, payload: dict, *, client: str, opener=None, tim
             body = {"error": text[:300]}
         raise ServerError(e.code, body if isinstance(body, dict) else {"error": str(body)[:300]},
                           f"{tool} answered {e.code}: {text[:300]}", retry_after=_retry_after(e.headers))
-    except (urllib.error.URLError, OSError) as e:
-        raise ist.FetchError(f"{tool} failed: {e}")
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        ambiguous = req._cardinal_write_started if tracked_grant else ambiguous_transport(e)
+        network = (not isinstance(e, http.client.HTTPException)
+                   or isinstance(e, (http.client.RemoteDisconnected, http.client.IncompleteRead)))
+        raise ist.FetchError(f"{tool} failed: {e}", ambiguous=ambiguous, network=network)
     try:
         body = json.loads(raw)
     except ValueError:
-        raise ist.FetchError(f"{tool} answered with something that is not JSON")
+        raise ist.FetchError(f"{tool} answered with something that is not JSON",
+                             ambiguous=tool == "grant-investigation-access")
     if not isinstance(body, dict):
-        raise ist.FetchError(f"{tool} answered with something that is not an object")
+        raise ist.FetchError(f"{tool} answered with something that is not an object",
+                             ambiguous=tool == "grant-investigation-access")
     return body
 
 
