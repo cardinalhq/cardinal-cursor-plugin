@@ -61,7 +61,7 @@ def describe(wiring, sid: str, binding: dict) -> str:
             f"Use `{cmd} ack {target} <seq> <accepted|declined|noted>` to acknowledge them.")
 
 
-def start(wiring, sid: str, source: Optional[str] = None) -> Optional[str]:
+def start(wiring, sid: str, source: Optional[str] = None, *, cwd: Optional[str] = None) -> Optional[str]:
     if not enabled(wiring) or not ie.valid_session(sid):
         return None
     conn = wiring.connection()
@@ -71,7 +71,8 @@ def start(wiring, sid: str, source: Optional[str] = None) -> Optional[str]:
     # Invalid explicit targets fail closed; never silently create another investigation.
     if wanted and not ie.valid_investigation(wanted):
         return None
-    result = boot.ensure(home(wiring), sid, conn, wiring.client, wanted=wanted,
+    context = {} if wiring.context_disabled() else wiring.collect(cwd or os.getcwd(), sid, gh=False)
+    result = boot.ensure(home(wiring), sid, conn, wiring.client, wanted=wanted, context=context,
                          started_at=boot.started_now() if source in (None, "startup") else None)
     binding = result.get("binding")
     if binding and binding.get("bootstrap", {}).get("status") == "ok":
