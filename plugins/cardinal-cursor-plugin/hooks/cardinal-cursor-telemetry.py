@@ -25,7 +25,25 @@ specific:
     spool ~/.cardinal/evidence, and its `[evidence:ev_…]` id is handed back
     via `additional_context`, so a storyboard can cite it as *captured*
     evidence (scripts/cardinal-evidence promotes it). Nothing is sent over
-    the network.
+    the network;
+  * the Investigation session (cardinal_core.investigation_agent):
+    sessionStart bootstraps it, starts the detached poller and puts the
+    session guidance in `additional_context`; postToolUse /
+    postToolUseFailure deliver staged items, the inbox and re-surfaced
+    challenges as `additional_context`; stop ends the turn (owner-input
+    flush, sync check) and STAGES what it would deliver: Cursor's
+    `followup_message` is a user turn, so it is never used (R1 of
+    docs/plans/cross-agent-parity.md);
+  * owner input on beforeSubmitPrompt (cardinal_core.owner_input.capture,
+    detached), only after the user consented in their own terminal
+    (`cardinal-connect --owner-input on`): Cursor has no user-visible,
+    non-blocking channel for a per-session disclosure. Never blocks;
+  * storyboard authoring (cardinal_core.storyboard_authoring): the preview
+    render and hero upload in a matcher-scoped postToolUse entry with a
+    long timeout (`--role authoring`), the evidence token on every tool, the
+    edit lookup on afterFileEdit and the discovery re-look on
+    beforeSubmitPrompt (both staged for the next postToolUse, the hooks that
+    compute them have no context channel).
 
 There is NO turn_usage / api_request emission on Cursor — the product
 never exposes per-model-call token counts (parity spec gap D). Failures
@@ -35,6 +53,7 @@ are best-effort and silent: telemetry must not break the agent loop.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -44,6 +63,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+START = time.monotonic()
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _decision_cli  # noqa: E402
@@ -340,14 +361,10 @@ def failure_text(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def capture_evidence(payload: dict[str, Any], failed: bool = False) -> str | None:
-    """Record one tool call (any tool) in the local evidence spool and
-    return the context line for the agent (`[evidence:ev_...]`, or
-    `[evidence:ev_... withheld: ...]` for a call that touched something
-    sensitive); None for Cardinal's own tools, when the user opted out
-    (CARDINAL_EVIDENCE_CAPTURE=0 or ~/.cardinal/evidence/disabled), with
-    CARDINAL_EVIDENCE_CONTEXT=0, or on any failure. Local file work only;
-    never raises."""
+def evidence_call(payload: dict[str, Any], failed: bool = False):
+    """The cardinal_core.evidence_capture.ToolCall of one postToolUse /
+    postToolUseFailure payload, or None (no tool name; a failure without
+    an error). Never raises."""
     try:
         from cardinal_core import evidence_capture as cap
 
@@ -361,7 +378,7 @@ def capture_evidence(payload: dict[str, Any], failed: bool = False) -> str | Non
             return None
         response = None if failed else _decode_json_container(_first(payload, "tool_output", "toolOutput"))
         tuid = _first(payload, "tool_use_id", "toolUseId", "tool_call_id", "toolCallId")
-        call = cap.ToolCall(
+        return cap.ToolCall(
             runtime="cursor",
             tool_name=raw_name,
             source=source,
@@ -374,6 +391,26 @@ def capture_evidence(payload: dict[str, Any], failed: bool = False) -> str | Non
             cwd=cwd_from_payload(payload),
             client=evidence.client_string("cursor", _first(payload, "cursor_version", "cursorVersion")),
         )
+    except Exception:
+        return None
+
+
+def capture_evidence(payload: dict[str, Any], failed: bool = False, call: Any = None) -> str | None:
+    """Record one tool call (any tool) in the local evidence spool and
+    return the context line for the agent (`[evidence:ev_...]`, or
+    `[evidence:ev_... withheld: ...]` for a call that touched something
+    sensitive); None for Cardinal's own tools, when the user opted out
+    (CARDINAL_EVIDENCE_CAPTURE=0 or ~/.cardinal/evidence/disabled), with
+    CARDINAL_EVIDENCE_CONTEXT=0, or on any failure. `call`: the payload's
+    evidence_call when the caller already built it. Local file work only;
+    never raises."""
+    try:
+        from cardinal_core import evidence_capture as cap
+
+        if call is None:
+            call = evidence_call(payload, failed)
+        if call is None:
+            return None
         # Never silent: a call the pipeline cannot finish in time is kept as a
         # withheld stub (capture_call_guarded).
         got = cap.capture_call_guarded(call, Path.home(), promote_cmd=shlex.quote(str(EVIDENCE_CLI)))
@@ -382,13 +419,35 @@ def capture_evidence(payload: dict[str, Any], failed: bool = False) -> str | Non
         return None
 
 
+def failure_line(call: Any, *, succeeded: bool | None = None) -> str | None:
+    """investigation_failures.observe for one tool call: a throttled line
+    when a shell call that writes to the Investigation could not reach
+    Cardinal (the sandbox's network denial). Core keys the shell tools by
+    runtime (investigation_failures.SHELL_TOOLS). Local only; never raises."""
+    try:
+        if call is None:
+            return None
+        from cardinal_core import investigation_failures
+
+        return investigation_failures.observe(Path.home(), call.session_id, call.tool_input, call.response,
+                                              call.error, runtime="cursor", tool_name=call.tool_name,
+                                              succeeded=succeeded)
+    except Exception:
+        return None
+
+
 def handle_post_tool_use_failure(payload: dict[str, Any]) -> None:
     """A failed tool call is evidence too (a failing test, a 403): captured
-    with status "error", its id returned as additional_context."""
+    with status "error", its id returned as additional_context, with the
+    Investigation's deliveries for this tool boundary (boundary_contexts)."""
     dump_debug_payload("postToolUseFailure", payload)
-    line = capture_evidence(payload, failed=True)
-    if line:
-        sys.stdout.write(json.dumps({"additional_context": line}))
+    call = evidence_call(payload, failed=True)
+    lines = [x for x in (failure_line(call), capture_evidence(payload, failed=True, call=call)) if x]
+    conv_id = conv_id_from_payload(payload)
+    if conv_id:
+        lines.extend(boundary_contexts(payload, conv_id))
+    if lines:
+        sys.stdout.write(json.dumps({"additional_context": "\n\n".join(lines)}))
         sys.stdout.flush()
 
 
@@ -502,6 +561,12 @@ def handle_before_submit_prompt(payload: dict[str, Any]) -> None:
             return
     except Exception:
         pass
+
+    # Owner input (only with the user's connect-time consent) and the
+    # discovery re-look: neither waits on the network here, and neither
+    # ever blocks the prompt or prints anything.
+    capture_owner_input(payload, conv_id, cwd)
+    spawn_relook(conv_id, cwd)
 
     branch = None
     repo = None
@@ -875,6 +940,8 @@ def run_background_job(path: Path) -> None:
             pass
     if isinstance(job, dict) and job.get("kind") == "post_tool_use":
         post_tool_use_background(job)
+    elif isinstance(job, dict) and job.get("kind") == "relook":
+        relook_background(job)
 
 
 def post_tool_use_background(job: dict[str, Any]) -> None:
@@ -927,11 +994,19 @@ def handle_post_tool_use(payload: dict[str, Any]) -> None:
     band per turn). The tool call (any tool) is first captured in the
     local evidence spool and its id prepended to that output."""
     dump_debug_payload("postToolUse", payload)
-    evidence_line = capture_evidence(payload)
+    call = evidence_call(payload)
+    failure = failure_line(call)
+    evidence_line = capture_evidence(payload, call=call)
+    # Cardinal's storyboard__preview / __publish: the authoring entry
+    # answers for this call (Cursor keeps the LAST response of a field), so
+    # this one says nothing and consumes nothing (staged items, the inbox,
+    # a limits notice wait for the next tool call).
+    owned = authoring_entry_owns(payload)
     conv_id = conv_id_from_payload(payload)
     if not conv_id:
-        if evidence_line:
-            sys.stdout.write(json.dumps({"additional_context": evidence_line}))
+        line = "\n\n".join(x for x in (failure, evidence_line) if x)
+        if line and not owned:
+            sys.stdout.write(json.dumps({"additional_context": line}))
             sys.stdout.flush()
         return
     state = session.load_progress(PATHS, conv_id)
@@ -991,12 +1066,12 @@ def handle_post_tool_use(payload: dict[str, Any]) -> None:
     state["tool_seq"] += 1
     session.save_progress(PATHS, conv_id, state)
 
-    contexts: list[str] = [evidence_line] if evidence_line else []
+    contexts: list[str] = [x for x in (failure, evidence_line) if x]
     # Piggyback pending notify/warn context onto the hook output. This
     # is the Cursor adapter's substitute for Claude's inline
     # systemMessage on the submit hook — see Divergence E.
     try:
-        msg = limits.consume_notify(PATHS, conv_id)
+        msg = None if owned else limits.consume_notify(PATHS, conv_id)
         if msg:
             contexts.append(msg)
     except Exception:
@@ -1012,7 +1087,10 @@ def handle_post_tool_use(payload: dict[str, Any]) -> None:
         contexts.extend(decision_contexts)
     except Exception as err:
         contexts.append(f"Cardinal did NOT record the decision: {_short_error(err)}")
-    if contexts:
+    observe_cardinal(payload, conv_id)
+    if not owned:
+        contexts.extend(boundary_contexts(payload, conv_id))
+    if contexts and not owned:
         sys.stdout.write(json.dumps({"additional_context": "\n\n".join(contexts)}))
         sys.stdout.flush()
 
@@ -1055,12 +1133,37 @@ def handle_pre_compact(payload: dict[str, Any]) -> None:
     emit_records([log_record("cardinal.plan_usage", attrs, time.time_ns())], payload)
 
 
+# The stop entry's timeout is 10 s (cardinal-connect); the turn's end
+# (sync check, owner-input flush) ends by this much after the hook started.
+STOP_BUDGET_SEC = 7.0
+
+
 def handle_stop(payload: dict[str, Any]) -> None:
-    """Best-effort transcript sweep. Cursor's transcript format carries
-    no token / rate-limit records (parity spec gap D — Cursor product
-    gap), so this stays a debug-capture no-op until Cursor exposes
-    usage on a hook payload or the transcript."""
+    """The turn's end of an Investigation session
+    (investigation_agent.turn_end): the inbox, one bounded sync check when
+    the poller is stale, an open directive or the decision reminders, the
+    owner-input outbox flush and the owner-input turn boundary (the
+    repeat check needs it). Cursor may not block here (R1: `followup_message`
+    is submitted as the next USER message, so advisory text would become
+    owner input): turn_end STAGES what it would deliver, for the next
+    postToolUse or sessionStart, and this hook PRINTS NOTHING, ever.
+
+    Telemetry: Cursor's transcript format carries no token / rate-limit
+    records (parity spec gap D), so there is no transcript sweep."""
     dump_debug_payload("stop", payload)
+    conv_id = conv_id_from_payload(payload)
+    if not conv_id:
+        return
+    try:
+        from cardinal_core import investigation_agent
+
+        # Never a re-entry from a Cardinal block (there is none), so
+        # stop_hook_active is False; the Delivery's turn_end_block is None
+        # on Cursor (investigation_turn.TURN_END_BLOCK) and is not printed.
+        investigation_agent.turn_end(storyboard_wiring(), conv_id, stop_hook_active=False,
+                                     deadline=START + STOP_BUDGET_SEC, cwd=cwd_from_payload(payload))
+    except Exception:
+        pass
 
 
 def handle_after_agent_response(payload: dict[str, Any]) -> None:
@@ -1209,17 +1312,37 @@ def storyboard_wiring():
     return storyboard_agent.Wiring("cursor", PATHS, PLUGIN_VERSION, cli=str(STORYBOARD_CLI))
 
 
+# afterFileEdit's entry has 5 s; the edit lookup's one request ends by this.
+EDIT_LOOKUP_BUDGET_SEC = 1.5
+
+
 def handle_after_file_edit(payload: dict[str, Any]) -> None:
-    """Record the edited file in storyboard_files (`context.paths`). Local
-    only, no output."""
+    """Record the edited file in storyboard_files (`context.paths`), then
+    the edit lookup (storyboard_authoring.edit_lookup: the storyboards
+    about that file's directory, the first edit there this session; one
+    request, bounded). afterFileEdit has no documented output, so the block
+    is STAGED and surfaces at the next postToolUse. No output."""
     dump_debug_payload("afterFileEdit", payload)
     path = payload.get("file_path") or payload.get("filePath")
     if not isinstance(path, str) or not path:
         return
     from cardinal_core import storyboard_agent
 
-    storyboard_agent.record_edits(storyboard_wiring(), conv_id_from_payload(payload), [path],
-                                  cwd_from_payload(payload))
+    conv_id = conv_id_from_payload(payload)
+    cwd = cwd_from_payload(payload)
+    wiring = storyboard_wiring()
+    storyboard_agent.record_edits(wiring, conv_id, [path], cwd)
+    if not conv_id:
+        return
+    try:
+        from cardinal_core import storyboard_authoring as sa
+
+        block = sa.edit_lookup(PATHS, "cursor", conv_id, path, cwd, connection=wiring.connection,
+                               client=wiring.client, deadline=START + EDIT_LOOKUP_BUDGET_SEC)
+        if block:
+            stage_for_next_boundary(conv_id, block)
+    except Exception:
+        pass
 
 
 def handle_session_start(payload: dict[str, Any]) -> None:
@@ -1244,20 +1367,398 @@ def handle_session_start(payload: dict[str, Any]) -> None:
         except Exception:
             pass
     try:
-        # The session id line (any directory) + the storyboards that may
-        # relate to this checkout, bounded well inside the hook's 5 s.
-        from cardinal_core import storyboard_agent
+        # The Investigation (bootstrap: one request, its own 3 s bound), its
+        # detached poller, what an earlier turn of this conversation staged,
+        # then the session id line (only without an Investigation: the
+        # guidance names it) + the storyboards that may relate to this
+        # checkout, all inside the hook's 10 s. sessionStart is
+        # fire-and-forget on Cursor (the agent does not wait for it).
+        from cardinal_core import investigation_agent, storyboard_agent
 
+        wiring = storyboard_wiring()
+        live = investigation_agent.start(wiring, conv_id, None, cwd=cwd) if conv_id else None
+        if conv_id:
+            investigation_agent.spawn_poller(wiring, conv_id, str(INVESTIGATION_POLLER))
+        if live:
+            parts.append(live)
+        if conv_id:
+            parts.extend(staged_contexts(wiring, conv_id))
         storyboard = storyboard_agent.session_start_text(
-            storyboard_wiring(), cwd, conv_id, deadline=min(started + 3.5, time.monotonic() + 2.0))
+            wiring, cwd, conv_id, include_session_line=not bool(live),
+            deadline=min(started + 8.0, time.monotonic() + 2.0))
         if storyboard:
             parts.append(storyboard)
+    except Exception:
+        pass
+    try:
+        from cardinal_core import storyboard_authoring as sa
+
+        for line in (sa.stray_key_warning(PATHS, "cursor", sid=conv_id),
+                     sa.connect_hint(PATHS, "cursor")):
+            if line:
+                parts.append(line)
+    except Exception:
+        pass
+    try:
+        # Checks preview (opt-in, `scripts/cardinal-checks on|off`): make the
+        # installed skill match the setting (it takes effect at the next
+        # session: Cursor has no skill reload or skill-tool deny) and, while on
+        # and connected, the routing rule. Local only.
+        from cardinal_core import checks_install
+        from cardinal_core import storyboard_authoring as sa
+
+        _, rule = checks_install.session_start(
+            "cursor", CHECKS_PLUGIN_ROOT, connected=sa.is_connected(PATHS, "cursor"))
+        if rule:
+            parts.append(rule)
     except Exception:
         pass
     if not parts:
         return
     sys.stdout.write(json.dumps({"additional_context": "\n\n".join(parts)}))
     sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Investigation sessions (cardinal_core.investigation_agent): bootstrap and
+# guidance at sessionStart, deliveries at each tool boundary, the turn's end
+# at stop. Cursor's context channels are sessionStart and postToolUse /
+# postToolUseFailure `additional_context` only (beforeSubmitPrompt answers
+# {continue, user_message}; stop's followup_message is a user turn;
+# afterFileEdit has no output), so whatever is produced elsewhere is STAGED
+# (investigation_turn.stage, <sid>.staged.json) and delivered at the next
+# postToolUse / postToolUseFailure, or at a later sessionStart.
+# ---------------------------------------------------------------------------
+
+INVESTIGATION_POLLER = Path(__file__).resolve().parent / "investigation-poller.py"
+# The plugin root the Checks preview template (checks/skill/) ships in.
+CHECKS_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+
+# Payload keys that would name a subagent. Cursor documents none on tool
+# hooks (subagentStart carries subagent_id); kept so a build that adds one
+# keeps staged items and the inbox for the main thread.
+SUBAGENT_KEYS = ("agent_id", "agentId", "subagent_id", "subagentId")
+
+
+def is_subagent_payload(payload: dict[str, Any]) -> bool:
+    return any(isinstance(payload.get(k), str) and payload.get(k) for k in SUBAGENT_KEYS)
+
+
+def stage_for_next_boundary(conv_id: str, text: str) -> None:
+    """Keep `text` for this conversation's next context-capable boundary
+    (postToolUse, postToolUseFailure, sessionStart). Never raises."""
+    try:
+        from cardinal_core import investigation_turn
+
+        investigation_turn.stage(Path.home(), conv_id, text)
+    except Exception:
+        pass
+
+
+def staged_contexts(wiring: Any, conv_id: str) -> list[str]:
+    """What was staged for this conversation, oldest first:
+    investigation_agent.prompt (a session bound on this connection's org),
+    else the plugin's own staged items (edit lookup, discovery re-look) of a
+    conversation without an Investigation. Never raises."""
+    try:
+        from cardinal_core import investigation_agent, investigation_turn
+
+        out = list(investigation_agent.prompt(wiring, conv_id).agent_context)
+        out.extend(investigation_turn.consume_staged(Path.home(), conv_id))
+        return out
+    except Exception:
+        return []
+
+
+def boundary_contexts(payload: dict[str, Any], conv_id: str) -> list[str]:
+    """A tool boundary (postToolUse / postToolUseFailure): keep the poller
+    running, then investigation_agent.deliver (staged items, the inbox, one
+    re-surfaced challenge or directive) and whatever else is staged. A
+    subagent's tool call gets nothing and consumes nothing. Local only (no
+    network). Never raises."""
+    out: list[str] = []
+    try:
+        from cardinal_core import investigation_agent
+
+        wiring = storyboard_wiring()
+        investigation_agent.spawn_poller(wiring, conv_id, str(INVESTIGATION_POLLER))
+        subagent = is_subagent_payload(payload)
+        investigation_agent.deliver(wiring, conv_id, out.append, is_subagent=subagent)
+        if not subagent:
+            out.extend(staged_contexts(wiring, conv_id))
+    except Exception:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Owner input (beforeSubmitPrompt): cardinal_core.owner_input.capture, the
+# gate every runtime shares. Cursor is in owner_input.CONSENT_REQUIRED: it has
+# no user-visible, non-blocking message per session, so nothing is captured
+# until the user consented in their own terminal (`cardinal-connect
+# --owner-input on`, which prints owner_input.consent_text in full). The
+# kill switch (CARDINAL_OWNER_INPUT=0, ~/.cardinal/owner-input.json
+# {"cursor": "off"}) wins over consent. Detached: the turn is taken under the
+# session lock here and a detached process posts it, so the prompt never
+# waits on the network. Nothing is printed and no prompt is ever blocked.
+# ---------------------------------------------------------------------------
+
+def capture_owner_input(payload: dict[str, Any], conv_id: str, cwd: str) -> str:
+    """The capture status (a debug code, never the prompt). Never raises."""
+    try:
+        home = Path.home()
+        sessions = home / ".cardinal" / "investigations" / "sessions"
+        if "/" in conv_id or not (sessions / f"{conv_id}.json").exists():
+            return "unbound"  # no import, no network for an unbound conversation
+        from cardinal_core import owner_input
+
+        wiring = storyboard_wiring()
+        agent_id = next((payload.get(k) for k in SUBAGENT_KEYS if payload.get(k)), None)
+        got = owner_input.capture(home, conv_id, payload.get("prompt"), runtime="cursor",
+                                  conn=wiring.connection(), client=wiring.client, environ=wiring.environ,
+                                  agent_id=agent_id if isinstance(agent_id, str) else None,
+                                  deadline=START + owner_input.BUDGET, detached=True, cwd=cwd)
+        # got.disclosure is never set on Cursor (consent stands in for it);
+        # there is no channel to show it on beforeSubmitPrompt anyway.
+        return got.status
+    except Exception:
+        return "error"
+
+
+# ---------------------------------------------------------------------------
+# Discovery re-look (beforeSubmitPrompt): when the branch or HEAD moved since
+# this conversation's last look, the storyboards that may relate to the
+# checkout (storyboard_authoring.relook_if_moved). Up to two requests, so it
+# runs in the detached --background child and its block is STAGED.
+# ---------------------------------------------------------------------------
+
+RELOOK_BUDGET_SEC = 2.0
+
+
+def spawn_relook(conv_id: str, cwd: str) -> None:
+    try:
+        from cardinal_core import storyboard_authoring as sa
+
+        if sa.discovery_disabled(PATHS, "cursor") or not sa.is_connected(PATHS, "cursor"):
+            return
+        spawn_background({"kind": "relook", "session_id": conv_id, "cwd": cwd})
+    except Exception:
+        pass
+
+
+def relook_background(job: dict[str, Any]) -> None:
+    sid, cwd = job.get("session_id"), job.get("cwd")
+    if not isinstance(sid, str) or not sid:
+        return
+    from cardinal_core import storyboard_authoring as sa
+
+    wiring = storyboard_wiring()
+    block = sa.relook_if_moved(PATHS, "cursor", sid, cwd, connection=wiring.connection, client=wiring.client,
+                               deadline=time.monotonic() + RELOOK_BUDGET_SEC)
+    if block:
+        stage_for_next_boundary(sid, block)
+
+
+# ---------------------------------------------------------------------------
+# Which MCP server a tool call went to. Cursor's docs give the matcher
+# spelling `MCP:<tool_name>` and no postToolUse field naming the server
+# (cursor.com/docs/agent/hooks; github.com/cursor/cookbook/issues/50,
+# reproduced on CLI 2026.09.28); the adapter's fixtures use
+# `mcp__<server>__<tool>`. Neither shape is verified on a live Cursor. A
+# name of the first shape carries its server; for any other shape, Cardinal
+# is the server only when afterMCPExecution (which documents
+# mcp_server_name) recorded this exact call (same tool, same input) for
+# Cardinal's own `cardinal` entry. Another server's tool of the same name is
+# never taken for Cardinal's: the preview renderer and the token store act
+# on what the result names, with the Cardinal key.
+# ---------------------------------------------------------------------------
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+MCP_SERVER_KEYS = ("mcp_server_name", "mcpServerName")
+MCP_CALLS_MAX = 32
+MCP_CALL_TTL_SEC = 600.0
+# How long a postToolUse for a Cardinal storyboard tool waits for
+# afterMCPExecution's record (the order of the two is undocumented).
+MCP_SERVER_WAIT_SEC = 1.5
+
+
+def mcp_calls_path(conv_id: str) -> Path:
+    return PATHS.runtime_dir / "mcp-calls" / f"{conv_id}.json"
+
+
+def bare_mcp_tool(name: str) -> str:
+    return name[len("MCP:"):] if name.startswith("MCP:") else name
+
+
+def mcp_input_key(value: Any) -> str:
+    """sha256 of the call's input as canonical JSON (a JSON string is
+    decoded first: MCP hooks pass it as a string, postToolUse as either)."""
+    try:
+        canon = json.dumps(_decode_json_container(value), sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def _read_mcp_calls(conv_id: str) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(mcp_calls_path(conv_id).read_text())
+    except (OSError, ValueError):
+        return []
+    now = time.time()
+    return [e for e in data if isinstance(e, dict) and isinstance(e.get("at"), (int, float))
+            and now - e["at"] < MCP_CALL_TTL_SEC] if isinstance(data, list) else []
+
+
+def handle_after_mcp_execution(payload: dict[str, Any]) -> None:
+    """Record that Cardinal's own MCP server ran this call (tool, input),
+    for postToolUse to tell Cardinal's tools from another server's. Local
+    only, 0600, bounded; no output (Cursor discards it)."""
+    dump_debug_payload("afterMCPExecution", payload)
+    conv_id = conv_id_from_payload(payload)
+    name = _first(payload, "tool_name", "toolName")
+    server = _first(payload, *MCP_SERVER_KEYS)
+    if server not in CARDINAL_MCP_SERVERS or not isinstance(name, str) or not name:
+        return
+    if not conv_id or not SESSION_ID_RE.match(conv_id):
+        return
+    entries = _read_mcp_calls(conv_id)
+    entries.append({"tool": bare_mcp_tool(name), "input": mcp_input_key(_first(payload, "tool_input", "toolInput")),
+                    "server": server, "at": time.time()})
+    path = mcp_calls_path(conv_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        from cardinal_core.paths import atomic_write_secret
+
+        atomic_write_secret(path, json.dumps(entries[-MCP_CALLS_MAX:]))
+    except Exception:
+        pass
+
+
+def resolve_mcp_name(payload: dict[str, Any], conv_id: str | None, wait: float = 0.0) -> tuple[Any, str | None]:
+    """(tool name, server) to give storyboard_authoring: an
+    `mcp__<server>__<tool>` name as is (it names its server); a name with a
+    server field on the payload, or one afterMCPExecution recorded for
+    Cardinal (waiting up to `wait` seconds for that record), as
+    `MCP:<tool>` with that server; anything else as is with no server (not
+    Cardinal's). Never raises."""
+    raw = _first(payload, "tool_name", "toolName")
+    if not isinstance(raw, str) or not raw or raw.startswith("mcp__"):
+        return raw, None
+    bare = bare_mcp_tool(raw)
+    if not bare:
+        return raw, None
+    server = _first(payload, *MCP_SERVER_KEYS)
+    if isinstance(server, str) and server:
+        return f"MCP:{bare}", server
+    if not conv_id or not SESSION_ID_RE.match(conv_id):
+        return raw, None
+    key = mcp_input_key(_first(payload, "tool_input", "toolInput"))
+    give_up = time.monotonic() + max(0.0, wait)
+    while True:
+        for e in reversed(_read_mcp_calls(conv_id)):
+            if e.get("tool") == bare and e.get("input") == key and e.get("server") in CARDINAL_MCP_SERVERS:
+                return f"MCP:{bare}", e["server"]
+        if time.monotonic() >= give_up:
+            return raw, None
+        time.sleep(0.1)
+
+
+# ---------------------------------------------------------------------------
+# Storyboard authoring (cardinal_core.storyboard_authoring). The preview
+# render (Chromium: ~10 s for a short storyboard, up to the core's 135 s
+# budget) and the hero upload run in their own postToolUse entry:
+# `--role authoring`, matcher AUTHORING_MATCHER, timeout
+# storyboard_authoring.PREVIEW_HOOK_TIMEOUT_S (150 s). Cursor documents
+# per-entry `timeout` (seconds, no maximum stated) and `matcher` on
+# postToolUse (cursor.com/docs/agent/hooks). Cursor keeps the last response
+# of a field when several hooks answer, so for those two tools the main
+# entry stays silent (authoring_entry_owns).
+# ---------------------------------------------------------------------------
+
+AUTHORING_ROLE = "authoring"
+# Matched by Cursor against `MCP:<tool_name>` (docs) or whatever it names the
+# tool; written to match anywhere, whether Cursor searches or full-matches.
+AUTHORING_MATCHER = ".*storyboard__(preview|publish).*"
+AUTHORING_TOOL_RE = re.compile(r"(?:^|__|:)storyboard__(preview|publish)$")
+AUTHORING_NEEDLE = f"--role {AUTHORING_ROLE} # cardinal-cursor-plugin"
+
+
+def authoring_registered(payload: dict[str, Any]) -> bool:
+    """Whether the user's or the project's hooks.json has the authoring
+    postToolUse entry (an install from before it has only the main one)."""
+    files = [PATHS.home / "hooks.json"]
+    roots = payload.get("workspace_roots") or payload.get("workspaceRoots")
+    for root in (roots if isinstance(roots, list) else [])[:4]:
+        if isinstance(root, str) and root:
+            files.append(Path(root) / ".cursor" / "hooks.json")
+    for f in files:
+        try:
+            entries = json.loads(f.read_text()).get("hooks", {}).get("postToolUse")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if any(isinstance(e, dict) and AUTHORING_NEEDLE in str(e.get("command") or "")
+               for e in (entries if isinstance(entries, list) else [])):
+            return True
+    return False
+
+
+def authoring_entry_owns(payload: dict[str, Any]) -> bool:
+    """A storyboard__preview / storyboard__publish call that the registered
+    authoring entry answers for."""
+    raw = _first(payload, "tool_name", "toolName")
+    return isinstance(raw, str) and bool(AUTHORING_TOOL_RE.search(raw)) and authoring_registered(payload)
+
+
+def observe_cardinal(payload: dict[str, Any], conv_id: str) -> None:
+    """Store the evidence token of Cardinal's storyboard__create / add_act
+    / preview (storyboard_authoring.observe_cardinal_result). Local only;
+    never raises."""
+    try:
+        from cardinal_core import storyboard_authoring as sa
+
+        raw = _first(payload, "tool_name", "toolName")
+        wait = MCP_SERVER_WAIT_SEC if isinstance(raw, str) and bare_mcp_tool(raw) in sa.TOKEN_TOOLS else 0.0
+        name, server = resolve_mcp_name(payload, conv_id, wait=wait)
+        sa.observe_cardinal_result(PATHS, "cursor", name, _decode_json_container(_first(payload, "tool_output", "toolOutput")),
+                                   session_id=conv_id, server=server)
+    except Exception:
+        pass
+
+
+def handle_post_tool_use_authoring(payload: dict[str, Any]) -> None:
+    """postToolUse `--role authoring`: after Cardinal's storyboard__preview,
+    render the scenes, cover and link-preview mock locally (on_preview);
+    after its storyboard__publish, upload the hero render (on_publish). The
+    text goes out as additional_context. Anything else (another server's
+    tool of the same name, a matcher Cursor did not apply): nothing."""
+    dump_debug_payload("postToolUse-authoring", payload)
+    raw = _first(payload, "tool_name", "toolName")
+    if not isinstance(raw, str) or not AUTHORING_TOOL_RE.search(raw):
+        return
+    conv_id = conv_id_from_payload(payload)
+    from cardinal_core import storyboard_authoring as sa
+
+    name, server = resolve_mcp_name(payload, conv_id, wait=MCP_SERVER_WAIT_SEC)
+    result = _decode_json_container(_first(payload, "tool_output", "toolOutput"))
+    text = None
+    if sa.is_cardinal_tool("cursor", name, "storyboard__preview", server=server):
+        tool_input = _decode_json_container(_first(payload, "tool_input", "toolInput"))
+        text = sa.on_preview(PATHS, "cursor", result, session_id=conv_id,
+                             tool_input=tool_input if isinstance(tool_input, dict) else None, started=START)
+    elif sa.is_cardinal_tool("cursor", name, "storyboard__publish", server=server):
+        wiring = storyboard_wiring()
+        text = sa.on_publish(PATHS, "cursor", result, connection=wiring.connection, client=wiring.client)
+    else:
+        return
+    contexts = [text] if text else []
+    if conv_id:
+        # This entry answers for the call, so it carries the boundary's
+        # deliveries too (the main entry left them).
+        contexts.extend(boundary_contexts(payload, conv_id))
+    if contexts:
+        sys.stdout.write(json.dumps({"additional_context": "\n\n".join(contexts)}))
+        sys.stdout.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -1279,12 +1780,19 @@ HANDLERS = {
     "subagentStop": handle_subagent_stop,
     "afterAgentResponse": handle_after_agent_response,
     "afterAgentThought": handle_after_agent_thought,
+    "afterMCPExecution": handle_after_mcp_execution,
+}
+# `--role <name>`: a second entry for the same event (Cursor runs every
+# matching entry), with its own matcher and timeout.
+ROLE_HANDLERS = {
+    ("postToolUse", AUTHORING_ROLE): handle_post_tool_use_authoring,
 }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--event", required=False, default=None)
+    parser.add_argument("--role", default=None)
     parser.add_argument("--background", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
@@ -1304,7 +1812,10 @@ def main() -> None:
         payload = {}
 
     event = args.event or payload.get("hook_event_name") or payload.get("hookEventName")
-    handler = HANDLERS.get(event) if isinstance(event, str) else None
+    if args.role is not None:
+        handler = ROLE_HANDLERS.get((event, args.role)) if isinstance(event, str) else None
+    else:
+        handler = HANDLERS.get(event) if isinstance(event, str) else None
     if handler is None:
         silent_exit()
 

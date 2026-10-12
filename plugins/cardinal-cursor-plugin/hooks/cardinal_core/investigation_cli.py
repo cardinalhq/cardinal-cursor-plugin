@@ -13,6 +13,7 @@ from . import investigation_state_sync as sync
 from . import investigation_bootstrap as boot
 from . import investigation_consumer as consumer
 from . import investigation_grants as gr
+from . import investigation_text
 
 EXIT_USAGE = 2
 
@@ -376,10 +377,9 @@ class CLI:
                 + "\n"
             )
             return
-        if f["view_url"]:
-            sys.stdout.write(f"Storyboard (live, private to its author while draft): {f['view_url']}\n")
-        if f["investigation_url"]:
-            sys.stdout.write(f"Investigation (control log): {f['investigation_url']}\n")
+        links = investigation_text.link_lines(f["view_url"], f["investigation_url"])
+        if links:
+            sys.stdout.write(links + "\n")
         sys.stdout.write(
             f"investigation {f['investigation_id']}"
             + (f" · storyboard {f['storyboard_id']}" if f["storyboard_id"] else " · no storyboard attached")
@@ -685,6 +685,7 @@ class CLI:
                 )
                 return 1
             raise
+        watch = investigation_text.watch_command(inv, credential_file=str(args.out) if args.out else None)
         if args.out:
             shown = {k: v for k, v in out.items() if k != "token"}
             shown["credential_file"] = str(args.out)
@@ -700,6 +701,8 @@ class CLI:
                 f"investigation revoke {out['grant_id']}`.",
                 file=sys.stderr,
             )
+        print(f"The grantee watches it with `{watch}` (one --follow per investigation; it replaces polling loops; "
+              "`events --help` says more).", file=sys.stderr)
         return 0
 
     def cmd_grants(self, args: argparse.Namespace) -> int:
@@ -902,6 +905,7 @@ def build_parser(wiring, session_env=()):
             description=(CHECKPOINT_HELP if action == "checkpoint" else
                          ie.ACK_GUIDANCE if action == "ack" else
                          ie.POST_GUIDANCE if action == "post" else None),
+            epilog=investigation_text.WATCH_GUIDANCE if action == "events" else None,
             formatter_class=argparse.RawDescriptionHelpFormatter,
         )
         if action == "checkpoint":

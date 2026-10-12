@@ -1,0 +1,28 @@
+{
+  "origin": "behavioral-program-qualification; sealed experiment retained as historical evidence, not a product dependency",
+  "upstream_plugin_commit": "48c1df812cd567dc64f7d1e01191139ed65ac099",
+  "migrated_sources": {
+    "bpq/engine.py": "aa5cfa321b7c8b16a830504d122d74015ad9367374c6f2a3fe182cc51a5f517c",
+    "bpq/storage.py": "b41716800345ca13b9223d472d190d733280619d181269733bd44a3821e022ec",
+    "bpq/identity.py": "7558e669eb393305d9a277ae376c69f22458cee39a71ea965b8729ace8056471",
+    "bpq/lifecycle.py": "afcd76b55876383523376eecd7deb2c141fec7fdb32be9e798ddac3a2dd5a342",
+    "bpq/runtime.py": "76d07ec26db3d098d367109a16d118444a312df90a727c2ce14cecef839e834c",
+    "bpq/llm.py": "b5e9e819db7bbf5c06c805cf29a30ed7595f2fa464bfd1d94c1780b7c290805d",
+    "bpq/corpus.py": "0f54c0da993285ad505d02bbbadf2c00172f2c33cd5cb6dad7f934c3d017592c",
+    "bpq/sdk_adapter.py": "09b6c6bdd55123f607f1dea98f185ed3232463fb128dc912e5ec58bc59140985"
+  },
+  "repair_instruction_sha256": "72b3258e8df9c01f873d6a62c76f1c30027224604cc3462ed374e5b9092fe90c",
+  "review_instruction_sha256": "c5c2bb1ef7ad986c013e3f180915aeda9ebbe4e6c67cd51de7f6685050689cbc",
+  "corpus_instruction_ast_sha256": "ab8a93caf282102f243d87bfa62fd6b45f67508769ea93164dacf4869361b64a",
+  "production_methods_source_sha256": {
+    "request": "9703db380fc708deba5706eb8dc15fd630963acc5e20899b37eb92866626c172",
+    "state_path": "d4912f594d322c5eb963024eb591863ea3d16a70942b2ca42ef23cedff546f91",
+    "read": "077e8dd1a7794d9db0b12adadcde9d285470e9232e10a990e24cd44a858f48ea",
+    "select": "6bf31c1f0ff03db1d299de085119d90ae5b67ea717f4f4623c6257d3c8cf88fa",
+    "context": "f4d1e0a953e82a52c2d5a339c94e9630b6cdc758948b8379b60b98ec92745432",
+    "start": "8b27a9b8e2d412c0e3caaa85bfdd16d8b3d3bd90cb754d4b5c35cc0d1a5645c3",
+    "poll": "9481dd42dae84188f8ebe46b5a6480e9261659daa2f9e5dce9283bf9bc18ee18",
+    "render": "bdba3a1056311e60b9593ea3e7ae653aa0ff5bede76b46b6c33d6a8c32bf7c11",
+    "inspect": "a2f64bc97ee1cc6225901673ace7d6e6a1991373f6ab1afe1d06a5b3432c9272"
+  }
+}

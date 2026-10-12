@@ -13,6 +13,13 @@ Monorepo adapter: the device flow, endpoint probes, and file primitives
 come from `cardinal_core` (vendored under ../hooks by build/vendor.py);
 the Cursor-specific mcp.json / hooks.json managed-entry writers stay
 here. See docs/specs/cursor-parity.md for the full contract.
+
+`--owner-input on|off` does not connect: it records whether this
+machine's Cursor sessions may record the prompts you type as owner input
+of their Cardinal Investigation (owner_input.consent). It prints the full
+text you consent to first, and `on` asks you to confirm it in this
+terminal. Cursor has no channel to tell you that per session, so this
+consent is the only way capture starts there.
 """
 
 from __future__ import annotations
@@ -55,6 +62,23 @@ HOOK_IDENTITY_MARKER = "cardinal-cursor-plugin"
 # listing (git ls-tree, <=5s), a `gh pr view` (<=1.5s), and OTLP posts
 # (<=2s each) must fit inside Cursor's per-hook timeout.
 POST_TOOL_USE_TIMEOUT_SECS = 15
+
+# The storyboard authoring entry (`--role authoring`): the local preview
+# render of Cardinal's storyboard__preview (core
+# storyboard_authoring.PREVIEW_HOOK_TIMEOUT_S: the renderer stops at 120 s,
+# the hook answers by 141 s) and the hero upload after storyboard__publish
+# (<=7 s). Cursor documents a per-entry `timeout` in seconds with no stated
+# maximum, and `matcher` on postToolUse, matched against `MCP:<tool_name>`
+# for MCP tools (cursor.com/docs/agent/hooks). The matcher is written to
+# match anywhere in the name, whether Cursor searches or full-matches;
+# the hook checks the exact tool itself (AUTHORING_MATCHER there too).
+AUTHORING_ROLE = "authoring"
+AUTHORING_MATCHER = ".*storyboard__(preview|publish).*"
+AUTHORING_TIMEOUT_SECS = 150
+
+# sessionStart bootstraps the Investigation (one request, 3 s) and looks up
+# related storyboards (2 s); Cursor runs it fire-and-forget.
+SESSION_START_TIMEOUT_SECS = 10
 
 CURSOR_DIR = Path.home() / ".cursor"
 USER_MCP_PATH = CURSOR_DIR / "mcp.json"
@@ -117,7 +141,27 @@ def build_mcp_entry(mcp_url: str, api_key: str) -> dict:
     }
 
 
-def write_mcp_config(path: Path, mcp_url: str, api_key: str) -> Path | None:
+# The local cardinal-behavior MCP server (Checks preview, behavior tools): a
+# stdio server Cursor runs outside its sandbox, with --runtime cursor (its
+# connection is ~/.cursor/cardinal.json + cardinal-secrets.json; no key here).
+BEHAVIOR_SERVER_NAME = "cardinal-behavior"
+BEHAVIOR_SCRIPT = PLUGIN_ROOT / "scripts" / "cardinal-behavior"
+
+
+def build_behavior_entry() -> dict:
+    return {
+        "command": "python3",
+        "args": [str(BEHAVIOR_SCRIPT), "--runtime", "cursor"],
+        "cardinalManaged": True,
+        "cardinalPluginVersion": PLUGIN_VERSION,
+    }
+
+
+def write_mcp_config(path: Path, mcp_url: str, api_key: str, behavior: bool = True) -> Path | None:
+    """The managed `cardinal` entry and, with `behavior` (the user-level
+    file; a project file is for cloud agents, which have no local plugin),
+    the managed `cardinal-behavior` entry. An unmanaged `cardinal` entry
+    stops the write; an unmanaged `cardinal-behavior` one is left alone."""
     data = load_json_object(path, "mcp.json")
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
@@ -129,6 +173,12 @@ def write_mcp_config(path: Path, mcp_url: str, api_key: str) -> Path | None:
             f"mcpServers.{MCP_SERVER_NAME} entry. Remove or rename that entry, then rerun."
         )
     servers[MCP_SERVER_NAME] = build_mcp_entry(mcp_url, api_key)
+    if behavior:
+        current = servers.get(BEHAVIOR_SERVER_NAME)
+        if isinstance(current, dict) and not current.get("cardinalManaged"):
+            print(f"WARN {path} already has an unmanaged mcpServers.{BEHAVIOR_SERVER_NAME} entry; left as it is.")
+        else:
+            servers[BEHAVIOR_SERVER_NAME] = build_behavior_entry()
     data["mcpServers"] = servers
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,21 +191,28 @@ def write_mcp_config(path: Path, mcp_url: str, api_key: str) -> Path | None:
 # Hooks config (JSON v1)
 # ---------------------------------------------------------------------------
 
-def managed_hook_command(event_name: str) -> str:
+def managed_hook_command(event_name: str, role: str | None = None) -> str:
     """Include the plugin identity marker in the command so disconnect
-    can recognize entries we own without relying on custom JSON fields."""
+    can recognize entries we own without relying on custom JSON fields.
+    `role` names a second entry for the same event (its own matcher and
+    timeout)."""
+    role_arg = f" --role {shlex.quote(role)}" if role else ""
     return (
         f"python3 {shlex.quote(str(HOOK_SCRIPT))} "
-        f"--event {shlex.quote(event_name)} # {HOOK_IDENTITY_MARKER}"
+        f"--event {shlex.quote(event_name)}{role_arg} # {HOOK_IDENTITY_MARKER}"
     )
 
 
-def managed_hook_entry(event_name: str, timeout: int) -> dict:
-    return {
-        "command": managed_hook_command(event_name),
+def managed_hook_entry(event_name: str, timeout: int, role: str | None = None,
+                       matcher: str | None = None) -> dict:
+    entry = {
+        "command": managed_hook_command(event_name, role),
         "type": "command",
         "timeout": timeout,
     }
+    if matcher is not None:
+        entry["matcher"] = matcher
+    return entry
 
 
 def strip_managed_hooks(data: dict) -> dict:
@@ -181,21 +238,34 @@ def strip_managed_hooks(data: dict) -> dict:
     return data
 
 
-def write_hooks_config(path: Path) -> Path | None:
-    """Write the Cursor hooks.json v1 shape.
+def build_hooks_config(path: Path) -> dict:
+    """The Cursor hooks.json v1 shape: `path`'s content with every managed
+    entry replaced by the current ones.
 
     Events registered:
-      sessionStart        — initiative-convention + budget standing
-      beforeSubmitPrompt  — spend-limits gate + git_state
-      postToolUseFailure  — local evidence capture of a failed tool call
-      afterFileEdit       — the edited file, for storyboard context.paths (local)
+      sessionStart        — initiative-convention + budget standing; the
+                            Investigation bootstrap, poller and guidance;
+                            staged items; connect hint / stray-key warning
+      beforeSubmitPrompt  — spend-limits gate + git_state; owner input
+                            (only with --owner-input consent; detached);
+                            discovery re-look (detached, staged)
+      postToolUseFailure  — local evidence capture of a failed tool call +
+                            the Investigation's tool-boundary deliveries
+      afterFileEdit       — the edited file, for storyboard context.paths;
+                            the edit lookup (staged)
+      afterMCPExecution   — records which calls Cardinal's own MCP server
+                            ran (postToolUse names no server)
       postToolUse         — evidence capture + turn_tool + tool_result + notify piggyback +
                             cardinal.decision recording (the sandboxed
                             `cardinal-decision record` only prints a
                             marker; this hook gates, ledgers, resolves the
                             PR via gh, and emits — hence the longer timeout)
+                            + the Investigation's tool-boundary deliveries
+      postToolUse (authoring) — matcher storyboard__preview|publish, 150 s:
+                            the local preview render and the hero upload
       preCompact          — cardinal.plan_usage (context-window slice)
-      stop                — best-effort transcript sweep (no-op; gap D)
+      stop                — the Investigation's turn end (flush, sync
+                            check; stages, never followup_message)
       subagentStop        — subagent_usage
       afterAgentResponse  — cardinal.turn_response (text length only)
       afterAgentThought   — cardinal.turn_thought (duration + text len)
@@ -204,11 +274,12 @@ def write_hooks_config(path: Path) -> Path | None:
     data.setdefault("version", 1)
     hooks = data.setdefault("hooks", {})
     for event, timeout in (
-        ("sessionStart", 5),
+        ("sessionStart", SESSION_START_TIMEOUT_SECS),
         ("beforeSubmitPrompt", 5),
         ("postToolUse", POST_TOOL_USE_TIMEOUT_SECS),
         ("postToolUseFailure", 5),
         ("afterFileEdit", 5),
+        ("afterMCPExecution", 5),
         ("preCompact", 5),
         ("stop", 10),
         ("subagentStop", 5),
@@ -216,10 +287,51 @@ def write_hooks_config(path: Path) -> Path | None:
         ("afterAgentThought", 5),
     ):
         hooks.setdefault(event, []).append(managed_hook_entry(event, timeout))
+    hooks["postToolUse"].append(managed_hook_entry(
+        "postToolUse", AUTHORING_TIMEOUT_SECS, role=AUTHORING_ROLE, matcher=AUTHORING_MATCHER))
+    return data
+
+
+def write_hooks_config(path: Path) -> Path | None:
+    data = build_hooks_config(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     backup_path = backup(path)
     atomic_write(path, json.dumps(data, indent=2) + "\n")
     return backup_path
+
+
+def repair_registration() -> list[str]:
+    """Refresh, without new credentials, what an upgraded plugin registers in
+    the user-level files of an existing connection: the managed hooks in
+    ~/.cursor/hooks.json and the managed `cardinal-behavior` MCP entry in
+    ~/.cursor/mcp.json (a connection made before the Checks preview has none;
+    an upgrade moves this plugin's scripts). The managed `cardinal` entry and
+    its key are left as they are; an unmanaged `cardinal-behavior` entry is
+    the user's and is never replaced. Returns the paths rewritten."""
+    repaired: list[str] = []
+    if USER_MCP_PATH.exists():
+        data = load_json_object(USER_MCP_PATH, "mcp.json")
+        servers = data.get("mcpServers")
+        cardinal = servers.get(MCP_SERVER_NAME) if isinstance(servers, dict) else None
+        if isinstance(cardinal, dict) and cardinal.get("cardinalManaged"):
+            current = servers.get(BEHAVIOR_SERVER_NAME)
+            unmanaged = isinstance(current, dict) and not current.get("cardinalManaged")
+            if not unmanaged and current != build_behavior_entry():
+                servers[BEHAVIOR_SERVER_NAME] = build_behavior_entry()
+                backup(USER_MCP_PATH)
+                atomic_write(USER_MCP_PATH, json.dumps(data, indent=2) + "\n")
+                repaired.append(str(USER_MCP_PATH))
+    if USER_HOOKS_PATH.exists():
+        before = load_json_object(USER_HOOKS_PATH, "hooks.json")
+        if any(HOOK_IDENTITY_MARKER in str(h.get("command") or "")
+               for entries in (before.get("hooks") or {}).values() if isinstance(entries, list)
+               for h in entries if isinstance(h, dict)):
+            after = build_hooks_config(USER_HOOKS_PATH)
+            if after != before:
+                backup(USER_HOOKS_PATH)
+                atomic_write(USER_HOOKS_PATH, json.dumps(after, indent=2) + "\n")
+                repaired.append(str(USER_HOOKS_PATH))
+    return repaired
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +588,7 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
 
     if project_paths:
         if mcp:
-            b = write_mcp_config(Path(project_paths["mcp_path"]), mcp["url"], mcp["api_key"])
+            b = write_mcp_config(Path(project_paths["mcp_path"]), mcp["url"], mcp["api_key"], behavior=False)
             print(f"Wrote Cardinal MCP entry to {project_paths['mcp_path']} (cloud-agent path)")
             if b:
                 print(f"Project MCP backup: {b}")
@@ -515,6 +627,57 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
         )
     print()
     print("Restart Cursor so it reloads MCP and hook config, then run cardinal-status.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Owner-input consent (--owner-input on|off)
+# ---------------------------------------------------------------------------
+
+CONFIRM_WORD = "yes"
+
+
+def owner_input_consent(on: bool, *, home: Path | None = None, stdin=None, stdout=None) -> int:
+    """Print the full consent text, then record the answer
+    (owner_input.set_consent, versioned by the text's sha256). `on` needs
+    the user to type "yes" in an interactive terminal: the agent's own
+    shell must not consent on the user's behalf. Exit code."""
+    from cardinal_core import owner_input
+
+    home = Path.home() if home is None else home
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    text = owner_input.consent_text("cursor")
+    path = owner_input.consent_path("cursor", home)
+    stdout.write("Cardinal owner input for Cursor\n\n" + text + "\n\n")
+    if on:
+        if not (hasattr(stdin, "isatty") and stdin.isatty()):
+            stdout.write("Not recorded: run this in your own terminal and type yes when asked "
+                         "(it cannot be answered for you).\n")
+            return 2
+        stdout.write(f'Type "{CONFIRM_WORD}" to turn owner input on for Cursor on this machine: ')
+        stdout.flush()
+        answer = (stdin.readline() or "").strip().lower()
+        if answer != CONFIRM_WORD:
+            stdout.write("Not recorded: owner input stays off.\n")
+            return 1
+    try:
+        owner_input.set_consent("cursor", home, on)
+    except (OSError, ValueError) as exc:
+        stdout.write(f"Could not record it in {path}: {exc}\n")
+        return 1
+    if on:
+        stdout.write(f"Owner input is ON for Cursor on this machine (recorded in {path}). It applies to "
+                     "sessions whose Investigation turns owner input on; new Cursor chats pick it up.\n")
+        if owner_input.kill_switch("cursor", home, os.environ):
+            stdout.write(f"Note: the kill switch is set (CARDINAL_OWNER_INPUT=0, or "
+                         f"{owner_input.kill_switch_path(home)}), so nothing is recorded until you remove it.\n")
+    else:
+        stdout.write(f"Owner input is OFF for Cursor on this machine (recorded in {path}). Queued prompts "
+                     "are deleted, not sent.\n")
+    stdout.write("Run `cardinal-connect --owner-input off` to stop; CARDINAL_OWNER_INPUT=0 or "
+                 f'{{"cursor": "off"}} in {owner_input.kill_switch_path(home)} turns it off whatever this '
+                 "file says.\n")
     return 0
 
 
@@ -558,6 +721,12 @@ def parse_args() -> argparse.Namespace:
         help="Run the device-code flow and print what would be written.",
     )
     parser.add_argument(
+        "--owner-input", choices=("on", "off"), default=None,
+        help="Don't connect: record whether this machine's Cursor sessions may record the prompts you "
+             "type as owner input of their Cardinal Investigation. Prints what you consent to; `on` "
+             "asks you to type yes.",
+    )
+    parser.add_argument(
         "scopes", nargs="*", metavar="SCOPE",
         help="Extra scopes for the control-plane token: "
              f"{', '.join(deviceflow.ACT_EXTRA_SCOPES)} (space- or comma-separated). "
@@ -583,12 +752,25 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    if args.owner_input is not None:
+        return owner_input_consent(args.owner_input == "on")
+
     if STATE_PATH.exists() and not args.rotate:
         try:
             prior = json.loads(STATE_PATH.read_text())
         except Exception:
             prior = {}
         user = prior.get("user_email") or "this account"
+        # Re-running on an existing connection refreshes the user-level hook
+        # and cardinal-behavior registration in place (an upgraded plugin),
+        # credentials unchanged. --project files still need --rotate --project.
+        repaired = repair_registration()
+        if repaired:
+            print("Refreshed the Cardinal registration (credentials unchanged):")
+            for path in repaired:
+                print(f"  {path}")
+            print(f"Cardinal is already connected as {user}. Restart Cursor so it reloads MCP and hook config.")
+            return 0
         sys.stderr.write(
             f"Cardinal is already connected as {user}. "
             "Re-run with --rotate to overwrite.\n"
