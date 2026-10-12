@@ -1,0 +1,5 @@
+{
+  "base_url": "https://lakerunner-query-api.global.aws.cardinalhq.io",
+  "output_dir": "~/.cardinal/behavior-executions",
+  "api_key_env": "CARDINAL_QUERY_API_KEY"
+}

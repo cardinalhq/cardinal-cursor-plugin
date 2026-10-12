@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""cardinal-checks — the Cardinal Checks preview opt-in for Cursor.
+
+Run it in your own terminal (not through the agent):
+    cardinal-checks on        install the checks skill (the next Cursor session has it)
+    cardinal-checks off       remove it (a running session keeps it until it ends)
+    cardinal-checks status    show the setting and the accepted checks
+
+The checks skill records teaching labels and follows range runs through the
+cardinal-behavior MCP tools, which run outside Cursor's sandbox. The same
+ledger is here for people:
+    cardinal-checks example set|approve|remove|expected|show --draft <id> ...
+    cardinal-checks accepted [--service S]
+    cardinal-checks range watch|status <range_id>
+
+The implementation is cardinal_core.checks_cli (shared by every adapter).
+"""
+
+import sys
+from pathlib import Path
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PLUGIN_ROOT / "hooks"))
+from cardinal_core import checks_cli  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(checks_cli.main("cursor", plugin_root=PLUGIN_ROOT))

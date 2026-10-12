@@ -6,7 +6,7 @@ returns a reference to one self-contained HTML page (the "preview bundle":
 preview_bundle {url?, path, bytes, sha256, revision} or {unavailable}). This
 script downloads each page with your Cardinal MCP key, loads it in a local,
 sandboxed, network-locked headless Chromium, steps through the scene's reveal
-steps and writes one PNG per step for Claude to Read and critique.
+steps and writes one PNG per step for the agent to Read and critique.
 
 Rendering is authoring feedback, not a publish check: publish trust comes only
 from maestro's deterministic validation. If no usable Chromium is found, this
@@ -42,9 +42,10 @@ Output (stdout): one JSON object per line.
                        frame_errors, protocol_errors}
   per scene problem:  {scene_id, step: null, ..., png: null, error: "<why>"}
   last line:          {"summary": {...}}
-PNGs go to ~/.claude/cardinal/storyboards/<storyboard_id>/r<revision>/
+PNGs go to ~/.<runtime>/cardinal/storyboards/<storyboard_id>/r<revision>/
 <scene>-<step>.png (-dark before .png for --theme dark), mode 0600, overwritten
-per revision. --out DIR overrides the directory.
+per revision; <runtime> is --runtime (claude, codex, cursor or gemini), the agent
+whose Cardinal connection is used. --out DIR overrides the directory.
 
 Exit codes:
   0  ran (per-scene errors, {unavailable} scenes and skipped scenes are in the
@@ -337,7 +338,27 @@ class FetchError(Exception):
 
 
 CONNECTION_ENV = "CARDINAL_CONNECTION"  # "env": the environment only, never settings.json
+# Claude Code's /cardinal:disconnect marker (--runtime claude only; the other
+# agents' connection lives in their cardinal.json + cardinal-secrets.json).
 DISCONNECTED_MARKER = Path(".claude") / "cardinal-disconnected"
+
+# --runtime -> (the agent's name, how its user connects), for messages. Set
+# once by main(); "claude" for a caller that imports this module.
+AGENTS = {
+    "claude": ("Claude Code", "/cardinal:connect"),
+    "codex": ("Codex", "the Cardinal plugin's scripts/cardinal-connect"),
+    "cursor": ("Cursor", "the Cardinal plugin's scripts/cardinal-connect"),
+    "gemini": ("Gemini CLI", "the Cardinal plugin's scripts/cardinal-connect"),
+}
+RUNTIME = "claude"
+
+
+def agent_name() -> str:
+    return AGENTS.get(RUNTIME, AGENTS["claude"])[0]
+
+
+def connect_command() -> str:
+    return AGENTS.get(RUNTIME, AGENTS["claude"])[1]
 
 
 def _disconnected(home: Path) -> bool:
@@ -348,9 +369,16 @@ def _disconnected(home: Path) -> bool:
 
 
 def connect_info(home: Path, environ: dict, runtime: str = "claude") -> dict:
-    """The MCP URL + key, resolved as the plugin's hooks do
-    (hooks/_storyboard_discovery.connection; this script is stdlib-only and
-    runs isolated, so the rule is repeated here):
+    """The MCP URL + key of `runtime`'s Cardinal connection, resolved as that
+    plugin's hooks do.
+
+    codex, cursor, gemini: the plugin's vendored cardinal_core
+    (evidence_promote.agent_paths_connection over ~/.<runtime>: cardinal.json
+    mcp_url + cardinal-secrets.json mcp_api_key, then CARDINAL_MCP_URL +
+    CARDINAL_MCP_API_KEY from the environment).
+
+    claude (hooks/_storyboard_discovery.connection; this script runs
+    isolated, so the rule is repeated here):
       - CARDINAL_CONNECTION=env: CARDINAL_MCP_URL + CARDINAL_MCP_API_KEY from
         the environment only, never ~/.claude/settings.json (a session
         pointed at another Maestro, e.g. a local stack, on a machine whose
@@ -435,11 +463,11 @@ def explain_status(status: int, body: dict) -> str:
     if status == 400:
         return "maestro rejected the bundle request (no revision): the plugin and this Cardinal disagree on the preview contract; upgrade both"
     if status == 401:
-        return "the Cardinal MCP key was rejected: reconnect with /cardinal:connect --rotate"
+        return f"the Cardinal MCP key was rejected: reconnect with {connect_command()} --rotate"
     if status == 403:
         if code == "org_scope_mismatch" or "org mismatch" in (code + " " + msg).lower():
-            return ("this storyboard belongs to a different Cardinal org than the one Claude Code is connected to: "
-                    "reconnect to that org (/cardinal:connect --rotate) or preview a storyboard in the connected org")
+            return (f"this storyboard belongs to a different Cardinal org than the one {agent_name()} is connected to: "
+                    f"reconnect to that org ({connect_command()} --rotate) or preview a storyboard in the connected org")
         if code == "insufficient_scope":
             return ("this Cardinal does not let the plugin key fetch preview bundles: upgrade Cardinal "
                     "(maestro v1.97.10 or newer)")
@@ -486,8 +514,8 @@ def fetch_bundle(conn: dict, ref: dict, max_bytes: int, opener=None, sleep=time.
         raise FetchError("preview_bundle.revision does not match its path: call storyboard__preview again")
     if conn.get("org") and org != conn["org"]:
         raise FetchError(
-            f"this preview is for org {org}, but Claude Code is connected to org {conn['org']}: "
-            "reconnect to that org (/cardinal:connect --rotate) to render it",
+            f"this preview is for org {org}, but {agent_name()} is connected to org {conn['org']}: "
+            f"reconnect to that org ({connect_command()} --rotate) to render it",
             status=403, code="org_scope_mismatch")
     expect_bytes, expect_sha = ref.get("bytes"), ref.get("sha256")
     if not isinstance(expect_bytes, int) or not isinstance(expect_sha, str):
@@ -1430,7 +1458,8 @@ def main(argv: list | None = None) -> int:
     ap.add_argument("--theme", choices=("light", "dark"), default="light")
     ap.add_argument("--dpr", type=float, default=1.0,
                     help=f"device pixel ratio, {MIN_DPR:g}–{MAX_DPR:g} (default 1, fine for critique)")
-    ap.add_argument("--out", metavar="DIR", help="PNG directory (default ~/.claude/cardinal/storyboards/<id>/r<rev>)")
+    ap.add_argument("--out", metavar="DIR",
+                    help="PNG directory (default ~/.<runtime>/cardinal/storyboards/<id>/r<rev>)")
     ap.add_argument("--chromium", metavar="PATH", help="Chrome/Chromium binary (else discovered)")
     ap.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT_S, help="whole-run wall clock, seconds")
     ap.add_argument("--keep", action="store_true", help="keep the temp dir (bundle pages + profile)")
@@ -1441,8 +1470,11 @@ def main(argv: list | None = None) -> int:
                     help="screenshot a local static page instead (scripts off, no network): needs --png")
     ap.add_argument("--png", metavar="OUT", help="--static-html: the PNG to write")
     ap.add_argument("--viewport", metavar="WxH", default="560x640", help="--static-html: viewport (default 560x640)")
-    ap.add_argument("--runtime", choices=("claude", "codex", "cursor", "gemini"), required=True, help="Use this agent's Cardinal connection")
+    ap.add_argument("--runtime", choices=tuple(AGENTS), required=True,
+                    help="the agent whose Cardinal connection and ~/.<runtime> directory are used")
     args = ap.parse_args(argv)
+    global RUNTIME
+    RUNTIME = args.runtime
 
     home = Path(os.environ.get("HOME") or str(Path.home()))
     deadline = time.monotonic() + max(10, args.timeout)
@@ -1549,8 +1581,8 @@ def main(argv: list | None = None) -> int:
         if any(ref is not None for _, _, ref in pages):
             conn = connect_info(home, os.environ, args.runtime)
             if not conn:
-                return finish(EXIT_FETCH, "Claude Code is not connected to Cardinal (no CARDINAL_MCP_URL / "
-                                          "CARDINAL_MCP_API_KEY): run /cardinal:connect, then preview again")
+                return finish(EXIT_FETCH, f"{agent_name()} is not connected to Cardinal (no CARDINAL_MCP_URL / "
+                                          f"CARDINAL_MCP_API_KEY): run {connect_command()}, then preview again")
             for i, (sid, _, ref) in enumerate(pages):
                 if time.monotonic() > deadline - 15:
                     for rest, _, _ in pages[i:]:

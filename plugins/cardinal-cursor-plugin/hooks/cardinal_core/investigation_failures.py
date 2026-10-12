@@ -16,7 +16,12 @@ MARKER = "NOT RECORDED —"
 THROTTLE = 600
 WRITE_SUBCOMMANDS = {"checkpoint", "question", "post", "ack"}
 CODE = re.compile(r"\A(?:Exit code:?|Process exited with code)\s+(-?\d+)(?:\s|$)")
-SHELL_TOOLS = {"claude": {"Bash"}, "codex": {"Bash", "exec", "exec_command", "functions.exec_command"}}
+SHELL_TOOLS = {
+    "claude": {"Bash"},
+    "codex": {"Bash", "exec", "exec_command", "functions.exec_command"},
+    "cursor": {"Shell", "run_terminal_cmd"},
+    "gemini": {"run_shell_command"},
+}
 
 
 def write_command(command):

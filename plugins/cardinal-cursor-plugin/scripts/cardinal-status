@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -17,6 +18,7 @@ USER_HOOKS_PATH = CURSOR_DIR / "hooks.json"
 STATE_PATH = CURSOR_DIR / "cardinal.json"
 SECRETS_PATH = CURSOR_DIR / "cardinal-secrets.json"
 MCP_SERVER_NAME = "cardinal"
+HOOKS_DIR = Path(__file__).resolve().parent.parent / "hooks"
 
 
 def load_json(path: Path, label: str) -> dict:
@@ -82,6 +84,32 @@ def probe_ingest(endpoint: str, api_key: str, api_header: str) -> str:
         return f"FAIL ingest network error: {exc}"
 
 
+def owner_input_line() -> str:
+    """Whether this machine's Cursor sessions may record typed prompts as
+    owner input: the connect-time consent (cardinal-connect --owner-input)
+    and the kill switch, which wins over it."""
+    try:
+        sys.path.insert(0, str(HOOKS_DIR))
+        from cardinal_core import owner_input
+    except Exception:
+        return "unknown (the plugin's vendored core is missing)"
+    home = Path.home()
+    if owner_input.kill_switch("cursor", home, os.environ):
+        return (f"off (kill switch: CARDINAL_OWNER_INPUT=0 or {owner_input.kill_switch_path(home)}; "
+                "nothing is recorded whatever the consent says)")
+    if owner_input.consent("cursor", home):
+        return ("on (you consented with cardinal-connect --owner-input on; prompts are recorded in sessions "
+                "whose Investigation turns owner input on; --owner-input off stops it)")
+    try:
+        prior = json.loads(owner_input.consent_path("cursor", home).read_text())
+    except (OSError, ValueError):
+        prior = None
+    if isinstance(prior, dict) and prior.get("on") is True:
+        return ("off (you consented to an earlier text; run cardinal-connect --owner-input on to read the "
+                "current one and consent again)")
+    return "off (cardinal-connect --owner-input on turns it on, in your own terminal)"
+
+
 def main() -> int:
     if not STATE_PATH.exists():
         print("Not connected. Run cardinal-connect to configure Cardinal for Cursor.")
@@ -129,6 +157,7 @@ def main() -> int:
     print(f"MCP endpoint:   {state.get('mcp_url')}")
     print(f"MCP key prefix: {state.get('mcp_key_prefix')}")
     print(f"MCP config:     {USER_MCP_PATH}")
+    print(f"Owner input:    {owner_input_line()}")
     if project:
         print()
         print(f"Project install root:  {project.get('root')}")

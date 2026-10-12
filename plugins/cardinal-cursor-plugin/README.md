@@ -10,6 +10,9 @@ This is a Cursor-native port of the command surface shared by the [Claude Code p
 | `cardinal-status` | Shows the recorded Cardinal workspace and probes the configured ingest and MCP endpoints. |
 | `cardinal-disconnect` | Best-effort revokes Cardinal keys, removes managed Cursor config entries at both user and project locations, and deletes local state. |
 | `cardinal-decision` | Opt-in decision capture: `on` / `off` / `status` / `record` (emits `cardinal.decision`). See [Decision capture](#decision-capture-opt-in). |
+| `cardinal-connect --owner-input on\|off` | Your consent to recording the prompts you type as owner input of the session's Investigation. Doesn't connect. See [Owner input](#owner-input-opt-in-consent). |
+
+Skills (`skills/`): `cardinal-connect`, `cardinal-disconnect`, `cardinal-status`, `cardinal-decision` (status only), `cardinal-storyboard`, `canvas`, `cardinal-install-site`, `migrate-from-grafana`, `optimize-toolkit`. Subagent (`agents/`): `brainstorm`, see [Skills and the brainstorm subagent](#skills-and-the-brainstorm-subagent).
 
 ## Telemetry scope
 
@@ -67,7 +70,7 @@ The hook is the only thing that writes or emits a decision. In Run Everything mo
 
 **What runs where.** The `postToolUse` hook does only local work: parsing, the on/off gate, validation, id assignment, the ledger write, and the reply. Every network send for that tool call happens in a detached background process (its own session, stdio on `/dev/null`), handed off through an atomically written `0600` spool file under `~/.cursor/cardinal/spool/`. That covers the `cardinal.turn_tool` / `tool_result` records, the code-cluster tree listing, the `gh`-based PR lookup, and the `cardinal.decision` POST. With ingest stalled, the hook still returns in well under a second. Hooks and their background process run outside the agent sandbox (the existing hooks already write under `~/.cursor/cardinal/` and POST to ingest from there), so `git` and `gh` **still run unsandboxed**, with your `gh` credentials. If the background process dies, the decision stays in the local ledger but its event is never sent.
 
-**After upgrading, re-run `python3 scripts/cardinal-connect --rotate`** (add `--project` if you use it). That refreshes the hook entries, including the 15s `postToolUse` timeout; older installs have 5s.
+**After upgrading, re-run `python3 scripts/cardinal-connect`** (no `--rotate` needed: on an existing connection it refreshes the user-level hook entries and the `cardinal-behavior` MCP entry in place, with no new key). That includes the 15s `postToolUse` timeout; older installs have 5s. Project files (`--project`) still need `--rotate --project`.
 
 Known limits of the background process: several tool calls finishing together on a branch whose PR isn't cached yet can each start their own `gh pr view`, and their concurrent writes to the shared PR cache (`prs.json`, last writer wins) can drop another branch's cached entry. The only cost is an extra `gh` call later. An argument that is only a shell operator (for example `--why ";"`) is read as a separator, so that decision is reported as not recorded.
 
@@ -82,6 +85,38 @@ Unverified, and worth knowing:
 - **The instructions arrive once, at session start.** `beforeSubmitPrompt` can't add context: its output schema is `{continue, user_message}` only. So unlike Claude's per-prompt `UserPromptSubmit` injection, the list of earlier decisions isn't refreshed on each turn. The `postToolUse` reply after each `record` gives the agent the id it needs for later links.
 - **Turning capture on doesn't affect sessions that are already open.** Start a new chat to pick it up.
 - **User Rules are not used.** They live only in Cursor Settings (*Customize → Rules*), and there's no file on disk the plugin could write ([rules docs](https://cursor.com/docs/context/rules)). Project rules (`.cursor/rules/*.mdc`) would have to be committed to each repo.
+
+## Investigation sessions
+
+Each Cursor conversation is bound to a Cardinal Investigation, the live record behind its storyboard. The shared logic lives in `cardinal_core.investigation_agent` / `investigation_turn` (the same as Codex and Gemini). This adapter only maps it onto Cursor's hook channels.
+
+Cursor gives a hook three ways to put text in front of the model: `sessionStart` `additional_context` (*"Additional context to add to the conversation's initial system context"*), and `postToolUse` / `postToolUseFailure` `additional_context` (*"Extra context injected into the conversation after the tool result"*) ([hooks docs](https://cursor.com/docs/agent/hooks)). `beforeSubmitPrompt` answers `{continue, user_message}` only, `afterFileEdit` documents no output, and `stop`'s `followup_message` is *"automatically submit[ted] … as the next user message"*. So anything produced outside those boundaries is **staged** (`~/.cardinal/investigations/sessions/<conversation>.staged.json`, 0600, at most 20 items) and delivered at the next one.
+
+| Hook | What it does |
+| --- | --- |
+| `sessionStart` (10 s) | Bootstraps the Investigation (one request), starts the detached poller (`hooks/investigation-poller.py`), and adds the session guidance: the labeled storyboard and investigation-timeline links, the `cardinal-storyboard investigation … --session <id>` commands (ack, post, checkpoint), and the supervision line when the server offers it. Also anything staged for this conversation, the connect hint (unconnected machine) and the stray-key warning (an MCP key without a URL). |
+| `postToolUse`, `postToolUseFailure` | The tool boundary: staged items, then the poller's inbox (advisory events), then, if nothing else was delivered, one re-surfaced accepted challenge or directive. A payload that names a subagent (`agent_id` / `subagent_id`; Cursor documents none on tool hooks) gets nothing and consumes nothing. Local only. |
+| `stop` (10 s) | The turn's end: the inbox, one bounded sync check when the poller is stale, an open directive or the owner-decision reminders, the owner-input outbox flush, and the owner-input turn boundary. What it would deliver is **staged**. It prints nothing, ever: no `followup_message`. |
+| `beforeSubmitPrompt` | Owner input (below) and the discovery re-look. The limits gate runs first and keeps priority: a blocked prompt is not captured. |
+
+`CARDINAL_STORYBOARD_SESSION_START=0` turns off the bootstrap and the session text. `CARDINAL_INVESTIGATION_POLLER=0` turns off the poller. The agent runs `scripts/cardinal-storyboard investigation …` in its own shell. **In Cursor's default Auto-review mode that shell has no network** ([run modes](https://cursor.com/docs/agent/security/run-modes), [sandbox reference](https://cursor.com/docs/reference/sandbox)), so every investigation command that talks to Cardinal (ack, post, checkpoint, `events --follow`) needs the user's approval to run outside the sandbox. The session guidance says so. The MCP tools (`storyboard__read_investigation_events` / `storyboard__post_investigation_event`) need no approval when no local evidence has to be promoted.
+
+## Owner input (opt-in consent)
+
+With owner input on, the prompts you type are recorded to the session's Investigation as owner input (`owner_input.recorded`). Credentials are scrubbed and the text is capped at 32 KiB. Only you and the grantees you authorize can read them. That's how a supervisor can check what you told this agent.
+
+Claude Code, Codex and Gemini CLI tell you this per session, in a user-visible message, before the first capture. **Cursor has no such channel**: `beforeSubmitPrompt`'s `user_message` is shown only *"when the prompt is blocked"*, and Cursor's other hook outputs are model context ([hooks docs](https://cursor.com/docs/agent/hooks)). So on Cursor, nothing is captured until you consent once, in your own terminal:
+
+```bash
+python3 scripts/cardinal-connect --owner-input on    # prints the full text, asks you to type yes
+python3 scripts/cardinal-connect --owner-input off
+```
+
+The consent is stored in `~/.cursor/cardinal/owner-input-consent.json` (0600), versioned by the sha256 of the text you saw: if Cardinal changes the text, you are asked again. `on` refuses to run without an interactive terminal, so the agent's shell can't consent for you. Even then, a session records prompts only when its Investigation's server turns owner input on and the session authored the Investigation (a joined one never does). `cardinal-status` shows the state. `cardinal-disconnect` removes `~/.cursor/cardinal/`, consent included.
+
+**Kill switch**, whatever the consent says: `CARDINAL_OWNER_INPUT=0` (or `false` / `off` / `no`) in the environment Cursor's hooks run with, or `{"cursor": "off"}` in `~/.cardinal/owner-input.json`. The file is for GUI launches, which don't see your shell's environment. With either set, nothing is captured and queued prompts are deleted instead of sent.
+
+How it is captured: `beforeSubmitPrompt` calls `cardinal_core.owner_input.capture(..., detached=True)`. The turn is numbered under the session lock and a detached process posts it, so the prompt never waits on the network, and nothing ever blocks it or prints. A payload naming a subagent is refused. Cursor fires `beforeSubmitPrompt` once per prompt, so the same prompt typed twice is recorded twice. Anything still queued is flushed at `stop`.
 
 ## Evidence capture (storyboards)
 
@@ -108,7 +143,13 @@ Shared logic: `cardinal_core.storyboard_agent`.
   `CARDINAL_STORYBOARD_SESSION_START=0` (all of it).
 - **Edited files**: `afterFileEdit` (registered by `cardinal-connect` from
   this version on; re-run it) records the edited `file_path` for
-  `context.paths`. Local only, no output.
+  `context.paths`, then runs the **edit lookup**: on the first edit in a
+  directory this session, one bounded request (1.5 s) for the storyboards
+  about that file or a PR that last changed it. `afterFileEdit` has no
+  output, so the block is staged and surfaces at the next `postToolUse`.
+- **Discovery re-look**: on each prompt, when the branch or HEAD moved since
+  the conversation's last look, the related storyboards are looked up again
+  in the detached background process and staged for the next `postToolUse`.
 - **Automatic context: not supported by Cursor's hook system; SessionStart +
   CLI used.** `beforeMCPExecution` answers with a permission
   (allow / deny / ask) and cannot rewrite the call's input, so nothing is
@@ -118,6 +159,173 @@ No Cursor payload has been captured for these hooks (no Cursor build was
 available): the `afterFileEdit` shape (`file_path` absolute, `edits`) and the
 `beforeMCPExecution` limits are from Cursor's hooks documentation and are
 unverified. `CARDINAL_CURSOR_DEBUG_PAYLOADS=1` dumps the real payloads.
+
+## Storyboard authoring
+
+Shared logic: `cardinal_core.storyboard_authoring`, the same as the other agents.
+
+- **Preview render.** After Cardinal's `storyboard__preview`, a second
+  `postToolUse` entry (`--role authoring`, matcher
+  `.*storyboard__(preview|publish).*`, **timeout 150 s**) renders every scene and
+  reveal step locally with Chromium (`skills/storyboard/scripts/render_preview.py
+  --runtime cursor`, PNGs under `~/.cursor/cardinal/storyboards/<sb>/r<rev>/`),
+  then the cover and link-preview mock, and returns the PNG list as
+  `additional_context`. Cursor documents a per-entry `timeout` in seconds with no
+  stated maximum, and `matcher` on `postToolUse` (*"MCP tools using the
+  `MCP:<tool_name>` format"*) ([hooks docs](https://cursor.com/docs/agent/hooks)).
+  The 15 s on the main entry is the plugin's own choice, not a Cursor limit. The
+  renderer stops at 120 s and the hook answers by about 141 s, so no detached
+  render is needed. Cursor keeps the last response of a field when several hooks
+  answer (same page), so for these two tools the main entry stays silent and
+  the authoring entry carries the boundary's deliveries.
+- **Hero upload.** After `storyboard__publish`, the same entry uploads the hero
+  scene's render (one PUT, 7 s). Off: `CARDINAL_STORYBOARD_HERO=0`.
+- **Evidence token.** After `storyboard__create` / `add_act` / `preview`, the
+  main entry stores the storyboard's evidence token under
+  `~/.cardinal/evidence/<conversation>/token.json`.
+- **Which server ran the tool.** Cursor's `postToolUse` names no MCP server
+  ([cursor/cookbook#50](https://github.com/cursor/cookbook/issues/50), reproduced
+  on CLI 2026.09.28). A tool named `mcp__cardinal__<tool>` names its server. For
+  any other spelling (Cursor's matcher uses `MCP:<tool>`), the call counts as
+  Cardinal's only when `afterMCPExecution` (which documents `mcp_server_name`)
+  recorded the same tool and input for the `cardinal` entry
+  (`~/.cursor/cardinal/mcp-calls/<conversation>.json`, 0600, 10 minutes). The
+  hook waits up to 1.5 s for that record. Another server's tool of the same name
+  is never taken for Cardinal's: the renderer and the token store act with the
+  Cardinal key. Which spelling Cursor really sends is unverified.
+
+After upgrading, re-run `python3 scripts/cardinal-connect` (no key is
+minted; `--rotate --project` for project files) to register the new entries:
+`afterMCPExecution`, the authoring `postToolUse` entry, and the 10 s
+`sessionStart`.
+
+## Skills and the brainstorm subagent
+
+`skills/connect`, `disconnect` and `status` drive the scripts above. Each one
+tells the agent that in Auto-review mode the script needs approval to run
+outside the sandbox, because it touches the network and `~/.cursor`.
+`skills/decision` only reports status: `on` / `off` are the user's, in their own
+terminal. `skills/canvas` is the Canvas guide (core shared with the other agents,
+synced from `common/canvas/`).
+
+`agents/brainstorm.md` is the same divergent-ideas subagent as the Claude
+plugin's, with `model: inherit` and `readonly: true`. Cursor plugins ship
+subagents from `agents/` (*"Place them in the `agents/` directory"*,
+[plugins reference](https://cursor.com/docs/reference/plugins)), and the manifest
+lists `"agents": "./agents/"`. Subagent frontmatter (`name`, `description`,
+`model`, `readonly`) follows [subagents](https://cursor.com/docs/agent/subagents).
+If this directory isn't loaded as a Cursor plugin, copy the file to
+`~/.cursor/agents/` (user subagents) to use it.
+
+## Checks preview (opt-in)
+
+Checks are reusable, evidence-backed decisions over telemetry (a contract the
+user approves, approved teaching examples, per-trace results with evidence),
+built on the `cardinal-behavior` MCP server. The preview is **off by
+default**; turn it on or off in your own terminal:
+
+```bash
+python3 scripts/cardinal-checks on       # install the checks skill; start a new Cursor session
+python3 scripts/cardinal-checks off      # remove it
+python3 scripts/cardinal-checks status   # the setting, the installed skill, accepted checks
+```
+
+- **`cardinal-behavior` MCP server.** `cardinal-connect` registers it
+  as a `cardinalManaged` `mcpServers.cardinal-behavior` entry in `~/.cursor/mcp.json` (not in a `--project` `.cursor/mcp.json`: a cloud agent has no local plugin to run; an unmanaged entry of that name is left alone), launched as `scripts/cardinal-behavior --runtime cursor`;
+  `cardinal-disconnect` removes it. A connection made before the Checks
+  preview has none: re-running `python3 scripts/cardinal-connect` (no
+  `--rotate`) adds it without a new key, and `cardinal-checks on` / `status`
+  print that command while it is missing. It is a local stdio server that Cursor
+  starts outside its sandbox, so it can write the Checks ledger and read
+  range runs that a sandboxed agent cannot. It reads this runtime's
+  connection (`~/.cursor/cardinal.json` `mcp_url` + `cardinal-secrets.json`
+  `mcp_api_key`); `CARDINAL_MCP_URL` with `CARDINAL_MCP_API_KEY` in its
+  environment overrides them (a URL without its key does not). No key is
+  written into the MCP registration. Its draft ledger and `enabled.json` are
+  private (0600 files in 0700 directories).
+- **The skill** (`cardinal-checks`, from `checks/skill/`: this plugin's
+  SKILL.md over the shared `common/checks/CORE.md`) is installed into
+  this plugin's `skills/checks/` (`plugin.json` `"skills": "./skills/"`) by `on` and removed by `off` (and by `cardinal-disconnect`). The SessionStart hook
+  reconciles that copy with the setting and, while the preview is on and
+  Cardinal is connected, adds the routing rule (answer with the query tools
+  first; a check only for per-trace judgments). Off: no text at all.
+- **Labels and reuse** go through MCP tools (`set_check_example`,
+  `approve_check_example`, `remove_check_example`, `get_check_draft`,
+  `lock_check_examples`, `list_accepted_checks`), never shell commands. The
+  ledger is `~/.cursor/cardinal/checks/drafts/`; disconnect removes it.
+- **Range runs** (`execute_behavior_range`) run in a detached worker; the
+  agent follows one by polling `get_behavior_range` (each call waits up to
+  30 s for new events, and a completed run's summary comes back in it).
+  Claude Code listens with its Monitor tool instead; Cursor has no
+  equivalent, so it polls.
+
+Restart Cursor after `cardinal-connect` so it starts the new MCP server. Not
+checked against a live Cursor (not installed where this was written); the
+fixtures are `tests/test_cursor_checks.py`.
+
+## Limits on Cursor
+
+What Cursor can and can't do next to the Claude, Codex and Gemini CLI plugins,
+feature by feature, with a citation for every limit: [`docs/parity.md`](../../docs/parity.md).
+
+Each of these is a property of Cursor, not of the plugin:
+
+- **Checks preview: a change takes effect at the next session; no skill
+  reload or deny.** Claude Code's gate returns `reloadSkills` and denies its
+  Skill tool while the preview is off. Cursor's `sessionStart` output is
+  `additional_context` (and `env`), with no skill-reload field, and no hook
+  event names a skill being used, so there is nothing to deny
+  ([hooks docs](https://cursor.com/docs/agent/hooks)). `cardinal-checks on` /
+  `off` apply to sessions started afterwards.
+
+- **No per-session owner-input disclosure.** Cursor has no user-visible,
+  non-blocking hook message (see [Owner input](#owner-input-opt-in-consent)).
+  The compensation is the connect-time, versioned consent.
+- **Advisories that arrive after the turn's last tool call wait** for the
+  next tool call or the next session's `sessionStart`. `stop` can't deliver
+  them: `followup_message` is submitted as the next *user* message, so advisory
+  text would turn into owner input and start a turn by itself
+  ([hooks docs](https://cursor.com/docs/agent/hooks)). `beforeSubmitPrompt` has
+  no context output. The plugin never uses `followup_message`.
+- **Another hook's `followup_message` may be recorded as owner input.** It is
+  unverified whether a `followup_message` from another hook's `stop` fires
+  `beforeSubmitPrompt`. If it does, that text reaches the owner-input capture
+  like a typed prompt and could be recorded (with your consent on), since the
+  payload does not say where the prompt came from.
+- **No storyboard discovery at a subagent's start.** `subagentStart` answers
+  `{permission, user_message}` only (`"ask"` counts as `"deny"`), with no
+  `additional_context`, so a subagent can't be handed the discovery block when
+  it starts ([hooks docs](https://cursor.com/docs/agent/hooks)). Staged items
+  still reach it at its first `postToolUse`.
+- **A subagent's tool call may get the session's advisories.** The tool-boundary
+  delivery skips a payload that names a subagent (`agent_id` / `subagent_id`),
+  but Cursor documents no subagent id on its tool hooks
+  ([hooks docs](https://cursor.com/docs/agent/hooks)). If a subagent's
+  `postToolUse` carries the parent conversation's id, the advisories can reach
+  the subagent instead of the main agent. Not checked on a live Cursor.
+- **No automatic context stamping on storyboard tools.** `beforeMCPExecution`
+  answers with a permission only and can't rewrite the call's input; the agent
+  passes `cardinal-storyboard context` (see [Storyboard associations](#storyboard-associations)).
+- **Cloud agents** don't run `sessionStart` (*"Deferred while cloud agents can
+  still start in a read-only environment"*) or the MCP hooks
+  ([hooks docs](https://cursor.com/docs/agent/hooks)). There, no Investigation is
+  bootstrapped, no guidance is given, the poller doesn't start, and a Cardinal
+  tool named `MCP:<tool>` can't be identified, so no preview render or token
+  store happens for it. Staged items still surface at `postToolUse`.
+- **Context delivery is reported broken in some Cursor builds.** Cursor staff
+  confirmed that `postToolUse` `additional_context` isn't delivered to the
+  model: for non-MCP tools the response is discarded, and for MCP tools only
+  `updated_mcp_tool_output` is used
+  ([forum #156157](https://forum.cursor.com/t/cursor-hooks-additional-context-not-injected-in-agent-context-in-posttooluse/156157),
+  [#155689](https://forum.cursor.com/t/native-posttooluse-hooks-accept-and-log-additional-context-successfully-but-the-injected-context-is-not-surfaced-to-the-model/155689),
+  [#158168](https://forum.cursor.com/t/posttooluse-hooks-additional-context-not-injected-into-agent-model-context/158168)).
+  `sessionStart` `additional_context` can be dropped by a race with composer
+  creation
+  ([forum #158452](https://forum.cursor.com/t/sessionstart-hook-additional-context-is-never-injected-into-agents-initial-system-context/158452)).
+  No fix had been announced as of these threads. Every Cursor context channel
+  this plugin uses (evidence ids, limits notices, decisions, investigation
+  deliveries, preview PNG lists) depends on them. The canvas and storyboard
+  skills tell the agent to render by hand when no preview report arrives.
 
 ## Cloud agents
 
@@ -133,6 +341,7 @@ This additionally writes `.cursor/mcp.json` and `.cursor/hooks.json` at your rep
 What that means for Cardinal in cloud agents:
 
 - **Initiative-convention prompt, budget standing, and decision-capture instructions:** not delivered, because they all ride on `sessionStart`.
+- **Investigation sessions:** not bootstrapped (that is `sessionStart` too). See [Limits on Cursor](#limits-on-cursor).
 - **Decision capture:** the agent is never told to record decisions. If it runs `cardinal-decision record` anyway, the recorder (`postToolUse`) does run in cloud agents, but only if the CLI and hook exist in the VM at the paths your hook config uses. The on/off switch and ledger it checks live under the VM's `~/.cursor/cardinal/`, not your laptop's, and `gh` there is usually unauthenticated, so the PR will be missing.
 - **Spend-limits gate:** runs on `beforeSubmitPrompt`, so it can block or warn in cloud agents too.
 - **`git_state` PR linkage:** `beforeSubmitPrompt` runs once hooks are active, but `gh` in the cloud VM is usually missing or not authenticated, so expect the PR keys to be absent there. Server-side branch → PR joins still apply.
@@ -153,7 +362,7 @@ The connect script prints a Cardinal approval URL, waits for approval, and write
 | File | What gets written |
 | --- | --- |
 | `~/.cursor/mcp.json` | A managed `mcpServers.cardinal` entry with the Cardinal MCP URL and API-key header. Tagged `cardinalManaged: true`. |
-| `~/.cursor/hooks.json` | Managed Cardinal hook entries for `sessionStart`, `beforeSubmitPrompt`, `postToolUse`, `preCompact`, `stop`, `subagentStop`, `afterAgentResponse`, `afterAgentThought`. Each entry's `command` string embeds the marker `cardinal-cursor-plugin` for disconnect identification. |
+| `~/.cursor/hooks.json` | Managed Cardinal hook entries for `sessionStart`, `beforeSubmitPrompt`, `postToolUse` (two entries: the main one, and the storyboard authoring one with a matcher and a 150 s timeout), `postToolUseFailure`, `afterFileEdit`, `afterMCPExecution`, `preCompact`, `stop`, `subagentStop`, `afterAgentResponse`, `afterAgentThought`. Each entry's `command` string embeds the marker `cardinal-cursor-plugin` for disconnect identification. |
 | `.cursor/mcp.json` + `.cursor/hooks.json` at repo root | Same content as the user-level files (only with `--project`). |
 | `~/.cursor/cardinal.json` | Non-secret state: org/user metadata, endpoint URLs, key ids, key prefixes, and config locations. |
 | `~/.cursor/cardinal-secrets.json` | Local plaintext ingest/MCP keys needed by hooks and status probes; written mode `0600`. |
@@ -169,10 +378,13 @@ python3 scripts/cardinal-connect --rotate
 python3 scripts/cardinal-connect --telemetry-only
 python3 scripts/cardinal-connect --project
 python3 scripts/cardinal-connect --dry-run
+python3 scripts/cardinal-connect --owner-input on|off
 python3 scripts/cardinal-status
 python3 scripts/cardinal-storyboard context --session-id <conversation id>
+python3 scripts/cardinal-storyboard investigation link --session <conversation id>
 python3 scripts/cardinal-disconnect
 python3 scripts/cardinal-disconnect --force
+python3 scripts/cardinal-checks on|off|status
 ```
 
 ## Known Cursor issues

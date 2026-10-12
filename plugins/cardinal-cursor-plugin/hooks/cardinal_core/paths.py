@@ -130,6 +130,12 @@ class AgentPaths:
     def debug_dir(self) -> Path:
         return self.telemetry_dir / "debug"
 
+    @property
+    def owner_input_consent_path(self) -> Path:
+        """The user's connect-time owner-input consent (owner_input.consent;
+        only a runtime without a per-session disclosure channel needs it)."""
+        return self.runtime_dir / "owner-input-consent.json"
+
     def progress_path(self, session_id: str) -> Path:
         return self.telemetry_dir / f"{safe_session(session_id)}.json"
 

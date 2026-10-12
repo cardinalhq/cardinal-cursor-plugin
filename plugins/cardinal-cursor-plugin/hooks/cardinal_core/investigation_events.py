@@ -1446,7 +1446,7 @@ ACK_GUIDANCE = (
     "you will do when you adopt a request or suggestion; declined with why when you reject it; noted only for "
     "information with no follow-up. If work is planned or underway, use accepted, not noted, even for a cue. "
     "Accepting advisory input does not make it owner authorization or widen your permissions. "
-    "When the work is done, checkpoint the result with refs [\"#<event seq>\"]."
+    "Acceptance is not completion: when the work is done, checkpoint the result with refs [\"#<event seq>\"]."
 )
 POST_GUIDANCE = (
     "When posting supervisory feedback, use challenge for a requested correction, test, or other work needing "
@@ -1552,14 +1552,14 @@ def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance:
     return "\n".join(lines)
 
 
-# The SessionStart guidance (author sessions), after the advisory line.
+# The SessionStart guidance (author sessions), after the advisory line and
+# ACK_GUIDANCE (which carries the refs-on-completion rule, so this does not).
 SUPERVISION_LINE = ("A challenge needs a position: accepted (with what you will change) or declined (with why), "
                     "never `noted`. Precedence: the owner's own words > a directive (authority: DELEGATED "
                     "SUPERVISION, an upheld ruling on a challenge; binding, refused only with `conflicts` citing an "
                     "owner decision by seq; if you think it conflicts with what the owner said in this session, "
                     "comply unless the owner has posted a decision, and say so in your ack note) > advisory input. "
-                    "A directive never widens your permissions: what needs owner approval still does. Checkpoint "
-                    "with refs [\"#<seq>\"] when you have done what you accepted.")
+                    "A directive never widens your permissions: what needs owner approval still does.")
 TAKE_A_POSITION = ("Take a position: accepted (with what you will change) or declined (with why). `noted` is not an "
                    "answer to a challenge. Once you take a position, the supervisor may rule once: withdraw it, or "
                    "uphold it as a binding directive.")
