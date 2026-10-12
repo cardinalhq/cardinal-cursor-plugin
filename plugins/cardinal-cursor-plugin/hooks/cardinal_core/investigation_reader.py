@@ -9,6 +9,18 @@ from . import investigation_events as ie
 from . import investigation_consumer as consumer
 from . import investigation_state as ist
 from . import investigation_state_sync as sync
+from . import supervision_status as sv
+
+
+def status_suffix(event, statuses):
+    """' [status: …]' for a challenge whose status the events read so far
+    determine (supervision_status), else ''."""
+    info = statuses.get(event.get("seq")) if event.get("type") == ie.CHALLENGE else None
+    if not info:
+        return ""
+    extra = "".join(f", {label} #{info[k]}" for k, label in (("ruling_seq", "ruling"), ("owner_seq", "owner"))
+                    if isinstance(info.get(k), int))
+    return f" [status: {info['status']}{extra}]"
 
 
 def principal_key(principal):
@@ -40,8 +52,10 @@ def compact_event(event, principals):
     text = payload.get(field) or ""
     if event.get("type") == ie.ACKNOWLEDGED:
         text = f"ack of #{payload.get('ack_of')}: {payload.get('disposition')}" + (
-            f" {payload['note']}" if payload.get("note") else ""
-        )
+            f" (conflicts with #{payload['conflicts_with']})" if payload.get("conflicts_with") else ""
+        ) + (f" {payload['note']}" if payload.get("note") else "")
+    elif event.get("type") == ie.RULING:
+        text = f"{payload.get('outcome')} ruling on #{payload.get('ruling_of')}: {text}"
     if ie.event_class(event) is None:
         text, payload = "[unknown class]", {}
     return {
@@ -70,7 +84,7 @@ def compact_line(event, principals):
     return f"#{e['seq']} {clock} {ie._tok(e['type'])} · {ie._one_line(e['author'])}{to}: {ie.json_text(str(e['text']))}"
 
 
-def display(page, args, *, legacy_line=None, maximum=None):
+def display(page, args, *, legacy_line=None, maximum=None, statuses=None):
     viewer = page.get("viewer") or {}
     grantee = (principal_key(viewer.get("principal")) or "").startswith("grantee:")
     exclude = args.exclude_self
@@ -95,10 +109,15 @@ def display(page, args, *, legacy_line=None, maximum=None):
         for e in answer["events"]:
             if isinstance(e.get("producer"), dict):
                 e["producer"].pop("_resolved", None)
+        shown_seqs = {e.get("seq") for e in shown}
+        known = {str(k): v for k, v in (statuses or {}).items() if k in shown_seqs}
+        if known:
+            answer["challenge_statuses"] = known
         print(json.dumps(answer, indent=2, ensure_ascii=False))
     else:
         for e in shown:
-            print(legacy_line(e) if legacy_line else compact_line(e, page.get("principals") or {}))
+            line = legacy_line(e) if legacy_line else compact_line(e, page.get("principals") or {})
+            print(line + status_suffix(e, statuses or {}))
     sys.stdout.flush()  # Commit only after successful printing; a crash replays the pending page.
     return len(shown), complete
 
@@ -128,6 +147,7 @@ def run(args, conn, inv, *, client, legacy_line=None):
     drain = not args.follow and not args.cursor_file and (explicit or legacy_line is not None)
     target = None if conn.get("token") or explicit or legacy_line is not None else args.session
     collected, principals, viewer = [], {}, {}
+    seen: dict = {}   # every event read in this run, for the challenges' statuses
     pages = 0
     try:
         while True:
@@ -184,8 +204,12 @@ def run(args, conn, inv, *, client, legacy_line=None):
                     "principals": principals,
                     "viewer": viewer,
                 }
+            for e in page["events"]:
+                if isinstance(e, dict) and isinstance(e.get("seq"), int):
+                    seen[e["seq"]] = e
             n, complete = display(
-                page, args, legacy_line=legacy_line, maximum=args.max - count if args.max else None
+                page, args, legacy_line=legacy_line, maximum=args.max - count if args.max else None,
+                statuses=sv.challenge_statuses(list(seen.values())),
             )
             count += n
             if args.cursor_file and args.auto_review and complete and page["next_after"] > page["after"]:

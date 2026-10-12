@@ -12,8 +12,10 @@ investigation's author only):
   revoke-investigation-grant {grant_id}               (idempotent)
 
 Scopes: `read` (the control and semantic events, get-investigation),
-`owner_input:read` (adds the owner input class; needs read) and `advise`
-(posts cue / question / challenge). TTL 5 min to 24 h (default 4 h); at
+`owner_input:read` (adds the owner input class; needs read), `advise`
+(posts cue / question / challenge) and `supervise` (delegated supervision:
+implies read and advise, and adds issue-ruling: one binding ruling on each
+of its own challenges once the worker took a position; a newer Maestro). TTL 5 min to 24 h (default 4 h); at
 most 20 live grants per investigation.
 
 The grantee uses the token alone: CARDINAL_INVESTIGATION_TOKEN (and
@@ -43,7 +45,8 @@ READ = "read"
 OWNER_INPUT_READ = "owner_input:read"
 ADVISE = "advise"
 EVIDENCE_READ = "evidence:read"
-SCOPES = (READ, OWNER_INPUT_READ, ADVISE, EVIDENCE_READ)
+SUPERVISE = "supervise"   # delegated supervision: read + advise + issue-ruling on its own challenges
+SCOPES = (READ, OWNER_INPUT_READ, ADVISE, EVIDENCE_READ, SUPERVISE)
 DEFAULT_SCOPES = (READ, ADVISE)
 TTL_DEFAULT = 14400
 TTL_MIN = 300
@@ -82,6 +85,8 @@ def parse_scopes(raw: Optional[str], owner_input: bool = False) -> list:
     if bad:
         raise ValueError(f"unknown scope {', '.join(repr(x) for x in bad)}: one or more of {', '.join(SCOPES)}")
     got = set(names)
+    if SUPERVISE in got:
+        got.update((READ, ADVISE))   # supervise implies them; listed explicitly for an unambiguous grant
     if owner_input:
         got.add(OWNER_INPUT_READ)
     if not got:
@@ -251,3 +256,69 @@ def token_connection(environ: Optional[dict] = None, fallback_origin: Optional[s
         raise ValueError(f"{ORIGIN_ENV} must be https (plain http only for localhost, 127.0.0.1 or [::1])")
     return {"origin": origin, "org": claims["org"], "token": token, "investigation_id": claims["inv"],
             "grant_id": claims["gid"] if valid_grant_id(claims["gid"]) else None, "scopes": claims["scopes"]}
+
+
+# ---------------------------------------------------------------------------
+# Supervisor side: a ruling on the grantee's own challenge (issue-ruling)
+# ---------------------------------------------------------------------------
+
+RULING_UNSUPPORTED = ("this Cardinal server does not support rulings yet (it needs a newer Maestro with "
+                      "delegated supervision); nothing was recorded")
+_RULING_ROUTE_404S = ("investigation_not_found", "ruling_target_not_found", "ack_target_not_found")
+
+
+def ruling_unsupported(err: "sync.ServerError") -> bool:
+    """True when the refusal itself shows the server has no issue-ruling
+    route (a 404 / 405 that is not one of the route's own). An older
+    Maestro may instead answer a grant token on an unknown route 401
+    "Invalid token": supports_rulings() tells that apart."""
+    code = err.body.get("error") if isinstance(err.body, dict) else None
+    return err.status in (404, 405) and code not in _RULING_ROUTE_404S
+
+
+def supports_rulings(conn: dict, investigation_id: str, *, client: str, opener=None) -> Optional[bool]:
+    """Whether the server advertises capabilities.delegated_supervision
+    (get-investigation, with the same grant token); None when that cannot
+    be read either (the token itself is refused, or the network)."""
+    try:
+        out = sync.get_investigation(conn, investigation_id, client=client, opener=opener)
+    except Exception:
+        return None
+    caps = out.get("capabilities") if isinstance(out.get("capabilities"), dict) else {}
+    cap = caps.get("delegated_supervision")
+    return isinstance(cap, dict) and cap.get("enabled") is True
+
+
+def ruling_payload(challenge_seq: int, outcome: str, text: str, refs: Optional[list] = None) -> dict:
+    """{ruling_of, outcome, text, refs?}, checked before anything is sent."""
+    if not isinstance(challenge_seq, int) or isinstance(challenge_seq, bool) or challenge_seq < 1:
+        raise ist.FetchError("the challenge number is a positive integer")
+    if outcome not in ("upheld", "withdrawn"):
+        raise ist.FetchError("the outcome is upheld or withdrawn")
+    payload = ie.text_payload(text, refs)
+    return {"ruling_of": challenge_seq, "outcome": outcome, **payload}
+
+
+def issue_ruling(conn: dict, investigation_id: str, challenge_seq: int, outcome: str, text: str, *,
+                 refs: Optional[list] = None, client: str, opener=None) -> dict:
+    """issue-ruling: {event, duplicate?}. Only with a supervise grant's token
+    (conn["token"]), only on a challenge.added this grant posted (an
+    owner_web grant: also one an earlier supervise grant posted); upheld
+    only once the worker took a position on it; one ruling per challenge
+    (the server checks each and answers ruling_target_not_own_challenge /
+    ruling_exists / ruling_requires_position, formerly
+    ruling_requires_decline). The idempotency key is per challenge, so a
+    retry of the same ruling is deduplicated."""
+    if not ie.valid_investigation(investigation_id):
+        raise ist.FetchError(f"not an investigation id: {investigation_id!r}")
+    if not conn.get("token"):
+        raise ist.FetchError("a ruling needs a supervise grant's token (CARDINAL_INVESTIGATION_TOKEN or "
+                             "--credential-file); the investigation's author asks for one with "
+                             "`cardinal-storyboard investigation grant --scope supervise`")
+    body = {"investigation_id": investigation_id, "payload": ruling_payload(challenge_seq, outcome, text, refs),
+            "idempotency_key": f"rule:{challenge_seq}", "type": "ruling.issued", "client": client}
+    out = sync._post(conn, "issue-ruling", body, client=client, opener=opener)
+    ev = out.get("event")
+    if not isinstance(ev, dict) or ev.get("investigation_id") != investigation_id or not isinstance(ev.get("seq"), int):
+        raise ist.FetchError("issue-ruling answered without the ruling")
+    return out
