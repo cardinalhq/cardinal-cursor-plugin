@@ -387,6 +387,39 @@ class CLI:
             + "\n"
         )
 
+    def cmd_repos(self, args: argparse.Namespace) -> int:
+        """Replay saved repositories and explicitly attach one or more checkouts."""
+        from . import session_repos
+        sid = self._session_arg(args)
+        if not sid:
+            return EXIT_USAGE
+        home, runtime = self._home(), self.wiring.runtime
+        if session_repos.disabled(home, runtime, self.wiring.environ):
+            raise ValueError("repository context collection is disabled")
+        conn, client = self.connection()
+        b = ie.read_binding(home, sid)
+        if not b or b.get("is_author") is False or b.get("org") != conn.get("org"):
+            raise ValueError("needs this author's bound session in the connected organization")
+        session_repos.replay(home, sid, runtime, client, env=self.wiring.environ)
+        for directory in args.cwd:
+            context = self.wiring.collect(directory, sid, gh=False)
+            if not context.get("repo"):
+                raise ValueError(f"no repository origin found in {directory}")
+            session_repos.stage(home, sid, context, runtime=runtime, env=self.wiring.environ)
+        contexts = session_repos.pending(home, sid, conn.get("org"))
+        # An explicit backfill always retries, including when a server was upgraded.
+        boot.refresh_path(home, sid).touch()
+        status = boot.refresh_capabilities(home, sid, conn, client)
+        if status != "ok":
+            raise ValueError(f"repository sync unavailable ({status})")
+        b = ie.read_binding(home, sid) or {}
+        supported = b.get("capabilities", {}).get("repository_provenance", {}).get("enabled") is True
+        out = {"repos": [c["repo"] for c in contexts], "status": "submitted", "multi_repo_supported": supported}
+        print(json.dumps(out) if args.json else "Repository labels submitted: " + ", ".join(out["repos"]))
+        if not supported:
+            print("This server supports only the original repo context; deploy repository provenance support for multiple repo labels.", file=sys.stderr)
+        return 0
+
     def cmd_link(self, args: argparse.Namespace) -> int:
 
         sid = self._session_arg(args)
@@ -884,6 +917,7 @@ def build_parser(wiring, session_env=()):
     default_sid = next((wiring.environ.get(k) for k in session_env if wiring.environ.get(k)), None)
     for action in (
         "link",
+        "repos",
         "question",
         "checkpoint",
         "create",
@@ -936,7 +970,9 @@ def build_parser(wiring, session_env=()):
             p.add_argument(
                 "--cursor-file", type=Path, help="#190 durable pending-page review state (requires grant)"
             )
-        if action == "reviewed":
+        if action == "repos":
+            p.add_argument("--cwd", action="append", default=[], help="checkout to attach; repeat for multiple repos; saved edits are replayed too")
+        elif action == "reviewed":
             p.add_argument("--batch", required=True)
         elif action == "question":
             p.add_argument("text", help="the question (1 to 1000 characters)")

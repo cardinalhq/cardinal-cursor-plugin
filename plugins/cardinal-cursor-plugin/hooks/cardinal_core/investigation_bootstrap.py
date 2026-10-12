@@ -395,6 +395,7 @@ def refresh_capabilities(home: Path, sid: str, conn: dict, client: str, *, opene
     answer): the marker stays and the caller retries with back-off."""
     if not wants_refresh(home, sid):
         return "none"
+    marker = refresh_path(home, sid).stat().st_mtime_ns
     b = ie.read_binding(home, sid)
     if b is None:
         with contextlib.suppress(OSError):
@@ -408,6 +409,13 @@ def refresh_capabilities(home: Path, sid: str, conn: dict, client: str, *, opene
         out = sync.ensure_session_investigation(conn, sid, investigation_id=inv, client=client, opener=opener,
                                                 context=session_context(home, sid, conn), timeout=timeout)
         caps = capabilities(out)
+        from . import session_repos
+        runtime = client.split("/", 1)[0]
+        runtime = "claude" if runtime == "claude-code" else runtime
+        if not session_repos.disabled(home, runtime) and b.get("is_author") is not False:
+            for context in session_repos.pending(home, sid, conn.get("org")):
+                sync.ensure_session_investigation(conn, sid, investigation_id=inv, client=client,
+                                                  opener=opener, context=context, timeout=timeout)
     except sync.ServerError as e:
         if not (sync.unsupported(e) or (400 <= e.status < 500 and e.status not in (408, 429))):
             raise
@@ -421,7 +429,8 @@ def refresh_capabilities(home: Path, sid: str, conn: dict, client: str, *, opene
             _owner_input_gate(home, sid, cur)
             ie.write_binding(home, sid, cur)
     with contextlib.suppress(OSError):
-        refresh_path(home, sid).unlink()
+        if refresh_path(home, sid).stat().st_mtime_ns == marker:
+            refresh_path(home, sid).unlink()
     return "off" if refused else "ok"
 
 

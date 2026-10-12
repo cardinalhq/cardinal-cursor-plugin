@@ -80,6 +80,9 @@ def start(wiring, sid: str, source: Optional[str] = None, *, cwd: Optional[str] 
     result = boot.ensure(home(wiring), sid, conn, wiring.client, wanted=wanted, context=context,
                          started_at=boot.started_now() if source in (None, "startup") else None)
     binding = result.get("binding")
+    if binding:
+        from . import session_repos
+        session_repos.replay(home(wiring), sid, wiring.runtime, wiring.client, env=wiring.environ)
     if binding and binding.get("bootstrap", {}).get("status") == "ok":
         return describe(wiring, sid, binding)
     return None
