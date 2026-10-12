@@ -59,7 +59,8 @@ def describe(wiring, sid: str, binding: dict) -> str:
             "Owner authority comes from the owner's own words: in the session transcript, or in an owner decision "
             "posted from the owner's signed-in Cardinal web session. "
             + ie.ACK_GUIDANCE + " " + ie.POST_GUIDANCE + " " +
-            f"Use `{cmd} ack {target} <seq> <accepted|declined|noted> --note '<response>'` to acknowledge them.")
+            f"Use `{cmd} ack {target} <seq> <accepted|declined|noted> --note '<response>'` to acknowledge them."
+            + (" " + ie.SUPERVISION_LINE if ie.capability(binding, ie.SUPERVISION_CAPABILITY) else ""))
 
 
 def start(wiring, sid: str, source: Optional[str] = None, *, cwd: Optional[str] = None) -> Optional[str]:
@@ -101,9 +102,12 @@ def deliver(wiring, sid: str, emit) -> None:
         if not binding or binding.get("org") != wiring.connection().get("org"):
             return
         ie.touch_activity(home(wiring), sid)
+        out = lambda text: emit(text.replace("cardinal-storyboard investigation", command(wiring)))
         # Only an on-disk inbox: tool completion never waits on the network.
-        ie.deliver_inbox(home(wiring), sid, lambda text: emit(
-            text.replace("cardinal-storyboard investigation", command(wiring))))
+        delivered = ie.deliver_inbox(home(wiring), sid, out)
+        # Count the boundary; re-surface an owed challenge / directive only
+        # when nothing else was delivered at it.
+        ie.resurface(home(wiring), sid, None if delivered else out)
 
 
 def cli_main(argv, wiring, session_env=(), *, legacy=False) -> int:

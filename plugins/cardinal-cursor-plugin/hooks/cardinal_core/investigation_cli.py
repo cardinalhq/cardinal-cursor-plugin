@@ -243,9 +243,21 @@ class CLI:
             return EXIT_USAGE
         conn, client = self.connection()
         try:
-            payload = ie.ack_payload(args.seq, args.disposition, args.note)
+            payload = ie.ack_payload(args.seq, args.disposition, args.note, args.conflicts_with)
         except ist.FetchError as err:
             print("not acknowledged: " + str(err), file=sys.stderr)
+            return EXIT_USAGE
+        # The server's rules for a challenge / directive, checked first when
+        # this session received the target (it is then in its binding).
+        binding = ie.read_binding(self._home(), sid)
+        if binding and binding.get("investigation_id") != args.investigation_id:
+            binding = None
+        why = None
+        if binding and ie.capability(binding, ie.SUPERVISION_CAPABILITY):
+            target = ie.tracked_event(binding, args.seq)
+            why = ie.ack_rule(target, args.disposition, args.note, ie.tracked_status(binding, target))
+        if why:
+            print("not acknowledged: " + why, file=sys.stderr)
             return EXIT_USAGE
         try:
             out = ie.append_event(
@@ -268,6 +280,7 @@ class CLI:
             return 1
         except ist.FetchError as e:
             return not_recorded(e)
+        ie.record_supervision(self._home(), sid, [out["event"]])
         try:
             ie.remove_pending_decision(self._home(), sid, args.seq)
         except OSError as err:
@@ -285,6 +298,61 @@ class CLI:
             )
         else:
             sys.stdout.write(f"acknowledged event #{args.seq} ({args.disposition}) as event #{ev['seq']}\n")
+        if args.disposition == "accepted" and ie.tracked_event(binding, args.seq) is not None:
+            sys.stdout.write(f"When it is done, checkpoint with refs [\"#{args.seq}\"]; until then it is shown again "
+                             "every few tool calls.\n")
+        return 0
+
+    def cmd_rule(self, args: argparse.Namespace) -> int:
+        """Supervisor (a supervise grant's token): one ruling on its own
+        declined challenge: --uphold (a binding directive) or --withdraw."""
+        got = self._target(args) if self.scoped else None
+        conn, client, inv = got if got is not None else ({}, None, None)
+        if not self.scoped or (got is not None and not conn.get("token")):
+            print("not ruled: a ruling needs a supervise grant's token (CARDINAL_INVESTIGATION_TOKEN or "
+                  "--credential-file); the investigation's author mints one with `cardinal-storyboard investigation "
+                  "grant --scope supervise`", file=sys.stderr)
+            return EXIT_USAGE
+        if got is None:
+            return EXIT_USAGE
+        scopes = conn.get("scopes") if isinstance(conn.get("scopes"), list) else None
+        if scopes and gr.SUPERVISE not in scopes:
+            print(f"not ruled: this grant's scopes are {','.join(ie._tok(x) for x in scopes)}, without supervise; "
+                  "ask the investigation's author for `investigation grant --scope supervise`", file=sys.stderr)
+            return EXIT_USAGE
+        outcome = "upheld" if args.uphold else "withdrawn"
+        try:
+            out = gr.issue_ruling(conn, inv, args.challenge_seq, outcome, args.text, refs=args.ref or None,
+                                  client=client)
+        except sync.ServerError as e:
+            # An older Maestro: no route (404), or a grant token refused on a
+            # route it does not know (401 / 403). Ask what it advertises
+            # before blaming the grant.
+            if gr.ruling_unsupported(e) or (
+                e.status in (401, 403)
+                and gr.supports_rulings(conn, inv, client=client) is False
+            ):
+                print(gr.RULING_UNSUPPORTED, file=sys.stderr)
+                return 1
+            if e.body.get("error") == "idempotency_conflict":
+                print(f"not ruled: you already ruled on challenge #{args.challenge_seq} with another outcome or text; "
+                      "a challenge is ruled on once", file=sys.stderr)
+                return 1
+            print("not ruled: " + ie.plain(e), file=sys.stderr)
+            return 1
+        except ist.FetchError as e:
+            if getattr(e, "network", False):
+                return not_recorded(e)
+            print("not ruled: " + ie._one_line(e, 1000), file=sys.stderr)
+            return EXIT_USAGE
+        if args.json:
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return 0
+        ev = out["event"]
+        said = "already ruled" if out.get("duplicate") else "ruled"
+        what = ("upheld: a binding directive the worker must accept (or answer `conflicts`, citing its owner's "
+                "words)" if outcome == "upheld" else "withdrawn: the challenge is closed")
+        print(f"{said} on challenge #{args.challenge_seq} as event #{ev['seq']} — {what}")
         return 0
 
     def _print_link(self, b: dict, as_json: bool) -> None:
@@ -485,8 +553,13 @@ class CLI:
             )
         if e.get("type") == ie.ACKNOWLEDGED:
             body = f"ack of #{payload.get('ack_of')}: {ie._tok(payload.get('disposition'))}"
+            if payload.get("conflicts_with") is not None:
+                body += f" (conflicts with #{ie._tok(str(payload['conflicts_with']))})"
             if isinstance(payload.get("note"), str):
                 body += f" {ie.json_text(payload['note'])}"
+        elif e.get("type") == ie.RULING:
+            body = (f"{ie._tok(payload.get('outcome'))} ruling on #{ie._tok(str(payload.get('ruling_of')))}"
+                    f" (authority {ie._tok(e.get('authority'))}): {ie.json_text(str(payload.get('text', '')))}")
         else:
             body = ie.json_text(str(payload.get("text", "")))
         return (
@@ -674,6 +747,10 @@ class CLI:
                     raise ValueError("grant does not belong to this investigation")
             gr.revoke(conn, args.grant_id, client=client)
         except sync.ServerError as e:
+            if e.body.get("error") == "revoke_requires_owner_web":
+                sys.stderr.write("not revoked: the owner minted this grant from the signed-in Cardinal web session "
+                                 "(delegated supervision); revoke it from the Investigation page\n")
+                return 1
             sys.stderr.write(self.refused(e, "not revoked") + "\n")
             return 1
         except ist.FetchError as e:
@@ -769,6 +846,7 @@ class CLI:
         finally:
             timing["request"] = time.monotonic() - t - timing["upload"]
         timing["events"] = len(out["events"])
+        ie.record_supervision(self._home(), sid, out["events"])   # a checkpoint citing "#<seq>" addresses it
         if args.json:
             sys.stdout.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
         else:
@@ -814,6 +892,7 @@ def build_parser(wiring, session_env=()):
         "grant",
         "grants",
         "revoke",
+        "rule",
         "reviewed",
         "show",
         "verify",
@@ -871,7 +950,9 @@ def build_parser(wiring, session_env=()):
             p.add_argument("--ttl", default="4h")
             p.add_argument("--label")
             p.add_argument(
-                "--scope", help="read,advise,owner_input:read,evidence:read (latter scopes require read)"
+                "--scope",
+                help="read,advise,owner_input:read,evidence:read,supervise (owner_input:read and evidence:read "
+                "require read; supervise implies read,advise and adds binding rulings on its own challenges)",
             )
             p.add_argument("--owner-input", action="store_true")
         elif action == "revoke":
@@ -885,8 +966,29 @@ def build_parser(wiring, session_env=()):
             p.add_argument("--idempotency-key")
         elif action == "ack":
             p.add_argument("seq", type=int)
-            p.add_argument("--disposition", choices=ie.DISPOSITIONS, required=True)
+            p.add_argument(
+                "--disposition",
+                choices=ie.DISPOSITIONS,
+                required=True,
+                help="a challenge: accepted|declined with --note; a directive: accepted, or conflicts "
+                "--conflicts-with SEQ; cues and questions: accepted|declined|noted",
+            )
             p.add_argument("--note")
+            p.add_argument(
+                "--conflicts-with",
+                type=int,
+                metavar="SEQ",
+                help="with --disposition conflicts: the owner.decided event the directive contradicts "
+                "(owner input recorded from a session is not accepted)",
+            )
+        elif action == "rule":
+            p.add_argument("challenge_seq", type=int, help="your own challenge's #seq")
+            outcome = p.add_mutually_exclusive_group(required=True)
+            outcome.add_argument("--uphold", action="store_true",
+                                 help="a binding directive (once the worker took a position)")
+            outcome.add_argument("--withdraw", action="store_true", help="close the challenge")
+            p.add_argument("--text", required=True, help="the directive, or why it is withdrawn (1-4000 chars)")
+            p.add_argument("--ref", action="append", default=[])
         elif action == "events":
             p.add_argument("--after", type=int, default=0)
             p.add_argument(
@@ -918,6 +1020,8 @@ def normalize_argv(argv):
     # Options take one value except the explicitly boolean options.
     boolean = {
         "--json",
+        "--uphold",
+        "--withdraw",
         "--follow",
         "--auto-review",
         "--exclude-self",
@@ -956,7 +1060,7 @@ def cli_main(argv, wiring, session_env=(), *, legacy=False):
     args = build_parser(wiring, session_env).parse_args(normalize_argv(argv))
     cli = CLI(wiring, args, legacy)
     try:
-        if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify"):
+        if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify", "rule"):
             return EXIT_USAGE if not cli._author_only("not recorded") else 0
         if args.action == "post" and (args.type is None or args.text is None):
             raise ValueError("post requires type and text (positional or --type/--text)")
