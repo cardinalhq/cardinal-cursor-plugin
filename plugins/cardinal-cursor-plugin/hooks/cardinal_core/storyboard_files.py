@@ -141,6 +141,11 @@ def record(state_dir: Optional[Path], session_id: Optional[str], file_path: Any,
         except OSError:
             pass
         _prune(state_dir, path, time.time() if now is None else now)
+        # The common ledger is used by all four adapters. Queue provenance
+        # independently of evidence promotion, without a network call here.
+        from . import session_repos
+        runtime = state_dir.parents[1].name.lstrip(".")
+        session_repos.stage(state_dir.parents[2], session_id, {"repo": repo}, runtime=runtime)
         return True
     except Exception:
         return False

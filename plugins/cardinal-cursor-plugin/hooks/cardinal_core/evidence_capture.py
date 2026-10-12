@@ -692,6 +692,12 @@ def capture_call(call: ToolCall, home: Path, *, env: Optional[dict] = None, rule
     if not write:
         return Captured(entry, None, verdict is not None)
     evidence.write_entry(root, entry)
+    if verdict is None:
+        try:
+            from . import session_repos
+            session_repos.observe(call, home, env=env)
+        except Exception:
+            pass
     # The entry is on disk: from here nothing (not even the budget timer,
     # see capture_call_guarded) may turn it into a failed capture.
     try:
