@@ -820,7 +820,9 @@ def build_parser(wiring, session_env=()):
     ):
         p = sub.add_parser(
             action,
-            description=CHECKPOINT_HELP if action == "checkpoint" else None,
+            description=(CHECKPOINT_HELP if action == "checkpoint" else
+                         ie.ACK_GUIDANCE if action == "ack" else
+                         ie.POST_GUIDANCE if action == "post" else None),
             formatter_class=argparse.RawDescriptionHelpFormatter,
         )
         if action == "checkpoint":
