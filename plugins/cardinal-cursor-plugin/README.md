@@ -385,28 +385,77 @@ python3 scripts/cardinal-storyboard investigation link --session <conversation i
 python3 scripts/cardinal-disconnect
 python3 scripts/cardinal-disconnect --force
 python3 scripts/cardinal-checks on|off|status
-python3 scripts/cardinal-wake enable|disable|status|run --dry-run
+python3 scripts/cardinal-wake enable|disable|status|run --dry-run|resume <session>
 ```
 
-## Owner-woken sessions (notify-only)
+## Owner-woken sessions
 
-`python3 scripts/cardinal-wake enable` (macOS; a per-user launchd agent)
-watches for owner decisions you post on an Investigation page addressed to
-a stopped session on this machine. For a Cursor session the result is
-always a macOS notification naming the session (short id), the
-Investigation and the state, never the decision's text. The waker never
-resumes a Cursor session, with or without `--launch`: no unattended Cursor
-resume has been shown to pass the wake gates
-([`docs/specs/resume-and-wake.md`](../../docs/specs/resume-and-wake.md)
-§5.3). Only a decision posted from your signed-in Cardinal web session
-counts; the waker reads it from Cardinal with this plugin's key, never from
-local files. It recognizes a Cursor session by its records under
-`~/.cursor/projects/*/agent-transcripts/` or `~/.cursor/chats/*/<id>/` when
-they exist (best effort; otherwise the notification says the runtime is
-unknown). The same waker resumes eligible Codex CLI sessions; the Codex
-plugin's README ("Owner-woken sessions") has the rules and the trust
-boundary. `disable` removes the agent; `status` shows recent wakes, never
-decision text.
+`python3 scripts/cardinal-wake` (macOS; a per-user launchd agent) tells you
+about owner decisions you post on an Investigation page addressed to a
+session on this machine, and resumes a stopped one in your own terminal
+when you ask.
+
+```bash
+python3 scripts/cardinal-wake enable                     # install the per-user launchd agent (macOS)
+python3 scripts/cardinal-wake status                     # the setting, recent notifications, resume commands
+python3 scripts/cardinal-wake run --dry-run              # what the next pass would do; notifies nothing
+python3 scripts/cardinal-wake resume <session>           # resume it here (a unique 8+ hex prefix is enough)
+python3 scripts/cardinal-wake resume <session> --print   # show the command and its directory only
+python3 scripts/cardinal-wake disable                    # remove the launchd agent
+```
+
+**What reaches you.** Only an owner decision you post from your signed-in
+Cardinal web session, addressed to a session on this machine, counts; never
+anything an agent posts. The waker reads it straight from Cardinal with the
+Cardinal key of the plugin whose session it is (this plugin's: `~/.cursor/cardinal.json` `mcp_url` + `cardinal-secrets.json`
+`mcp_api_key`), never from
+local files. Each decision is one macOS notification naming the runtime,
+the session (first 8 characters of its id) and the Investigation (its id and
+host), never the decision's text; at most 3 per session and 10 in all per
+rolling day (the rest follow later). A decision posted without "Resume this
+session if it has stopped", or older than 7 days, is notified the same way.
+
+**The notification.** For a session whose window is still open it says to
+switch to that window. For a stopped session it ends with
+`Resume: ~/.cardinal/wake/lib/cardinal-wake resume <first 8 of the id>`:
+run that in your terminal, or install
+[terminal-notifier](https://github.com/julienXX/terminal-notifier)
+(`brew install terminal-notifier`) and click the notification: Terminal
+opens and runs it (through a private `~/.cardinal/wake/resume/<id>.command`).
+
+**`resume` (experimental for Cursor).** The waker recognizes a Cursor
+session by its records under `~/.cursor/projects/*/agent-transcripts/` or
+`~/.cursor/chats/*/<id>/` (best effort; otherwise the notification says the
+runtime is unknown). `resume` takes the chat's working directory only from
+those records (never from the Investigation binding) and runs, there,
+`cursor-agent --resume <session> "<wake prompt>"`. Only a binary named
+`cursor-agent` is used (never `agent`, an unrelated tool on some machines),
+and this resume has not been verified against Cursor yet. When
+`cursor-agent` is not installed, or the records do not say where the chat
+ran, it tells you to reopen the chat in Cursor (its project, then the
+Agent panel's history) instead.
+The wake prompt names the decision's number and Investigation (never its
+text) and is listed as a machine prompt, so the resumed turn is never
+recorded as owner input. The resumed session also receives the decision
+through this plugin's investigation hooks, as any session does.
+`resume --print` shows the command and its directory without running them;
+`status` lists candidate sessions with their resume commands.
+
+**Nothing is ever started unattended.** The waker only notifies; you resume,
+in your own terminal, with your own settings and permissions, and you see
+everything the session does ([`docs/specs/resume-and-wake.md`](../../docs/specs/resume-and-wake.md) v4). `enable --launch`, from earlier
+versions, is refused with a one-line message. `enable` copies this plugin's
+`cardinal_core` and a small runner into `~/.cardinal/wake/lib/` (every enable
+copies them again, so a plugin upgrade never leaves the agent pointing at a
+removed version) and runs it every 45 s with a Python that resolves outside
+your home directory, your repositories, temp dirs and version-manager shims,
+in isolated mode (`-I -S`), with a system-only PATH. `disable` removes the
+launchd agent.
+
+After updating the plugin, run `cardinal-wake enable` again: it refreshes the
+stable copy in `~/.cardinal/wake/lib/` (until then `status` says the
+installed runner is out of date, and notifications ask for it instead of
+naming the resume command).
 
 ## Known Cursor issues
 
