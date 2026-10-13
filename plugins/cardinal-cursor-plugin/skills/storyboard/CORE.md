@@ -4,7 +4,7 @@ Use this workflow when the user asks for a storyboard visualization or asks to p
 
 ## Author the same storyboard
 
-Use the session's bound `sb_…` and `inv_…` from its context. Never create a duplicate. If this runtime has no bound storyboard, use `storyboard__find` with the session id and context; create only when no suitable storyboard exists. Never edit another author's investigation just because it matches a search.
+Use the session's bound `sb_…` and `inv_…` from its context, unless the person names an earlier session's storyboard to continue (see "Continue an earlier session's storyboard"). Never create a duplicate. If this runtime has no bound storyboard, use `storyboard__find` with the session id and context; create only when no suitable storyboard exists. Never edit another author's investigation just because it matches a search.
 
 Read the existing storyboard with `storyboard__get`, then fetch `storyboard__describe_grammar` sections `authoring`, `evidence`, and `canvas`. Preserve useful existing scenes and their ids; revise the argument where the findings changed. The session supplies the explanation, while evidence supports the facts. Keep private prompts, credentials, and unrelated transcript content out of the storyboard.
 
@@ -25,6 +25,17 @@ A request to publish authorizes updating and reviewing the visualization, then p
 Call `storyboard__publish` only after those steps succeed, and verify that its response reports publication. Draft storyboards are visible only to their author. Publication makes the reviewed visualization visible to members of the organization; creating or extending public share links requires a separate explicit request. Honor any public-link and raw-evidence confirmations returned by the server.
 
 Return the storyboard link and briefly describe whether it was updated privately or published. Do not prompt for an update at the end of ordinary work or after completing this skill.
+
+## Continue an earlier session's storyboard
+
+When the person names an earlier storyboard to pick up (an `sb_…` id, its link, or the session that made it), author that one instead of this session's:
+
+1. Find it with `storyboard__find` and that session id (or take the named `sb_…`), then `storyboard__get` it. Never `storyboard__create` a duplicate; this session's own automatic draft stays empty.
+2. If every act is published, call `storyboard__add_act` before any `cardinal-evidence promote` or `storyboard__preview`: uploads to a published storyboard are refused.
+3. Cite the old session's `ev_…` ids as usual. If promote reports one missing (aged out after 14 days, or evicted under disk pressure), say so and replace it with a witnessed query or `storyboard__record_evidence`.
+4. Preview, revise and publish as above. If the server refuses the update from this session, say so.
+
+To continue the old investigation's timeline too, the person starts a new session with `CARDINAL_INVESTIGATION_ID=inv_…` to join it. Do not run `cardinal-storyboard investigation bind` from a running session: it replaces this session's binding, including its storyboard and capabilities.
 
 ## Supervising another session
 

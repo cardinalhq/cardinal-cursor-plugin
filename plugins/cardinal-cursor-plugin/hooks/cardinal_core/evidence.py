@@ -38,6 +38,9 @@ What this module owns:
     session in token.json for `cardinal-evidence promote`.
   - record_promoted()/promoted_receipt(): the receipt each promoted entry
     got, kept per session in promoted.json, so a repeat promote reuses it.
+  - set_hold()/release_hold()/read_hold()/holds(): a session's evidence
+    hold (.hold), a best-effort preference in size eviction, and the
+    .hold-breached marker gc() leaves when disk pressure overrode it.
   - list_entries()/session_dirs()/set_capture_disabled(): what the
     `cardinal-evidence list` / `off` / `on` / `status` commands read and write.
   - spill_path()/read_spill(): Claude Code's spill-file follower, shared
@@ -78,7 +81,8 @@ GC_BUDGET_S = 0.25
 # a session; per-session totals cached in GC_INDEX so this holds for a spool
 # of any size), and one session keeps at most
 # MAX_ENTRIES_PER_SESSION entries. Token files and markers are never evicted
-# for size.
+# for size. A session with a live hold (HOLD_FILE) is evicted after the
+# unheld ones, within HOLD_MAX_FRACTION of the cap (gc()).
 MAX_SPOOL_BYTES = 256 << 20
 MAX_ENTRIES_PER_SESSION = 10000
 MAX_MB_ENV = "CARDINAL_EVIDENCE_MAX_MB"
@@ -1605,6 +1609,214 @@ def record_promoted(root: Path, session_id: Any, storyboard_id: str, receipts: d
     return _write_session_json(root, session_id, PROMOTED_FILE, ".promoted_", body)
 
 
+# ---------------------------------------------------------------------------
+# Evidence hold (best-effort)
+#
+# A session whose work may still be published (it checkpointed, or the user
+# asked) keeps its uncited captures longer under disk pressure:
+#     <root>/<session_id>/.hold            (0600, atomic tmp-then-rename)
+#     {set_at, until, reason: checkpoint|manual|wake}   (RFC 3339, UTC)
+# with until <= set_at + MAX_HOLD_S. It is a PREFERENCE in gc()'s size pass,
+# never a retention guarantee: entries still age out after RETENTION_S, and
+# held sessions together keep at most HOLD_MAX_FRACTION of the cap. The
+# durable path is to cite the evidence (a checkpoint or a scene uploads it as
+# a receipt the server pins). User-facing text says "protected while space
+# allows". The marker expires at its `until` (gc removes it then, so the
+# directory can go too).
+#
+# When the size pass does evict entries of a held session it writes
+#     <root>/<session_id>/.hold-breached   {at, entries_removed, evidence_ids}
+# (evidence_ids: the newest MAX_BREACH_IDS evicted ids, so `promote` can say
+# an id it cannot find was evicted despite the hold). Never evicted for
+# size; removed RETENTION_S after its last write, like an entry.
+#
+# GC_INDEX is unchanged (older adapter cores share the spool and keep only
+# 5-field rows): gc reads .hold only for the sessions it is about to evict.
+# ---------------------------------------------------------------------------
+
+HOLD_FILE = ".hold"
+HOLD_BREACHED = ".hold-breached"
+HOLD_REASONS = ("checkpoint", "manual", "wake")
+MAX_HOLD_S = RETENTION_S
+HOLD_MAX_FRACTION = 0.5
+MAX_BREACH_IDS = 1000
+# A hold whose set_at is further ahead of this machine's clock than this was
+# not written by this machine's plugin: it holds nothing.
+HOLD_CLOCK_SKEW_S = 3600
+
+
+def format_time(t: float) -> str:
+    """Epoch seconds -> RFC 3339 UTC, to the second (parse_time reads it)."""
+    return datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_hold(data: Any) -> Optional[dict]:
+    """{set_at, until, reason} (epoch seconds) from a .hold body, until
+    clamped to set_at + MAX_HOLD_S; None when malformed."""
+    if not isinstance(data, dict):
+        return None
+    set_at, until = parse_time(data.get("set_at")), parse_time(data.get("until"))
+    reason = data.get("reason")
+    if set_at is None or until is None or reason not in HOLD_REASONS:
+        return None
+    return {"set_at": set_at, "until": min(until, set_at + MAX_HOLD_S), "reason": reason}
+
+
+def _live_hold(sdir: Any, now: float) -> Optional[dict]:
+    """The session directory's hold while it is in force (set_at not ahead
+    of the clock, until not passed), else None."""
+    h = _parse_hold(_read_private_json(Path(sdir) / HOLD_FILE))
+    if h is None or h["set_at"] > now + HOLD_CLOCK_SKEW_S or h["until"] <= now:
+        return None
+    return h
+
+
+def read_hold(root: Path, session_id: Any, now: Optional[float] = None) -> Optional[dict]:
+    """A session's live hold {set_at, until, reason} (epoch seconds), or None."""
+    if not (isinstance(session_id, str) and SESSION_ID_RE.match(session_id)):
+        return None
+    return _live_hold(Path(root) / session_id, time.time() if now is None else now)
+
+
+def set_hold(root: Path, session_id: Any, *, reason: str, seconds: float = MAX_HOLD_S,
+             now: Optional[float] = None, create: bool = False) -> Optional[dict]:
+    """Hold a session's evidence for `seconds` (at most MAX_HOLD_S) from now:
+    write <root>/<session>/.hold (0600, atomic), replacing any earlier hold.
+    Returns the hold written, or None when the session has no spool
+    directory (nothing to protect) and not create. ValueError on a bad
+    session id, reason or duration. A failed write raises; the automatic
+    callers (a checkpoint, the PostToolUse hook) call it fail-open."""
+    if not (isinstance(session_id, str) and SESSION_ID_RE.match(session_id)) or session_id == NO_SESSION:
+        raise ValueError("bad session id")
+    if reason not in HOLD_REASONS:
+        raise ValueError("bad hold reason")
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds <= MAX_HOLD_S:
+        raise ValueError(f"a hold lasts more than 0 and at most {MAX_HOLD_S // 86400} days")
+    now = time.time() if now is None else now
+    if not create:
+        try:
+            if not stat.S_ISDIR(os.lstat(Path(root) / session_id).st_mode):
+                return None
+        except OSError:
+            return None
+    body = {"set_at": format_time(now), "until": format_time(now + seconds), "reason": reason}
+    _write_session_json(root, session_id, HOLD_FILE, ".hold_", body)
+    return _parse_hold(body)
+
+
+def hold_after_checkpoint(home: Path, session_id: Any, env: Optional[dict] = None) -> None:
+    """After a successful investigation checkpoint (investigation_events.
+    checkpoint, or the PostToolUse hook seeing Cardinal's
+    storyboard__checkpoint answer): hold the checkpointing session's
+    evidence for MAX_HOLD_S, since that work may still be published.
+    Nothing while capture is off or when the session has no spool
+    directory. Fail open: never raises, so a hold can never fail a
+    checkpoint or a hook."""
+    try:
+        root = default_root(home)
+        if capture_disabled(root, env):
+            return
+        set_hold(root, session_id, reason="checkpoint")
+    except Exception:
+        pass
+
+
+def release_hold(root: Path, session_id: Any) -> bool:
+    """Remove a session's hold; True when there was one."""
+    if not (isinstance(session_id, str) and SESSION_ID_RE.match(session_id)):
+        return False
+    try:
+        os.unlink(Path(root) / session_id / HOLD_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_breach(root: Path, session_id: Any) -> Optional[dict]:
+    """A session's .hold-breached marker {at, entries_removed, evidence_ids},
+    or None."""
+    if not (isinstance(session_id, str) and SESSION_ID_RE.match(session_id)):
+        return None
+    data = _read_private_json(Path(root) / session_id / HOLD_BREACHED)
+    if not isinstance(data, dict) or parse_time(data.get("at")) is None:
+        return None
+    n = data.get("entries_removed")
+    ids = data.get("evidence_ids")
+    return {"at": data["at"],
+            "entries_removed": n if isinstance(n, int) and not isinstance(n, bool) and n >= 0 else 0,
+            "evidence_ids": [x for x in ids if isinstance(x, str) and EVIDENCE_ID_RE.match(x)]
+            if isinstance(ids, list) else []}
+
+
+def _record_breach(root: Path, session: str, ev_ids: list, now: float) -> None:
+    """Add evicted ids to a held session's breach marker (merged with an
+    earlier one; the newest MAX_BREACH_IDS ids kept). Never raises."""
+    try:
+        prior = read_breach(root, session) or {"entries_removed": 0, "evidence_ids": []}
+        ids = [x for x in prior["evidence_ids"] if x not in ev_ids] + list(ev_ids)
+        body = {"at": format_time(now), "entries_removed": prior["entries_removed"] + len(ev_ids),
+                "evidence_ids": ids[-MAX_BREACH_IDS:]}
+        _write_session_json(root, session, HOLD_BREACHED, ".hold-breached_", body)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def breach_for(root: Path, ev_id: Any) -> Optional[tuple]:
+    """(session, exact) when an entry missing from the spool may have been
+    evicted under disk pressure despite a hold: exact when a breach marker
+    names it, not exact when a marker's id list was cut (more removed than
+    it names). None when no breach accounts for it."""
+    if not (isinstance(ev_id, str) and EVIDENCE_ID_RE.match(ev_id)):
+        return None
+    maybe = None
+    for name, _ in session_dirs(root):
+        b = read_breach(root, name)
+        if b is None:
+            continue
+        if ev_id in b["evidence_ids"]:
+            return name, True
+        if maybe is None and b["entries_removed"] > len(b["evidence_ids"]):
+            maybe = (name, False)
+    return maybe
+
+
+def breach_note(root: Path, ev_id: Any) -> Optional[str]:
+    """breach_for() in words, for an id the spool no longer has, or None."""
+    found = breach_for(root, ev_id)
+    if found is None:
+        return None
+    session, exact = found
+    if exact:
+        return f"evicted under disk pressure despite a hold on session {session}"
+    return (f"not on this machine; session {session} lost entries under disk pressure despite a hold, and "
+            "this may have been one of them")
+
+
+def holds(root: Path, now: Optional[float] = None) -> list:
+    """[(session, live hold or None, entry bytes, breach or None)] for every
+    session with a live hold or a breach marker, most recently active first."""
+    now = time.time() if now is None else now
+    out = []
+    for name, sdir in session_dirs(root):
+        h = _live_hold(sdir, now)
+        b = read_breach(root, name)
+        if h is None and b is None:
+            continue
+        size = 0
+        try:
+            with os.scandir(sdir) as it:
+                for f in it:
+                    if f.name.startswith("ev_") and f.name.endswith(".json"):
+                        try:
+                            size += f.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            continue
+        except OSError:
+            pass
+        out.append((name, h, size, b))
+    return out
+
+
 def set_capture_disabled(root: Path, disabled: bool) -> None:
     """Write (disabled) or remove the opt-out flag file <root>/disabled."""
     root = Path(root)
@@ -1706,7 +1918,21 @@ def gc(root: Path, now: Optional[float] = None, retention_s: float = RETENTION_S
     written, replaced or removed changes it), so a pass only lists the
     sessions that changed or have something due to expire. A pass that runs
     out of budget keeps what it learned and asks for another pass in
-    GC_RETRY_S instead of waiting out the interval."""
+    GC_RETRY_S instead of waiting out the interval.
+
+    Holds (best-effort; _gc_size_pass): over the cap, sessions are walked
+    least recently active first, as without holds, and .hold is read only
+    for a session the walk reaches (one it does not reach loses nothing, so
+    its hold is moot). A held session is skipped, and the walk goes on
+    evicting unheld sessions. The held sessions skipped so far protect at
+    most HOLD_MAX_FRACTION of the cap: whenever their bytes exceed that,
+    the one with the oldest set_at loses its oldest entries until they fit
+    again (or the spool is under the cap). If every unheld session is gone
+    and the spool is still over the cap, held sessions go too, oldest set_at
+    first. So holds never cost unheld sessions more than HOLD_MAX_FRACTION
+    of the cap, and the spool still converges under it. Any entry evicted
+    from a held session is recorded in its .hold-breached marker. Age
+    expiry ignores holds."""
     now = time.time() if now is None else now
     deadline = time.monotonic() + budget_s
     root = Path(root)
@@ -1767,33 +1993,8 @@ def gc(root: Path, now: Optional[float] = None, retention_s: float = RETENTION_S
         if complete:
             total = sum(c[1] for c in index.values())
             if total > cap:
-                # Least recently active sessions first; the oldest entries
-                # of each first.
-                for name in sorted(index, key=lambda k: (index[k][4], k)):
-                    if total <= cap:
-                        break
-                    if time.monotonic() > deadline:
-                        complete = False
-                        break
-                    path = os.path.join(str(root), name)
-                    entries = _gc_entries(path, deadline)
-                    if entries is None:
-                        complete = False
-                        break
-                    entries.sort()
-                    for _, size, p in entries:
-                        if total <= cap or time.monotonic() > deadline:
-                            break
-                        try:
-                            os.unlink(p)
-                            removed += 1
-                            total -= size
-                        except OSError:
-                            pass
-                    index[name] = [-1, 0, 0, 0.0, 0.0]   # list it again next pass
-                    if total > cap and time.monotonic() > deadline:
-                        complete = False
-                        break
+                n_removed, complete = _gc_size_pass(root, index, total, cap, now, deadline)
+                removed += n_removed
         for path in empty:
             try:
                 os.rmdir(path)
@@ -1878,10 +2079,95 @@ def _gc_entries(path: str, deadline: float) -> Optional[list]:
     return out
 
 
+def _gc_size_pass(root: Path, index: dict, total: int, cap: int, now: float, deadline: float) -> tuple:
+    """gc()'s size bound, with holds (the rule is in gc()'s docstring):
+    remove entries until the spool's total is at most cap. index (session
+    -> GC_INDEX row) gives each session's bytes and last activity; every
+    session it removes from is reset to [-1, 0, 0, 0.0, 0.0] (listed again
+    next pass). -> (files removed, complete: False past the deadline)."""
+    budget = int(cap * HOLD_MAX_FRACTION)
+    held: list = []          # [set_at, name, bytes] of the held sessions the walk skipped
+    st = {"total": total, "held": 0, "removed": 0}
+
+    def evict(name: str, stop, victim: Optional[list] = None) -> Optional[bool]:
+        """Oldest entries of one session first, until stop(). -> True when
+        the session ran out of entries, False when stop() held first, None
+        past the deadline. victim: its held row, kept in step."""
+        path = os.path.join(str(root), name)
+        entries = _gc_entries(path, deadline)
+        if entries is None:
+            return None
+        entries.sort()
+        gone: list = []
+        out: Optional[bool] = True
+        for _, size, p in entries:
+            if stop():
+                out = False
+                break
+            if time.monotonic() > deadline:
+                out = None
+                break
+            try:
+                os.unlink(p)
+            except OSError:
+                continue
+            st["removed"] += 1
+            st["total"] -= size
+            gone.append(os.path.basename(p)[:-len(".json")])
+            if victim is not None:
+                victim[2] -= size
+                st["held"] -= size
+        index[name] = [-1, 0, 0, 0.0, 0.0]   # list it again next pass
+        if victim is not None and gone:
+            _record_breach(root, name, gone, now)
+        return out
+
+    def trim_held(stop) -> bool:
+        """Held sessions, oldest set_at first, until stop(). False past the
+        deadline."""
+        while held and not stop():
+            held.sort()
+            victim = held[0]
+            got = evict(victim[1], stop, victim)
+            if got is None:
+                return False
+            if got:
+                # Out of entries (or they could not be removed): it protects
+                # nothing more.
+                st["held"] -= victim[2]
+                held.pop(0)
+        return True
+
+    def over_cap() -> bool:
+        return st["total"] > cap
+
+    for name in sorted(index, key=lambda k: (index[k][4], k)):
+        if not over_cap():
+            break
+        if time.monotonic() > deadline:
+            return st["removed"], False
+        hold = _live_hold(os.path.join(str(root), name), now)
+        if hold is not None:
+            held.append([hold["set_at"], name, index[name][1]])
+            st["held"] += index[name][1]
+            if not trim_held(lambda: st["held"] <= budget or not over_cap()):
+                return st["removed"], False
+            continue
+        if evict(name, lambda: not over_cap()) is None:
+            return st["removed"], False
+    # Every unheld session the walk reached is gone and the spool is still
+    # over the cap (the holds fit their budget, so only removals that
+    # failed or a stale total get here): the holds give way too.
+    if over_cap() and not trim_held(lambda: not over_cap()):
+        return st["removed"], False
+    return st["removed"], True
+
+
 def _gc_session(path: str, now: float, retention_s: float, deadline: float,
                 max_per_session: int) -> Optional[tuple]:
     """List one session directory: remove what expired (entries, token,
-    promotion ledger, marker, dead temp files) and the oldest entries beyond max_per_session.
+    promotion ledger, markers, a hold past its until, dead temp files) and
+    the oldest entries beyond max_per_session.
     -> (removed, files left, [(mtime, size, path)] of entries kept, the
     time the next file here expires), or None past deadline."""
     removed = 0
@@ -1907,7 +2193,17 @@ def _gc_session(path: str, now: float, retention_s: float, deadline: float,
                     ttl = retention_s
                 elif name == PROMOTED_FILE:
                     ttl = retention_s
-                elif name.startswith((".ev_", ".token_", ".promoted_")) and name.endswith(".tmp"):
+                elif name == HOLD_FILE:
+                    # Expires at its own `until` (at most MAX_HOLD_S after it
+                    # was written; a malformed one after RETENTION_S), so a
+                    # hold never keeps itself and its directory forever.
+                    h = _parse_hold(_read_private_json(Path(f.path)))
+                    ttl = min(h["until"] if h else fst.st_mtime + RETENTION_S,
+                              fst.st_mtime + MAX_HOLD_S) - fst.st_mtime
+                elif name == HOLD_BREACHED:
+                    ttl = retention_s
+                elif name.startswith((".ev_", ".token_", ".promoted_", ".hold_", ".hold-breached_")) \
+                        and name.endswith(".tmp"):
                     ttl = STALE_TMP_S
                 else:
                     ttl = None

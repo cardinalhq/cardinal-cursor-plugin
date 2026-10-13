@@ -20,7 +20,18 @@ Commands (main()):
   list [--session ID | --all] [--limit N] [--tool GLOB] [--grep TEXT] [--withheld]
   find TEXT                  list --grep TEXT
   show ev_...                the scrubbed entry exactly as promote would cite it
-  off | on | status
+  hold SESSION [--days N] | hold SESSION --release
+                             protect a session's captured evidence while space
+                             allows (evidence.set_hold, reason "manual"; N <= 14,
+                             default 14): a preference in size eviction, never
+                             retention. A successful checkpoint sets the same
+                             hold (reason "checkpoint").
+  off | on | status          status also lists holds, their bytes, and any
+                             session that lost entries to disk pressure despite
+                             a hold (.hold-breached)
+
+A promote of an ev_ id missing from the spool says so when a breach marker
+accounts for it ("evicted under disk pressure despite a hold").
 
 Each adapter supplies a PromoteAdapter: its client string, how to find the
 Cardinal connection (URL + key), which environment variables name the
@@ -413,8 +424,7 @@ def cmd_promote(args, adapter: PromoteAdapter, out=sys.stdout, err=sys.stderr, o
     for ev_id in ids:
         entry = evidence.read_entry(root, ev_id)
         if entry is None or entry.get("evidence_id") != ev_id:
-            results[ev_id] = ("error", "not_in_spool", "no such entry on this machine (captured elsewhere, "
-                              "removed after 14 days, or capture was off)")
+            results[ev_id] = ("error", "not_in_spool", missing_message(root, ev_id))
         elif is_withheld(entry):
             w = entry.get("withheld") or {}
             results[ev_id] = ("error", "withheld",
@@ -541,6 +551,15 @@ def cmd_promote(args, adapter: PromoteAdapter, out=sys.stdout, err=sys.stderr, o
             err.write(f"{prog}: could not record the promotion locally ({type(e).__name__}); "
                       "promoting these entries again would upload them again\n")
     return report(ids, results, out, err, sb, reused)
+
+
+def missing_message(root: Path, ev_id: str) -> str:
+    """Why an ev_ id is not in the spool, as far as this machine can tell."""
+    note = evidence.breach_note(root, ev_id)
+    if note:
+        return (note + ": cite a witnessed query that shows the same, or report the result with "
+                "storyboard__record_evidence")
+    return "no such entry on this machine (captured elsewhere, removed after 14 days, or capture was off)"
 
 
 def summary_of(entry: dict) -> str:
@@ -740,6 +759,41 @@ def cmd_on(args, adapter: PromoteAdapter, out=sys.stdout, err=sys.stderr) -> int
     return EXIT_OK
 
 
+def _mib(n: float) -> str:
+    return f"{n / (1 << 20):.1f} MiB"
+
+
+def cmd_hold(args, adapter: PromoteAdapter, out=sys.stdout, err=sys.stderr) -> int:
+    root = evidence.default_root(home_dir())
+    prog = adapter.prog
+    sid = args.session
+    if not evidence.SESSION_ID_RE.match(sid) or sid == evidence.NO_SESSION:
+        err.write(f"{prog}: not a session id: {clip(sid, 80)!r}\n")
+        return EXIT_FAILED
+    if args.release:
+        if evidence.release_hold(root, sid):
+            out.write(f"Released the hold on session {sid}: its evidence is evicted like any other session's.\n")
+        else:
+            out.write(f"Session {sid} had no hold.\n")
+        return EXIT_OK
+    max_days = evidence.MAX_HOLD_S // 86400
+    days = max_days if args.days is None else args.days
+    if not 1 <= days <= max_days:
+        err.write(f"{prog}: --days is 1 to {max_days}\n")
+        return EXIT_FAILED
+    hold = evidence.set_hold(root, sid, reason="manual", seconds=days * 86400)
+    if hold is None:
+        err.write(f"{prog}: no captured evidence for session {sid} on this machine; nothing to hold\n")
+        return EXIT_FAILED
+    cap = evidence.spool_cap_bytes()
+    out.write(f"Session {sid}'s captured evidence is protected while space allows until "
+              f"{evidence.format_time(hold['until'])}: under disk pressure it is evicted after sessions without "
+              f"a hold, and all holds together keep at most {_mib(cap * evidence.HOLD_MAX_FRACTION)} of the "
+              f"{_mib(cap)} spool. Entries still expire 14 days after capture. To keep a result, cite it "
+              "(promote it into a storyboard, or cite it in a checkpoint).\n")
+    return EXIT_OK
+
+
 def cmd_status(args, adapter: PromoteAdapter, out=sys.stdout, err=sys.stderr) -> int:
     home = home_dir()
     root = evidence.default_root(home)
@@ -750,6 +804,21 @@ def cmd_status(args, adapter: PromoteAdapter, out=sys.stdout, err=sys.stderr) ->
     cap = evidence.spool_cap_bytes()
     out.write(f"spool: {root} ({n} entries in {sessions} sessions, {size / (1 << 20):.1f} of {cap >> 20} MiB; "
               f"entries are removed after 14 days, oldest first past the cap)\n")
+    held = evidence.holds(root)
+    live = [row for row in held if row[1]]
+    if live:
+        out.write(f"holds: {len(live)} session(s), {_mib(sum(row[2] for row in live))} protected while space "
+                  f"allows (at most {_mib(cap * evidence.HOLD_MAX_FRACTION)} in all; evicted after unheld "
+                  "sessions, still removed after 14 days)\n")
+    else:
+        out.write("holds: none\n")
+    for s, h, size, br in held:
+        line = f"  {s}: " + (f"held until {evidence.format_time(h['until'])} ({h['reason']}), {_mib(size)}" if h
+                             else "no hold")
+        if br:
+            line += (f"; {br['entries_removed']} entries evicted under disk pressure despite a hold "
+                     f"(last {clip(br['at'], 40)})")
+        out.write(line + "\n")
     rules = gate.load_rules(home, os.getcwd())
     for w in rules.warnings:
         out.write(f"evidence rules: ignored {w}\n")
@@ -771,7 +840,7 @@ def build_parser(prog: str = "cardinal-evidence") -> argparse.ArgumentParser:
         description="Cite any tool result from your agent sessions in a Cardinal storyboard: find, inspect and "
                     "promote locally captured evidence to captured receipts.",
     )
-    sub = p.add_subparsers(dest="command", metavar="{promote,list,find,show,off,on,status}")
+    sub = p.add_subparsers(dest="command", metavar="{promote,list,find,show,hold,off,on,status}")
     pr = sub.add_parser("promote", help="upload spool entries to a draft storyboard as captured receipts")
     pr.add_argument("--storyboard", metavar="SB_ID",
                     help="the draft storyboard (sb_...); default: the one storyboard created in this session")
@@ -796,14 +865,22 @@ def build_parser(prog: str = "cardinal-evidence") -> argparse.ArgumentParser:
     scope(fd, 20)
     sh = sub.add_parser("show", help="print one entry exactly as promote would cite it")
     sh.add_argument("evidence_id", metavar="ev_ID")
+    ho = sub.add_parser("hold", help="protect a session's captured evidence while space allows")
+    ho.add_argument("session", metavar="SESSION")
+    hg = ho.add_mutually_exclusive_group()
+    max_days = evidence.MAX_HOLD_S // 86400
+    hg.add_argument("--days", type=int, metavar="N",
+                    help=f"hold for N days (1-{max_days}, default {max_days}); entries still expire 14 days "
+                         "after capture")
+    hg.add_argument("--release", action="store_true", help="remove the session's hold")
     sub.add_parser("off", help="stop capturing tool results")
     sub.add_parser("on", help="resume capturing tool results")
-    sub.add_parser("status", help="capture state, spool size and upload target")
+    sub.add_parser("status", help="capture state, spool size, holds and upload target")
     return p
 
 
-HANDLERS = {"promote": cmd_promote, "list": cmd_list, "find": cmd_find, "show": cmd_show, "off": cmd_off,
-            "on": cmd_on, "status": cmd_status}
+HANDLERS = {"promote": cmd_promote, "list": cmd_list, "find": cmd_find, "show": cmd_show, "hold": cmd_hold,
+            "off": cmd_off, "on": cmd_on, "status": cmd_status}
 
 
 def main(argv: Optional[list], adapter: PromoteAdapter) -> int:
