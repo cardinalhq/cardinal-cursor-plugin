@@ -158,13 +158,6 @@ EVENT_CLASSES = (CONTROL, SEMANTIC, OWNER_INPUT)
 OWNER = "owner"
 OWNER_DECIDED = "owner.decided"
 READ_CLASSES = EVENT_CLASSES + (OWNER,)
-# cardinal-wake's lifecycle reports (conductor#2110): written by the waker
-# only, with the plugin connection. Deliberately NOT in READ_CLASSES or any
-# delivered type list: event_class answers None for them, so they are never
-# delivered or rendered to a model, and the cursor moves past them.
-WAKE = "wake"
-SESSION_WAKE = "session.wake"
-WRITE_ONLY_TYPES = (SESSION_WAKE,)
 CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,)   # for an event without `class` only
 OWNER_INPUT_TYPES = ("owner_input.recorded",)   # written by the prompt hook only (owner_input.py)
 GRANTEE = "grantee"                             # producer.principal.kind of an access grant's holder
@@ -549,7 +542,7 @@ def read_all(conn: dict, investigation_id: str, *, after: int, to_session_id: Op
 
 def append_event(conn: dict, investigation_id: str, type_: str, payload: dict, *, idempotency_key: str,
                  client: str, to_session_id: Optional[str] = None, session_id: Optional[str] = None,
-                 producer_client: Optional[str] = None, opener=None, timeout: float = 30.0) -> dict:
+                 producer_client: Optional[str] = None, opener=None) -> dict:
     """append-investigation-event: {event, duplicate?}. Never owner input:
     only the prompt hook records that (owner_input.py)."""
     if not valid_investigation(investigation_id):
@@ -571,7 +564,7 @@ def append_event(conn: dict, investigation_id: str, type_: str, payload: dict, *
         body["session_id"] = session_id
     if producer_client:
         body["client"] = producer_client
-    out = sync._post(conn, "append-investigation-event", body, client=client, opener=opener, timeout=timeout)
+    out = sync._post(conn, "append-investigation-event", body, client=client, opener=opener)
     ev = out.get("event")
     if not isinstance(ev, dict) or ev.get("investigation_id") != investigation_id or not isinstance(ev.get("seq"), int):
         raise ist.FetchError("append-investigation-event answered without the event")

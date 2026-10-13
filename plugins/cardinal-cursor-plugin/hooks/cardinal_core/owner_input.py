@@ -806,51 +806,11 @@ CONSENT_TEXT = ("Cardinal records the prompts you type in each {runtime} session
 DEDUPE_REPEATS = frozenset({"gemini"})
 REPEAT_WINDOW = 30.0
 
-# The first prompt `cardinal-wake resume` gives a stopped session the owner
-# resumes in their own terminal (docs/specs/resume-and-wake.md §5, v4),
-# fixed except for the owner decision's seq, the read cursor (seq - 1) and
-# the investigation id (twice). The decision text is never in it: the agent
-# reads it with storyboard__read_investigation_events, owner decisions only
-# (`after` = seq - 1 starts the page at the decision); the session's own
-# investigation hooks deliver it too, with the command that acknowledges it.
-# Listed in MACHINE_PROMPTS for every runtime (an exact match; both
-# investigation ids must be the same) so the resumed turn is never owner
-# input.
-WAKE_PROMPT = ("Cardinal resumed this session for owner decision #{seq} in Investigation {investigation}. "
-               "Read it with the storyboard__read_investigation_events tool (investigation_id {investigation}, "
-               'types ["owner.decided"], after {after}), act on it, and acknowledge it with the command Cardinal '
-               "shows with the decision.")
-_WAKE_SEQ_RE = "[1-9][0-9]{0,17}"
-_WAKE_INV_RE = "inv_[0-9a-f]{24}"
-
-
-def _wake_prompt_re() -> "re.Pattern[str]":
-    marked = re.escape(WAKE_PROMPT.format(seq="WAKESEQ", investigation="WAKEINV", after="WAKEAFTER"))
-    marked = marked.replace("WAKESEQ", f"(?P<seq>{_WAKE_SEQ_RE})", 1).replace("WAKESEQ", "(?P=seq)")
-    marked = marked.replace("WAKEINV", f"(?P<inv>{_WAKE_INV_RE})", 1).replace("WAKEINV", "(?P=inv)")
-    marked = marked.replace("WAKEAFTER", f"(?:0|{_WAKE_SEQ_RE})")
-    return re.compile(r"^\s*" + marked + r"\s*\Z")
-
-
-WAKE_PROMPT_RE = _wake_prompt_re()
-
-
-def wake_prompt(seq: int, investigation_id: str) -> str:
-    """WAKE_PROMPT for owner decision #seq (a positive int) of
-    `investigation_id` (inv_ + 24 hex)."""
-    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1 or seq >= 10 ** 18:
-        raise ValueError(f"not an event seq: {seq!r}")
-    if not (isinstance(investigation_id, str) and re.fullmatch(_WAKE_INV_RE, investigation_id)):
-        raise ValueError(f"not an investigation id: {investigation_id!r}")
-    return WAKE_PROMPT.format(seq=seq, investigation=investigation_id, after=seq - 1)
-
-
 # Prompts a runtime submits by itself, never a turn the owner took.
 MACHINE_PROMPTS = {
     # Claude Code re-enters UserPromptSubmit with a synthetic body when a
     # background task finishes ("<task-notification>…" / "task-notification …").
-    # `cardinal-wake resume`'s first prompt (WAKE_PROMPT): `claude --resume <sid> "<WAKE_PROMPT>"`.
-    "claude": (re.compile(r"^\s*<?task-notification[\s>]", re.IGNORECASE), WAKE_PROMPT_RE),
+    "claude": (re.compile(r"^\s*<?task-notification[\s>]", re.IGNORECASE),),
     # gemini-cli's loop recovery sends this as the request (_recoverFromLoop),
     # and /init submits its GEMINI.md template (performInit, gemini-cli
     # 0.63.0 packages/core/src/commands/init.ts). An MCP server's prompt
@@ -860,8 +820,6 @@ MACHINE_PROMPTS = {
         re.compile(r"^\s*System: Potential loop detected\b"),
         re.compile(r"^\s*You are an AI agent that brings the power of Gemini directly into the terminal\. "
                    r"Your task is to analyze the current directory and generate a comprehensive GEMINI\.md file"),
-        # `cardinal-wake resume`'s `gemini --resume <id> "<WAKE_PROMPT>"`.
-        WAKE_PROMPT_RE,
     ),
     # Codex submits these template prompts for /review's presets and /init's
     # AGENTS.md (captured from codex-cli 0.160.1 / 0.162.1 UserPromptSubmit
@@ -873,11 +831,7 @@ MACHINE_PROMPTS = {
         re.compile(r"^Review the code changes (?:introduced by commit|against the base branch) "
                    r"[\s\S]*Provide prioritized, actionable findings\.$"),
         re.compile(r"^Generate a file named AGENTS\.md that serves as a contributor guide for this repository\."),
-        # `cardinal-wake resume`'s `codex resume <sid> "<WAKE_PROMPT>"`.
-        WAKE_PROMPT_RE,
     ),
-    # `cardinal-wake resume`'s `cursor-agent --resume <sid> "<WAKE_PROMPT>"` (experimental).
-    "cursor": (WAKE_PROMPT_RE,),
 }
 
 # gemini-cli wraps hook context in <hook_context>…</hook_context> and inlines

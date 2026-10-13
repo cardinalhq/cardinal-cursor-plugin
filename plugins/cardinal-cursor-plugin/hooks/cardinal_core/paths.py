@@ -30,7 +30,7 @@ SESSION_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 # (evidence.default_root) under <home>/.cache/cardinal/sandboxed/.cardinal.
 # That spool and those bindings are agent-writable (the sandboxed agent can
 # write ~/.cache): readers treat them as untrusted hints, as they treat any
-# binding. cardinal-wake's own state (~/.cardinal/wake) is never relocated.
+# binding.
 SANDBOX_ENV = "SANDBOX"
 SEATBELT_SANDBOX = "sandbox-exec"
 SANDBOXED_HOME_PARTS = (".cache", "cardinal", "sandboxed")
