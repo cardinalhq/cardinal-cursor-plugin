@@ -2,6 +2,8 @@
 
 Use this workflow when the user asks for a storyboard visualization or asks to publish the storyboard. Giving a link, recording findings, or finishing an investigation does not itself authorize visualization authoring.
 
+An owner decision with intent `story.requested` (delivered as `OWNER DECISION (story requested)`, from the Story tab's Request story) is the owner asking: it authorizes updating this storyboard's visuals and previewing them. It does not authorize publishing (finalizing the act) or sharing unless the decision text asks for that.
+
 ## Author the same storyboard
 
 Use the session's bound `sb_…` and `inv_…` from its context, unless the person names an earlier session's storyboard to continue (see "Continue an earlier session's storyboard"). Never create a duplicate. If this runtime has no bound storyboard, use `storyboard__find` with the session id and context; create only when no suitable storyboard exists. Never edit another author's investigation just because it matches a search.
