@@ -119,6 +119,7 @@ from typing import Any, Callable, Iterator, Optional
 from . import investigation_state as ist
 from . import investigation_state_sync as sync
 from . import supervision_status as sv
+from .paths import in_seatbelt_sandbox, state_home
 
 try:  # POSIX only; without it (Windows) the binding is written unlocked.
     import fcntl
@@ -157,6 +158,13 @@ EVENT_CLASSES = (CONTROL, SEMANTIC, OWNER_INPUT)
 OWNER = "owner"
 OWNER_DECIDED = "owner.decided"
 READ_CLASSES = EVENT_CLASSES + (OWNER,)
+# cardinal-wake's lifecycle reports (conductor#2110): written by the waker
+# only, with the plugin connection. Deliberately NOT in READ_CLASSES or any
+# delivered type list: event_class answers None for them, so they are never
+# delivered or rendered to a model, and the cursor moves past them.
+WAKE = "wake"
+SESSION_WAKE = "session.wake"
+WRITE_ONLY_TYPES = (SESSION_WAKE,)
 CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,)   # for an event without `class` only
 OWNER_INPUT_TYPES = ("owner_input.recorded",)   # written by the prompt hook only (owner_input.py)
 GRANTEE = "grantee"                             # producer.principal.kind of an access grant's holder
@@ -244,7 +252,9 @@ def home_dir() -> Path:
 
 
 def sessions_dir(home: Path) -> Path:
-    return home / ".cardinal" / "investigations" / "sessions"
+    """~/.cardinal/investigations/sessions, or under the relocated state
+    home inside a seatbelt sandbox (paths.state_home)."""
+    return state_home(home) / ".cardinal" / "investigations" / "sessions"
 
 
 def valid_session(sid: Any) -> bool:
@@ -539,7 +549,7 @@ def read_all(conn: dict, investigation_id: str, *, after: int, to_session_id: Op
 
 def append_event(conn: dict, investigation_id: str, type_: str, payload: dict, *, idempotency_key: str,
                  client: str, to_session_id: Optional[str] = None, session_id: Optional[str] = None,
-                 producer_client: Optional[str] = None, opener=None) -> dict:
+                 producer_client: Optional[str] = None, opener=None, timeout: float = 30.0) -> dict:
     """append-investigation-event: {event, duplicate?}. Never owner input:
     only the prompt hook records that (owner_input.py)."""
     if not valid_investigation(investigation_id):
@@ -561,7 +571,7 @@ def append_event(conn: dict, investigation_id: str, type_: str, payload: dict, *
         body["session_id"] = session_id
     if producer_client:
         body["client"] = producer_client
-    out = sync._post(conn, "append-investigation-event", body, client=client, opener=opener)
+    out = sync._post(conn, "append-investigation-event", body, client=client, opener=opener, timeout=timeout)
     ev = out.get("event")
     if not isinstance(ev, dict) or ev.get("investigation_id") != investigation_id or not isinstance(ev.get("seq"), int):
         raise ist.FetchError("append-investigation-event answered without the event")
@@ -1811,6 +1821,52 @@ def last_activity(home: Path, sid: str) -> float:
         return activity_path(home, sid).stat().st_mtime
     except (OSError, ValueError):
         return 0.0
+
+
+def sandbox_turns_path(home: Path, sid: str) -> Path:
+    return sessions_dir(home) / f"{binding_path(home, sid).stem}.sandbox-turns.json"
+
+
+def record_sandbox_turn(home: Path, sid: str, environ: Optional[dict] = None,
+                        now: Optional[float] = None) -> None:
+    """Count one turn of session `sid` as run inside a seatbelt sandbox or
+    not (Gemini CLI's prompt hook; cardinal-wake requires every recorded
+    turn sandboxed before it would launch the session). A sandboxed turn is
+    counted under the relocated state home, an unsandboxed one under
+    ~/.cardinal. The record is agent-writable (a sandboxed agent can write
+    ~/.cache), so it is a hint, weaker than a runtime's own record. Never
+    raises."""
+    try:
+        if not valid_session(sid):
+            return
+        boxed = in_seatbelt_sandbox(environ)
+        home = state_home(home, environ)
+        now = time.time() if now is None else now
+        _ensure_dirs(home)
+        with locked(home, sid, wait=0.5) as got:
+            if not got:
+                return
+            data = sandbox_turns(home, sid)
+            key = "sandboxed" if boxed else "unsandboxed"
+            data[key] = data[key] + 1
+            data["last_at"] = _now_iso(now)
+            write_json(sandbox_turns_path(home, sid), data)
+    except Exception:
+        return
+
+
+def sandbox_turns(home: Path, sid: str) -> dict:
+    """{sandboxed, unsandboxed} turn counts recorded under `home`'s state
+    home (record_sandbox_turn); zeros when there is no record."""
+    try:
+        data = json.loads(sandbox_turns_path(home, sid).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    out = {}
+    for k in ("sandboxed", "unsandboxed"):
+        v = data.get(k) if isinstance(data, dict) else None
+        out[k] = v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+    return out
 
 
 def read_inbox(home: Path, sid: str, binding: Optional[dict] = None) -> Optional[dict]:

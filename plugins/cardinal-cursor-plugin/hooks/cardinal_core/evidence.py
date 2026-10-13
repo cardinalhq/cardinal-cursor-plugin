@@ -118,19 +118,31 @@ NO_SESSION = "no-session"
 # ---------------------------------------------------------------------------
 
 def default_root(home: Path) -> Path:
-    """The spool root under a user's home directory: ~/.cardinal/evidence."""
-    return Path(home) / ".cardinal" / "evidence"
+    """The spool root under a user's home directory: ~/.cardinal/evidence;
+    inside a seatbelt sandbox, a separate spool under the relocated state
+    home (paths.state_home: agent-writable, so its entries are what a
+    sandboxed agent's own process recorded)."""
+    from .paths import state_home
+    return state_home(Path(home)) / ".cardinal" / "evidence"
 
 
 def capture_disabled(root: Path, env: Optional[dict] = None) -> bool:
     """True when the user opted out: CARDINAL_EVIDENCE_CAPTURE=0 (or
-    false/off/no), or the flag file <root>/disabled exists."""
+    false/off/no), or the flag file <root>/disabled exists (for a relocated
+    sandboxed spool, the user's own ~/.cardinal/evidence/disabled too)."""
     env = os.environ if env is None else env
     v = str(env.get("CARDINAL_EVIDENCE_CAPTURE", "")).strip().lower()
     if v in ("0", "false", "off", "no"):
         return True
+    from .paths import is_sandboxed_home, unsandboxed_home
     try:
-        return (Path(root) / DISABLED_FLAG).exists()
+        root = Path(root)
+        if (root / DISABLED_FLAG).exists():
+            return True
+        holder = root.parent.parent   # <state home>/.cardinal/evidence
+        if root.name == "evidence" and is_sandboxed_home(holder):
+            return (unsandboxed_home(holder) / ".cardinal" / "evidence" / DISABLED_FLAG).exists()
+        return False
     except OSError:
         return True
 
