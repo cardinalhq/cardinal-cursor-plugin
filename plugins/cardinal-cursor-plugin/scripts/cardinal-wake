@@ -1,26 +1,36 @@
 #!/usr/bin/env python3
-"""cardinal-wake — owner-woken sessions (Cursor adapter): notify-only.
+"""cardinal-wake — owner-woken sessions (Cursor adapter).
 
 Run it in your own terminal (not through the agent):
-    cardinal-wake enable [--launch]   install the per-user launchd agent (macOS)
+    cardinal-wake enable              install the per-user launchd agent (macOS)
     cardinal-wake disable             remove it
-    cardinal-wake status              the setting, disabled runtimes, recent wakes, candidate sessions
+    cardinal-wake status              the setting, recent notifications, candidate sessions and their
+                                      resume commands
     cardinal-wake run [--once] [--dry-run]
-    cardinal-wake reenable codex      after a failed post-run sandbox check
+    cardinal-wake resume <session> [--print]
+                                      resume a session in this terminal (a unique 8+ hex prefix is enough)
 
-Cursor sessions are notify-only: when you post an owner decision on an
-Investigation page addressed to a stopped Cursor session, the waker shows a
-macOS notification and never resumes it, with or without --launch (no
-unattended Cursor resume has been shown to pass the wake gates,
-docs/specs/resume-and-wake.md §5.3). The same waker serves every plugin;
-Codex CLI sessions that only ever ran sandboxed can be resumed (--launch).
+When you post an owner decision on an Investigation page addressed to one
+of your sessions, the waker shows a macOS notification (never the
+decision's text). For a stopped session it names
+`~/.cardinal/wake/lib/cardinal-wake resume <session>`; with terminal-notifier
+installed, clicking it opens Terminal and runs that. `resume` runs the
+session's own runtime resume in its recorded working directory, with the
+decision as the first prompt:
+    claude --resume <session> "<wake prompt>"
+    codex resume <session> "<wake prompt>"   (a Codex desktop session opens in the app)
+    gemini --resume <session> "<wake prompt>"
+    cursor-agent --resume <session> "<wake prompt>"   (experimental)
+For a session that is still open it says to switch to that window. Nothing
+is ever launched unattended.
 
 The waker reads the investigation events with the Cardinal key of the
 plugin whose session it is (this plugin's: ~/.cursor/cardinal.json mcp_url +
 cardinal-secrets.json mcp_api_key). `enable` copies this plugin's
 cardinal_core and a small runner into ~/.cardinal/wake/lib/ (re-copied by
-every enable), so launchd never points into a versioned plugin directory.
-The implementation is cardinal_core.session_wake.
+every enable), so launchd and a notification's click never point into a
+versioned plugin directory. The implementation is
+cardinal_core.session_wake; see docs/specs/resume-and-wake.md §5.
 """
 
 import sys
