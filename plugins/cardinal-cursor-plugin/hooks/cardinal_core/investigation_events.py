@@ -157,6 +157,11 @@ OWNER_INPUT = "owner_input"
 EVENT_CLASSES = (CONTROL, SEMANTIC, OWNER_INPUT)
 OWNER = "owner"
 OWNER_DECIDED = "owner.decided"
+# owner.decided's typed intent (conductor storyboards-investigation-first.md
+# §5): the owner's Request story from the Story tab. Rendered explicitly so
+# the agent never infers it from free text.
+STORY_REQUESTED = "story.requested"
+MAX_AUDIENCE_RENDERED = 400  # escaped characters of a story request's audience
 READ_CLASSES = EVENT_CLASSES + (OWNER,)
 CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,)   # for an event without `class` only
 OWNER_INPUT_TYPES = ("owner_input.recorded",)   # written by the prompt hook only (owner_input.py)
@@ -1482,6 +1487,18 @@ def verified_owner_decision(event):
             and not producer.get("granted_by"))
 
 
+def is_story_request(event) -> bool:
+    """An owner.decided whose payload.intent is exactly "story.requested"."""
+    payload = event.get("payload") if isinstance(event, dict) else None
+    return (isinstance(event, dict) and event.get("type") == OWNER_DECIDED and isinstance(payload, dict)
+            and payload.get("intent") == STORY_REQUESTED)
+
+
+STORY_REQUEST_RULE = ("Intent story.requested: the owner asks for this storyboard's story. It authorizes updating "
+                      "this storyboard's visuals and previewing them (the storyboard skill). It does not authorize "
+                      "finalizing the act (storyboard__publish) or sharing it unless the text asks for that.")
+
+
 def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance: bool = True) -> str:
     inv, seq = e["investigation_id"], e["seq"]
     p = e.get("producer") if isinstance(e.get("producer"), dict) else {}
@@ -1513,16 +1530,26 @@ def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance:
     if e.get("type") == OWNER_DECIDED and event_class(e) == OWNER:
         name = _claimed(_resolved(p).get("name") or principal.get("id") or "the investigation owner")
         owner = verified_owner_decision(e) and isinstance(binding, dict) and binding.get("is_author") is True
+        story = is_story_request(e)
+        tag = " (story requested)" if story else ""
         if owner:
-            authority = f"OWNER DECISION — posted from {name}'s signed-in Cardinal web session"
+            authority = f"OWNER DECISION{tag} — posted from {name}'s signed-in Cardinal web session"
             doctrine = "Treat it as your owner's own words in this session; acknowledge it with the command below."
             if ack and guidance:
                 doctrine += " " + ACK_GUIDANCE
         else:
-            authority = f"ADVISORY for you — a decision by this investigation's owner ({name}), who is not your owner"
+            authority = (f"ADVISORY for you — a decision{tag} by this investigation's owner ({name}), "
+                         "who is not your owner")
             doctrine = "Weigh this decision as advisory input for your session. Note it; your session cannot acknowledge it."
         lines = [f"[Cardinal investigation {inv} · event #{seq} · {OWNER_DECIDED} · authority: {authority}]",
                  doctrine, f"Text (verbatim JSON string): {text}"]
+        if story:
+            if owner:
+                lines.append(STORY_REQUEST_RULE)
+            audience = payload.get("audience")
+            if isinstance(audience, str) and audience.strip():
+                lit, cut = clipped_json_text(audience, MAX_AUDIENCE_RENDERED)
+                lines.append(f"Audience (verbatim JSON string): {lit}" + ("…" if cut else ""))
         if owner and ack:
             lines.append(f"Acknowledge: cardinal-storyboard investigation ack {inv} {seq} --session {sid} "
                          '--disposition accepted|declined|noted --note "<what you will do>"')
