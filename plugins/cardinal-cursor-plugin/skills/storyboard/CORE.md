@@ -12,6 +12,17 @@ Use `storyboard__define_surface` and `storyboard__upsert_scene` to author the dr
 
 Draw what makes the finding understandable: a comparison, sequence, dependency, or before/after. Read the server's canvas guide for the available primitives, bindings, libraries and validation rules. Do not replace a clear visual with raw logs or decorative charts.
 
+## Tag the storyboard
+
+Tags are org-wide labels people filter and group storyboards by. Once the question is framed:
+
+1. Call `storyboard__list_tags`.
+2. Pick 1 to 3 tags that fit the investigation. Reuse an existing tag whenever one fits, even if its name is not your first choice.
+3. Call `storyboard__create_tag` only if none fit, with a lowercase-kebab name and a one-line description. If it returns an existing tag or lists similar ones, prefer those.
+4. Call `storyboard__set_tags`, and revisit the tags before publishing.
+
+If `storyboard__list_tags` is not available (an older Cardinal), skip tagging.
+
 ## Preview and revise
 
 Call `storyboard__preview`. Fix validation errors. Render the returned preview bundles using the adapter instructions in SKILL.md, then inspect every scene and reveal step. Check whether the point is clear, labels are readable, and nothing clips or overlaps. Revise and preview again as needed. Never claim visual review when rendering was unavailable; report that limitation.
@@ -20,7 +31,7 @@ Keep the same storyboard and leave the result private. Updating a visualization 
 
 ## Publish after updating
 
-A request to publish authorizes updating and reviewing the visualization, then publishing that reviewed draft. Refresh the scenes to reflect the latest findings and evidence before calling `storyboard__publish`; do not publish an empty or stale draft. Complete the preview and revision loop above first. If authoring, validation, or rendering fails, leave the storyboard in draft and report what remains.
+A request to publish authorizes updating and reviewing the visualization, then publishing that reviewed draft. Refresh the scenes to reflect the latest findings and evidence before calling `storyboard__publish`; do not publish a stale draft. An act with no scenes can be published: it publishes the investigation record so another agent can pick it up, but a public link still needs a published scene. Complete the preview and revision loop above first. If authoring, validation, or rendering fails, leave the storyboard in draft and report what remains.
 
 Call `storyboard__publish` only after those steps succeed, and verify that its response reports publication. Draft storyboards are visible only to their author. Publication makes the reviewed visualization visible to members of the organization; creating or extending public share links requires a separate explicit request. Honor any public-link and raw-evidence confirmations returned by the server.
 
