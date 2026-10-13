@@ -14,6 +14,8 @@ Commands (cardinal_core.evidence_promote, shared by every adapter):
   list [--tool GLOB] [--grep TEXT] [--withheld]  this session's entries
   find TEXT                                     entries containing TEXT
   show ev_...                                   one entry as it would be cited
+  hold SESSION [--days N] | --release           protect a session's evidence while
+                                                space allows (not retention)
   off | on | status
 
 promote uploads with the Cardinal MCP key `cardinal-connect` stored in

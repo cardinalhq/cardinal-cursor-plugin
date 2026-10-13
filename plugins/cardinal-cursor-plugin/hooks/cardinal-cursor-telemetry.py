@@ -1712,13 +1712,14 @@ def authoring_entry_owns(payload: dict[str, Any]) -> bool:
 
 def observe_cardinal(payload: dict[str, Any], conv_id: str) -> None:
     """Store the evidence token of Cardinal's storyboard__create / add_act
-    / preview (storyboard_authoring.observe_cardinal_result). Local only;
-    never raises."""
+    / preview, and hold this conversation's evidence after a successful
+    storyboard__checkpoint (storyboard_authoring.observe_cardinal_result).
+    Local only; never raises."""
     try:
         from cardinal_core import storyboard_authoring as sa
 
         raw = _first(payload, "tool_name", "toolName")
-        wait = MCP_SERVER_WAIT_SEC if isinstance(raw, str) and bare_mcp_tool(raw) in sa.TOKEN_TOOLS else 0.0
+        wait = MCP_SERVER_WAIT_SEC if isinstance(raw, str) and bare_mcp_tool(raw) in sa.OBSERVED_TOOLS else 0.0
         name, server = resolve_mcp_name(payload, conv_id, wait=wait)
         sa.observe_cardinal_result(PATHS, "cursor", name, _decode_json_container(_first(payload, "tool_output", "toolOutput")),
                                    session_id=conv_id, server=server)

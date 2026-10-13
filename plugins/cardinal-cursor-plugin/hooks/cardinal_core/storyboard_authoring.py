@@ -15,7 +15,9 @@ it; the other adapters call the same functions from their own hook events.
                           returns which image link previews use. NETWORK: one
                           PUT, bounded by UPLOAD_TIMEOUT_S.
   observe_cardinal_result after storyboard__create / add_act / preview: keep
-                          the storyboard's evidence token (evidence.store_token).
+                          the storyboard's evidence token (evidence.store_token);
+                          after a successful storyboard__checkpoint: hold the
+                          session's evidence (evidence.hold_after_checkpoint).
                           Local only.
   is_cardinal_tool        whether a tool name is Cardinal's own MCP server's
                           tool, in this runtime's naming.
@@ -938,6 +940,11 @@ def on_publish(paths: AgentPaths, runtime: str, tool_result: Any, *,
 # ---------------------------------------------------------------------------
 
 TOKEN_TOOLS = ("storyboard__create", "storyboard__preview", "storyboard__add_act")
+# storyboard__checkpoint: a success sets the session's evidence hold.
+CHECKPOINT_TOOL = "storyboard__checkpoint"
+# Every tool observe_cardinal_result acts on (an adapter that must resolve
+# an MCP name before calling it waits for these).
+OBSERVED_TOOLS = TOKEN_TOOLS + (CHECKPOINT_TOOL,)
 TOKEN_SPILL_BYTES = 16 << 20
 UPLOAD_PATH_RE = re.compile(r"^/api/orgs/([^/?#]+)/storyboards/(sb_[0-9a-f]{24})/evidence$")
 BUNDLE_PATH_RE = re.compile(r"^/api/orgs/([^/?#]+)/storyboards/(sb_[0-9a-f]{24})/scenes/")
@@ -979,6 +986,14 @@ def token_record(result: dict, known: dict) -> Optional[tuple]:
     return sb, org, token, result.get("evidence_token_expires_at")
 
 
+def _is_checkpoint_answer(obj: dict) -> bool:
+    """storyboard__checkpoint's success answer {investigation_id, events,
+    first_seq, last_seq} (duplicate: true included: the checkpoint exists)."""
+    seq = obj.get("first_seq")
+    return (isinstance(obj.get("investigation_id"), str) and isinstance(obj.get("events"), list)
+            and isinstance(seq, int) and not isinstance(seq, bool))
+
+
 def observe_cardinal_result(paths: AgentPaths, runtime: str, tool_name: Any, result: Any, *,
                             session_id: Any, server: Optional[str] = None, home: Optional[Path] = None,
                             environ: Optional[Mapping] = None) -> None:
@@ -987,15 +1002,24 @@ def observe_cardinal_result(paths: AgentPaths, runtime: str, tool_name: Any, res
     another server hands back is never stored, so no other server can point
     a later upload at its own storyboard), store the result's evidence token
     in <home>/.cardinal/evidence/<session_id>/token.json (0600, atomic,
-    keyed by storyboard id; evidence.store_token). Nothing while evidence
-    capture is off (CARDINAL_EVIDENCE_CAPTURE=0 or the disabled flag file).
-    `result`: the tool's MCP-shaped result. Local only, no output, never
-    raises."""
+    keyed by storyboard id; evidence.store_token). When it is Cardinal's
+    storyboard__checkpoint and the result is its success answer, hold this
+    session's evidence (evidence.hold_after_checkpoint: the MCP checkpoint
+    never passes through investigation_events.checkpoint, which sets the
+    same hold for the CLI). Nothing while evidence capture is off
+    (CARDINAL_EVIDENCE_CAPTURE=0 or the disabled flag file). `result`: the
+    tool's MCP-shaped result. Local only, no output, never raises."""
     try:
-        if not is_cardinal_tool(runtime, tool_name, TOKEN_TOOLS, server=server):
+        if not is_cardinal_tool(runtime, tool_name, OBSERVED_TOOLS, server=server):
             return
         from . import evidence
 
+        if is_cardinal_tool(runtime, tool_name, CHECKPOINT_TOOL, server=server):
+            if unwrap(result, _is_checkpoint_answer, spill_root=spill_root(paths, runtime),
+                      spill_max=TOKEN_SPILL_BYTES) is not None:
+                evidence.hold_after_checkpoint(Path(home) if home is not None else _home(environ), session_id,
+                                               None if environ is None else dict(environ))
+            return
         found = unwrap(result, _has_storyboard_id, spill_root=spill_root(paths, runtime),
                        spill_max=TOKEN_SPILL_BYTES)
         if found is None:

@@ -1008,8 +1008,9 @@ def upload_cited(conn: dict, investigation_id: str, session_id: str, ids: list, 
     for ev_id in ids:
         entry = evidence.read_entry(root, ev_id) if CAPTURED_REF_RE.fullmatch(str(ev_id)) else None
         if entry is None or entry.get("evidence_id") != ev_id:
-            bad.append(f"{_tok(ev_id)}: not in this machine's evidence spool (captured elsewhere, removed after 14 "
-                       "days, or capture was off)")
+            note = evidence.breach_note(root, ev_id)
+            bad.append(f"{_tok(ev_id)}: " + (note or "not in this machine's evidence spool (captured elsewhere, "
+                                             "removed after 14 days, or capture was off)"))
         elif promote.is_withheld(entry):
             bad.append(f"{ev_id}: {promote.withheld_reason(entry)}; nothing of that call was kept, so it cannot be "
                        "cited")
@@ -1096,7 +1097,9 @@ def checkpoint(conn: dict, investigation_id: str, session_id: str, events: Any, 
     The default key is checkpoint_key() of the events as cited. Cited ev_
     ids are then uploaded (upload_cited; it raises EvidenceRefused, and
     then nothing is posted) and replaced by their receipts. timing, when
-    given, gets "upload" (seconds). Returns the server's
+    given, gets "upload" (seconds). On success the session's local
+    evidence gets a best-effort hold (evidence.hold_after_checkpoint;
+    it never fails the checkpoint). Returns the server's
     answer {investigation_id, events, first_seq, last_seq, duplicate?} with
     the idempotency_key used. Raises CheckpointInputError (malformed),
     sync.ServerError (refused; checkpoint_unsupported / checkpoint_refusal
@@ -1145,6 +1148,13 @@ def checkpoint(conn: dict, investigation_id: str, session_id: str, events: Any, 
     if not ok:
         raise ist.FetchError("checkpoint-investigation answered without this checkpoint's events")
     out["idempotency_key"] = key
+    # This session's work may still be published: protect its uncited
+    # captures while space allows (best-effort; fail open).
+    try:
+        from . import evidence
+        evidence.hold_after_checkpoint(home or home_dir(), session_id)
+    except Exception:
+        pass
     return out
 
 
