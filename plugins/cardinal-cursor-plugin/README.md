@@ -385,7 +385,28 @@ python3 scripts/cardinal-storyboard investigation link --session <conversation i
 python3 scripts/cardinal-disconnect
 python3 scripts/cardinal-disconnect --force
 python3 scripts/cardinal-checks on|off|status
+python3 scripts/cardinal-wake enable|disable|status|run --dry-run
 ```
+
+## Owner-woken sessions (notify-only)
+
+`python3 scripts/cardinal-wake enable` (macOS; a per-user launchd agent)
+watches for owner decisions you post on an Investigation page addressed to
+a stopped session on this machine. For a Cursor session the result is
+always a macOS notification naming the session (short id), the
+Investigation and the state, never the decision's text. The waker never
+resumes a Cursor session, with or without `--launch`: no unattended Cursor
+resume has been shown to pass the wake gates
+([`docs/specs/resume-and-wake.md`](../../docs/specs/resume-and-wake.md)
+§5.3). Only a decision posted from your signed-in Cardinal web session
+counts; the waker reads it from Cardinal with this plugin's key, never from
+local files. It recognizes a Cursor session by its records under
+`~/.cursor/projects/*/agent-transcripts/` or `~/.cursor/chats/*/<id>/` when
+they exist (best effort; otherwise the notification says the runtime is
+unknown). The same waker resumes eligible Codex CLI sessions; the Codex
+plugin's README ("Owner-woken sessions") has the rules and the trust
+boundary. `disable` removes the agent; `status` shows recent wakes, never
+decision text.
 
 ## Known Cursor issues
 

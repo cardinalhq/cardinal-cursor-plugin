@@ -21,6 +21,52 @@ from typing import Any
 
 SESSION_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]")
 
+# Cardinal's per-session state home inside a whole-process seatbelt sandbox
+# (Gemini CLI's `-s`: it runs the CLI, hooks included, under sandbox-exec and
+# sets SANDBOX=sandbox-exec inside). Its profiles let a process write the
+# workspace, temp and cache dirs and ~/.cache, never ~/.cardinal, so the
+# hooks keep their Investigation binding / inbox / cursor / poller files
+# (investigation_events.sessions_dir) and evidence spool
+# (evidence.default_root) under <home>/.cache/cardinal/sandboxed/.cardinal.
+# That spool and those bindings are agent-writable (the sandboxed agent can
+# write ~/.cache): readers treat them as untrusted hints, as they treat any
+# binding. cardinal-wake's own state (~/.cardinal/wake) is never relocated.
+SANDBOX_ENV = "SANDBOX"
+SEATBELT_SANDBOX = "sandbox-exec"
+SANDBOXED_HOME_PARTS = (".cache", "cardinal", "sandboxed")
+
+
+def in_seatbelt_sandbox(environ: Any = None) -> bool:
+    """This process runs inside a whole-process seatbelt sandbox (SANDBOX=sandbox-exec)."""
+    env = os.environ if environ is None else environ
+    return env.get(SANDBOX_ENV) == SEATBELT_SANDBOX
+
+
+def sandboxed_home(home: Path) -> Path:
+    """The relocated Cardinal state home for `home`: <home>/.cache/cardinal/sandboxed."""
+    home = Path(home)
+    return home if is_sandboxed_home(home) else home.joinpath(*SANDBOXED_HOME_PARTS)
+
+
+def is_sandboxed_home(home: Path) -> bool:
+    return tuple(Path(home).parts[-len(SANDBOXED_HOME_PARTS):]) == SANDBOXED_HOME_PARTS
+
+
+def unsandboxed_home(home: Path) -> Path:
+    """The user's home for a (possibly relocated) state home."""
+    home = Path(home)
+    return home.parents[len(SANDBOXED_HOME_PARTS) - 1] if is_sandboxed_home(home) else home
+
+
+def state_home(home: Path, environ: Any = None) -> Path:
+    """Where Cardinal's per-session state lives: `home` (its ~/.cardinal), or
+    sandboxed_home(home) inside a seatbelt sandbox. The one place this is
+    decided; idempotent (a relocated home stays as it is)."""
+    home = Path(home)
+    if is_sandboxed_home(home):
+        return home
+    return sandboxed_home(home) if in_seatbelt_sandbox(environ) else home
+
 
 def safe_session(session_id: str) -> str:
     return SESSION_SAFE_RE.sub("_", session_id)[:128]
