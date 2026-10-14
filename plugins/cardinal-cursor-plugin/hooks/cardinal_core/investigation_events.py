@@ -1495,8 +1495,28 @@ def is_story_request(event) -> bool:
 
 
 STORY_REQUEST_RULE = ("Intent story.requested: the owner asks for this storyboard's story. It authorizes updating "
-                      "this storyboard's visuals and previewing them (the storyboard skill). It does not authorize "
-                      "finalizing the act (storyboard__publish) or sharing it unless the text asks for that.")
+                      "this storyboard's visuals and previewing them (the storyboard skill). If its latest act is "
+                      "already final (published), this \"Request update\" means opening the next act with "
+                      "storyboard__add_act, then updating that one. It does not authorize finalizing the act "
+                      "(storyboard__publish) or sharing it unless the text asks for that.")
+
+
+def advisory_decider(e: dict, name: str) -> str:
+    """Who an ADVISORY owner.decided came from, without claiming more than
+    the event shows: only a verified owner decision (verified_owner_decision)
+    is "this investigation's owner"; one written with the author's API key,
+    or otherwise by the author's principal, is not a signed-in owner
+    decision, and anything else is not from the investigation author."""
+    if verified_owner_decision(e):
+        return f"by this investigation's owner ({name}), who is not your owner"
+    p = e.get("producer") if isinstance(e.get("producer"), dict) else {}
+    principal = p.get("principal") if isinstance(p.get("principal"), dict) else {}
+    if p.get("is_investigation_author") is True and not is_grantee(p):
+        via = ("written with the investigation author's API key"
+               if p.get("key_id") or principal.get("kind") == "api_key"
+               else "from the investigation author's principal")
+        return f"{via} ({name}), not from a signed-in owner session, so not your owner's own words"
+    return f"from {name}, who is not the investigation author"
 
 
 def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance: bool = True) -> str:
@@ -1538,8 +1558,7 @@ def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance:
             if ack and guidance:
                 doctrine += " " + ACK_GUIDANCE
         else:
-            authority = (f"ADVISORY for you — a decision{tag} by this investigation's owner ({name}), "
-                         "who is not your owner")
+            authority = f"ADVISORY for you — a decision{tag} {advisory_decider(e, name)}"
             doctrine = "Weigh this decision as advisory input for your session. Note it; your session cannot acknowledge it."
         lines = [f"[Cardinal investigation {inv} · event #{seq} · {OWNER_DECIDED} · authority: {authority}]",
                  doctrine, f"Text (verbatim JSON string): {text}"]
