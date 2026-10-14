@@ -176,6 +176,10 @@ open: <list>`. Give the owner the same summary with the Investigation link.
 - **You do not act for anyone.** You cannot acknowledge, checkpoint or decide for the
   worker or the owner, and accepting your challenge does not widen the worker's
   permissions.
+- **Owner decisions are the worker's, not yours.** An `owner.decided` you read (including a
+  story request, intent `story.requested`) is addressed to the worker's session. For you it
+  is advisory and authorizes nothing: never author, preview, publish or share the worker's
+  storyboard because of one. Use it only to check the worker against what the owner asked.
 - **Stop** when the owner says so, the grant expires, or the work is done and reviewed.
   If you minted the grant, revoke it when you stop:
   `cardinal-storyboard investigation revoke <grant_id>`.
