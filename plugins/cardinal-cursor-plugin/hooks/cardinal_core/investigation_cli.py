@@ -14,6 +14,7 @@ from . import investigation_bootstrap as boot
 from . import investigation_consumer as consumer
 from . import investigation_grants as gr
 from . import investigation_text
+from . import owner_relay
 
 EXIT_USAGE = 2
 
@@ -899,6 +900,215 @@ class CLI:
             sys.stdout.write(ie.checkpoint_line(out) + "\n")
         return 0
 
+    # -- relayed owner decisions (supervisor side). Nothing here sends a
+    # decision: only the prompt hook relays one, when the owner approves it.
+
+    def cmd_propose_decision(self, args: argparse.Namespace) -> int:
+        sid = self._session_arg(args)
+        if not sid:
+            return EXIT_USAGE
+        worker = args.investigation_id or args.investigation
+        if worker is None or not self._investigation_arg(worker):
+            if worker is None:
+                print("not proposed: name the worker's investigation (inv_...)", file=sys.stderr)
+            return EXIT_USAGE
+        owner_relay.validate(worker, args.to_session, args.text, args.answers, args.ref)
+        home = self._home()
+        code = self._can_relay(home, sid, worker, "not proposed")
+        if code is not None:
+            return code
+        answers = None
+        if args.answers is not None:
+            answers = self._answered(worker, args.answers)
+            if answers is None:
+                return EXIT_USAGE
+        entry = owner_relay.propose(home, sid, worker, args.to_session, args.text, answers=args.answers,
+                                    refs=args.ref or None)
+        if args.json:
+            out = {**entry, "instruction": owner_relay.INSTRUCTION.format(id=entry["id"])}
+            if answers:
+                out["answers_line"] = answers
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return 0
+        when = time.strftime("%H:%M", time.localtime(entry["expires_at"]))
+        print(f"proposed {entry['id']}: an owner decision for session {args.to_session} of {worker} "
+              f"(expires at {when} local time, in 30 minutes; nothing was sent)")
+        print("--- decision text ---")
+        print(entry["text"])
+        print("--- end ---")
+        if answers:
+            print(answers)
+        print(owner_relay.INSTRUCTION.format(id=entry["id"]) + f" Tell the owner it expires at {when}.")
+        off = self._relay_off_line()
+        if off:
+            print("Tell the owner too: " + off)
+        return 0
+
+    def _answered(self, worker: str, seq: int):
+        """The line saying what --answers points at ("answers #N: <type>
+        <excerpt>"), read with this machine's key; None (printed why) when it
+        is a supervisor's challenge or ruling, which a relayed decision
+        cannot answer (the server refuses it: only a web decision overrules
+        those). Unreadable: a line saying so (the server checks it)."""
+        conn, client = self.connection()
+        try:
+            page = ie.read_events(conn, worker, after=seq - 1, limit=1, client=client, timeout=5.0)
+            e = next((e for e in page["events"] if e.get("seq") == seq), None)
+        except Exception:
+            e = None
+        if e is None:
+            return f"answers #{seq} (not read here; Cardinal checks it when the owner approves)"
+        typ = e.get("type") if isinstance(e.get("type"), str) else "event"
+        if typ in (ie.CHALLENGE, ie.RULING):
+            print(f"not proposed: #{seq} is a supervisor's {'challenge' if typ == ie.CHALLENGE else 'ruling'}; a "
+                  "relayed decision cannot answer or overrule it (only a decision posted from the Investigation "
+                  "page on the web can). Drop --answers, or tell the owner to overrule it on the web.",
+                  file=sys.stderr)
+            return None
+        payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
+        text = payload.get("text") if isinstance(payload.get("text"), str) else ""
+        return f"answers #{seq}: {ie._tok(typ)} {owner_relay.excerpt(text, 80)}" if text \
+            else f"answers #{seq}: {ie._tok(typ)}"
+
+    def _can_relay(self, home: Path, sid: str, worker: str, what: str):
+        """None when supervisor session `sid` can relay owner decisions to
+        `worker`, else the exit code (the reason printed)."""
+        b = ie.read_binding(home, sid)
+        if not b:
+            print(f"{what}: session {sid} has no investigation yet; the relay names this supervisor session's "
+                  "own Investigation (run `cardinal-storyboard investigation link`)", file=sys.stderr)
+            return 1
+        if b.get("is_author") is not True:
+            print(f"{what}: session {sid} joined someone else's investigation; only a session that authors "
+                  "its own Investigation can relay an owner decision", file=sys.stderr)
+            return 1
+        if b["investigation_id"] == worker:
+            print(f"{what}: {worker} is this session's own investigation; a relayed decision goes to the "
+                  "worker you supervise", file=sys.stderr)
+            return EXIT_USAGE
+        conn, client = self.connection()
+        if not isinstance(conn, dict) or not conn.get("key") or conn.get("token"):
+            print(f"{what}: this machine is not connected to Cardinal with its own key (run cardinal-connect); "
+                  "the owner's decisions are relayed with it", file=sys.stderr)
+            return 1
+        if not ie.capability(b, owner_relay.CAPABILITY):
+            b = ie.refresh_binding_capabilities(home, sid, conn, client) or b
+        if not ie.capability(b, owner_relay.CAPABILITY):
+            print(f"{what}: " + owner_relay.NOT_CAPABLE, file=sys.stderr)
+            return 1
+        self._relay_binding = b
+        return None
+
+    def _relay_off_line(self) -> str:
+        """The owner's relay setting as this Cardinal reported it
+        (capabilities.owner_relay.on_for_caller): a line when it is off,
+        "" when on or unknown."""
+        caps = (getattr(self, "_relay_binding", None) or {}).get("capabilities") or {}
+        cap = caps.get(owner_relay.CAPABILITY) if isinstance(caps, dict) else None
+        if not isinstance(cap, dict) or cap.get("on_for_caller") is not False:
+            return ""
+        conn, _ = self.connection()
+        link = owner_relay.settings_link(cap.get("settings_url"), (conn or {}).get("origin"))
+        where = link or "your Cardinal settings page (Settings, Investigations)"
+        return f"Relayed decisions are off for your account: turn them on once at {where} (web only)."
+
+    def cmd_supervising(self, args: argparse.Namespace) -> int:
+        sid = self._session_arg(args)
+        if not sid:
+            return EXIT_USAGE
+        home = self._home()
+        worker = args.investigation_id or args.investigation
+        if args.remove:
+            if args.name is None and worker is None:
+                raise ValueError("--remove takes --name, or the worker's investigation (and --to-session)")
+            gone = owner_relay.remove_target(home, sid, name=args.name, investigation_id=worker,
+                                             to_session_id=args.to_session)
+            if not gone:
+                print("no such target in this session", file=sys.stderr)
+                return 1
+            print("removed " + ", ".join(owner_relay._target_label(t) for t in gone))
+            return 0
+        if worker is None:
+            ts = owner_relay.targets(home, sid)
+            if args.json:
+                print(json.dumps({"targets": ts}, indent=2))
+                return 0
+            if not ts:
+                print(f"no worker target in session {sid}")
+            for t in ts:
+                print(f"{t.get('name') or '(no name)'} -> session {t['to_session_id']} of {t['investigation_id']}")
+            return 0
+        if args.to_session is None:
+            raise ValueError("supervising <worker_inv> needs --to-session <worker_sid>")
+        owner_relay.validate_target(worker, args.to_session, args.name)
+        code = self._can_relay(home, sid, worker, "not registered")
+        if code is not None:
+            return code
+        t = owner_relay.add_target(home, sid, worker, args.to_session, args.name, replace=args.replace)
+        if args.json:
+            print(json.dumps(t, indent=2))
+            return 0
+        n = len(owner_relay.targets(home, sid))
+        form = f"decide {t['name']}: <text>" if t.get("name") else "decide: <text>"
+        print(f"registered {owner_relay._target_label(t)} of {worker} as a worker target ({n} in this session; "
+              "nothing was sent).")
+        print(f"The owner can now type `{form}` here to send that worker their own words as an owner decision"
+              + (" (bare `decide:` while it is the only target)." if t.get("name") else
+                 " (while it is the only target; add --name to tell several apart).")
+              + " Never type it for them.")
+        off = self._relay_off_line()
+        if off:
+            print("Tell the owner too: " + off)
+        return 0
+
+    def cmd_proposals(self, args: argparse.Namespace) -> int:
+        sid = self._session_arg(args)
+        if not sid:
+            return EXIT_USAGE
+        home = self._home()
+        entries = owner_relay.pending(home, sid)
+        done = owner_relay.recent(home, sid)
+        ts = owner_relay.targets(home, sid)
+        if args.json:
+            print(json.dumps({"proposals": entries, "targets": ts, "recent": done}, indent=2, ensure_ascii=False))
+            return 0
+        for t in ts:
+            print(f"target {t.get('name') or '(no name)'} -> session {t['to_session_id']} of {t['investigation_id']}")
+        if not entries:
+            print(f"no pending owner-decision proposal in session {sid}")
+        for e in entries:
+            line = (f"{e['id']} -> session {e['to_session_id']} of {e['investigation_id']}, expires "
+                    f"{ie._now_iso(e['expires_at'])}")
+            if e.get("answers") is not None:
+                line += f", answers #{e['answers']}"
+            if e.get("uncertain"):
+                line += ", may already have been delivered (a send got no answer)"
+            print(line)
+            print(f"  Text (verbatim JSON string): {ie.json_text(e['text'])}")
+        for r in done:
+            print(f"recent {r['id']} ({ie._tok(r.get('outcome'))}, {ie._now_iso(r['at'])}): "
+                  f"{ie._one_line(r['message'], 600)}")
+        return 0
+
+    def cmd_withdraw_proposal(self, args: argparse.Namespace) -> int:
+        sid = self._session_arg(args)
+        if not sid:
+            return EXIT_USAGE
+        pid = args.proposal_id
+        if not isinstance(pid, str) or not owner_relay.ID_RE.fullmatch(pid):
+            print(f"not a proposal id: {pid!r} (dp_ followed by 16 hex characters)", file=sys.stderr)
+            return EXIT_USAGE
+        entry = owner_relay.withdraw(self._home(), sid, pid)
+        if entry is None:
+            print(f"{pid} is not pending in session {sid} (expired, withdrawn or already handled)", file=sys.stderr)
+            return 1
+        if entry.get("uncertain"):
+            print(f"withdrew {pid}; it may already have been delivered (an earlier send got no answer): check the "
+                  "worker's Investigation")
+        else:
+            print(f"withdrew {pid}; nothing was sent")
+        return 0
+
 
 def not_recorded(err, *, outbox=None):
     reason = ie._one_line(err, 500)
@@ -920,7 +1130,8 @@ def build_parser(wiring, session_env=()):
         prog="cardinal-storyboard investigation",
         description=(
             "Owner authority comes from the owner's own words: in the session transcript, or in an owner decision "
-            "posted from the owner's signed-in Cardinal web session. Advisory input carries no owner authority."
+            "posted from the owner's signed-in Cardinal web session or relayed from their supervisor session. "
+            "Advisory input carries no owner authority."
         ),
     )
     sub = parser.add_subparsers(dest="action", required=True)
@@ -943,6 +1154,10 @@ def build_parser(wiring, session_env=()):
         "reviewed",
         "show",
         "verify",
+        "propose-decision",
+        "supervising",
+        "proposals",
+        "withdraw-proposal",
     ):
         p = sub.add_parser(
             action,
@@ -974,7 +1189,7 @@ def build_parser(wiring, session_env=()):
             ),
         )
         p.set_defaults(investigation_id=None)
-        if action in ("events", "show", "post", "bind", "attach"):
+        if action in ("events", "show", "post", "bind", "attach", "propose-decision", "supervising"):
             p.add_argument("investigation_id", nargs=None if action in ("bind", "attach") else "?")
         if action in ("events", "reviewed"):
             p.add_argument(
@@ -1063,6 +1278,21 @@ def build_parser(wiring, session_env=()):
         elif action == "verify":
             p.add_argument("target", help="event seq or semantic_id")
             p.add_argument("--root", type=Path)
+        elif action == "propose-decision":
+            p.description = owner_relay.PROPOSE_HELP
+            p.add_argument("--to-session", required=True, help="the worker's session id")
+            p.add_argument("--text", required=True, help="the decision, verbatim (1-4000 characters)")
+            p.add_argument("--answers", type=int, metavar="SEQ", help="the worker event it answers")
+            p.add_argument("--ref", action="append", default=[], help="a reference (repeatable, at most 20)")
+        elif action == "supervising":
+            p.description = owner_relay.SUPERVISING_HELP
+            p.add_argument("--to-session", help="the worker's session id")
+            p.add_argument("--name", help="a short name for `decide <name>: …` (a-z, 0-9, -; at most 32)")
+            p.add_argument("--remove", action="store_true", help="drop the target (by --name, or by id and session)")
+            p.add_argument("--replace", action="store_true",
+                           help="move --name here from a target of another investigation")
+        elif action == "withdraw-proposal":
+            p.add_argument("proposal_id", help="dp_...")
     return parser
 
 
@@ -1082,6 +1312,8 @@ def normalize_argv(argv):
         "--exclude-self",
         "--include-self",
         "--owner-input",
+        "--remove",
+        "--replace",
         "--help",
         "-h",
     }
@@ -1115,7 +1347,13 @@ def cli_main(argv, wiring, session_env=(), *, legacy=False):
     args = build_parser(wiring, session_env).parse_args(normalize_argv(argv))
     cli = CLI(wiring, args, legacy)
     try:
-        if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify", "rule"):
+        if cli.scoped and args.action in ("propose-decision", "supervising"):
+            print(f"not {'proposed' if args.action == 'propose-decision' else 'registered'}: an owner decision is "
+                  "relayed with this machine's own key, never with an access grant; run "
+                  f"{args.action} without --credential-file and without CARDINAL_INVESTIGATION_TOKEN", file=sys.stderr)
+            return EXIT_USAGE
+        if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify", "rule", "proposals",
+                                              "withdraw-proposal"):
             return EXIT_USAGE if not cli._author_only("not recorded") else 0
         if args.action == "post" and (args.type is None or args.text is None):
             raise ValueError("post requires type and text (positional or --type/--text)")
@@ -1133,7 +1371,7 @@ def cli_main(argv, wiring, session_env=(), *, legacy=False):
                 return EXIT_USAGE
             conn, client, inv = got
             return investigation_artifacts.verify(conn, inv, args.target, root=args.root, client=client)
-        return getattr(cli, "cmd_" + args.action)(args)
+        return getattr(cli, "cmd_" + args.action.replace("-", "_"))(args)
     except (ValueError, ie.CheckpointInputError) as e:
         print(ie._one_line(e, 1000), file=sys.stderr)
         if (

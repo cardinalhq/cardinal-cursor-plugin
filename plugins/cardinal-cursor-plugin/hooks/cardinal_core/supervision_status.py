@@ -20,8 +20,11 @@ core/tests/testdata/supervision-statuses.json).
                        "#<ruling seq>" or "#<challenge seq>"
   conflicted           the worker answered the directive `conflicts`, citing
                        the owner's words (owner_seq)
-  overruled            an owner.decided whose `answers` is the challenge or
-                       its ruling; wins over every other status (owner_seq)
+  overruled            an owner decision posted from the web (authority
+                       owner_decision) whose `answers` is the challenge or its
+                       ruling; wins over every other status (owner_seq). A
+                       relayed one (owner_relayed) or one without an
+                       authority overrules nothing (overrules_supervision)
 
 Each status is {"status", "ruling_seq", "owner_seq"} (None when absent).
 The server validates every write (one position per session, one ruling per
@@ -67,6 +70,14 @@ SEMANTIC_CLASS = "semantic"
 SEMANTIC_TYPES = ("hypothesis.proposed", "hypothesis.resolved", "experiment.started", "experiment.completed",
                   "experiment.revised", "finding.proposed", "finding.revised", "finding.retracted",
                   "decision.proposed", "decision.revised", "question.opened", "question.resolved")
+
+
+def overrules_supervision(e: dict) -> bool:
+    """An owner.decided that may overrule a challenge or ruling: posted from
+    the owner's signed-in web session (authority owner_decision). A relayed
+    one carries the owner's machine key, which the supervised agent holds
+    too, so it overrules nothing."""
+    return e.get("type") == OWNER_DECIDED and e.get("authority") == "owner_decision"
 
 
 def _int(v: Any) -> Optional[int]:
@@ -141,8 +152,8 @@ def challenge_statuses(events: Any) -> Dict[int, dict]:
     challenge.added in `events` (any order; non-dicts and events without an
     integer seq are ignored). For challenge seq c, first match wins:
 
-    1. overruled: an owner.decided answers c or c's ruling (owner_seq: the
-       lowest such decision).
+    1. overruled: a web owner decision (overrules_supervision) answers c or
+       c's ruling (owner_seq: the lowest such decision).
     2. The ruling = the lowest-seq ruling.issued with ruling_of c. Not upheld
        -> withdrawn. Upheld (seq r): the position is the LATEST author ack of
        r with disposition accepted / conflicts: none -> directive; conflicts
@@ -165,7 +176,7 @@ def challenge_statuses(events: Any) -> Dict[int, dict]:
             c = _seq(_payload(e).get("ruling_of"))
             if c is not None and c not in rulings:
                 rulings[c] = e
-        elif e.get("type") == OWNER_DECIDED:
+        elif overrules_supervision(e):
             a = _seq(_payload(e).get("answers"))
             if a is not None and a not in answered_by:
                 answered_by[a] = e["seq"]

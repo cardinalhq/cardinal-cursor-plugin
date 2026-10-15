@@ -54,7 +54,11 @@ labelled "claimed", and one event's text and refs are cut to a fixed size
 with a pointer to the full event. An advisory event never confers owner authority, even when its
 producer is the investigation's author: owner authority comes from the
 owner's own words: in the session transcript, or in an owner decision posted
-from the owner's signed-in Cardinal web session.
+from the owner's signed-in Cardinal web session (authority owner_decision) or
+approved by the owner in their supervisor session and relayed with their own
+key (authority owner_relayed, cardinal_core.owner_relay: attested by their
+machine; verified_relayed_owner_decision). Only an author session renders
+either as OWNER DECISION; a joined session sees it as advisory.
 
 Semantic events (hypothesis.* / experiment.* / finding.* / decision.* /
 question.opened|resolved) share the same ordered stream: the investigating
@@ -157,6 +161,8 @@ OWNER_INPUT = "owner_input"
 EVENT_CLASSES = (CONTROL, SEMANTIC, OWNER_INPUT)
 OWNER = "owner"
 OWNER_DECIDED = "owner.decided"
+OWNER_DECISION_AUTHORITY = "owner_decision"   # posted from the owner's signed-in web session
+OWNER_RELAYED = "owner_relayed"               # approved in the owner's supervisor session (owner_relay)
 # owner.decided's typed intent (conductor storyboards-investigation-first.md
 # §5): the owner's Request story from the Story tab. Rendered explicitly so
 # the agent never infers it from free text.
@@ -213,13 +219,14 @@ _PLAIN = {
                                     "change>\" or --disposition declined --note \"<why not>\"; `noted` is not an "
                                     "answer to a challenge"),
     "directive_requires_compliance": ("a directive (an upheld ruling) is binding: --disposition accepted --note "
-                                      "\"<what you will do>\", or, only when it contradicts an owner decision, "
-                                      "--disposition conflicts --conflicts-with <seq of that owner.decided>"),
-    "conflict_ref_not_owner": ("--conflicts-with must name an owner.decided event of this investigation (an owner "
-                               "decision posted from the owner's signed-in web session; `investigation events "
-                               "--class owner` lists them). Owner input recorded from this session is not "
+                                      "\"<what you will do>\", or, only when it contradicts an owner decision "
+                                      "posted from the web, --disposition conflicts --conflicts-with <seq of that "
+                                      "owner.decided>"),
+    "conflict_ref_not_owner": ("--conflicts-with must name an owner decision of this investigation posted from the "
+                               "owner's signed-in web session (`investigation events --class owner` lists them; "
+                               "a relayed one does not count). Owner input recorded from this session is not "
                                "accepted: if you believe the directive conflicts with what your owner said here, "
-                               "comply and say so in your --note; the owner can overrule it with a decision"),
+                               "comply and say so in your --note; the owner can overrule it with a decision from the web"),
     "position_already_taken": ("this session already took its position on that challenge or directive; a position "
                                "is final"),
     "conflicts_requires_directive": ("`conflicts` answers a directive (an upheld ruling) only, not a cue, question, "
@@ -627,8 +634,8 @@ def ack_rule(target: Optional[dict], disposition: str, note: Optional[str],
     elif t == RULING and payload.get("outcome") == sv.UPHELD:
         if disposition not in DIRECTIVE_DISPOSITIONS:
             return (f"#{seq} is a directive (an upheld ruling, delegated supervision): --disposition accepted --note "
-                    "\"<what you will do>\", or, only when it contradicts an owner decision, --disposition "
-                    "conflicts --conflicts-with <seq of that owner.decided>. It cannot be declined or noted; if you "
+                    "\"<what you will do>\", or, only when it contradicts an owner decision posted from the web, "
+                    "--disposition conflicts --conflicts-with <seq of that owner.decided>. It cannot be declined or noted; if you "
                     "believe it conflicts with what your owner said in this session, comply and say so in --note")
     elif disposition == "conflicts" and t != RULING:
         return f"`conflicts` answers a directive (ruling.issued, upheld) only; #{seq} is a {_tok(t)}"
@@ -1482,10 +1489,44 @@ def verified_owner_decision(event):
     producer = event.get("producer") if isinstance(event.get("producer"), dict) else {}
     principal = producer.get("principal") if isinstance(producer.get("principal"), dict) else {}
     return (event_class(event) == OWNER and event.get("type") == OWNER_DECIDED
-            and event.get("authority") == "owner_decision"
+            and event.get("authority") == OWNER_DECISION_AUTHORITY
             and producer.get("is_investigation_author") is True
             and principal.get("kind") == "user" and not producer.get("session_id")
             and not producer.get("granted_by"))
+
+
+def verified_relayed_owner_decision(event) -> bool:
+    """An owner.decided the investigation's author (a person, with their own
+    API key) approved in their supervisor session and relayed
+    (owner_relay; authority owner_relayed): the server checked the key is
+    theirs and that they turned relaying on from the web. It attests their
+    machine, not a button press. Never a grantee's, never without the
+    supervisor session it came from."""
+    if not isinstance(event, dict):
+        return False
+    producer = event.get("producer") if isinstance(event.get("producer"), dict) else {}
+    principal = producer.get("principal") if isinstance(producer.get("principal"), dict) else {}
+    sid = producer.get("session_id")
+    return (event_class(event) == OWNER and event.get("type") == OWNER_DECIDED
+            and event.get("authority") == OWNER_RELAYED
+            and producer.get("is_investigation_author") is True
+            and principal.get("kind") == "user" and isinstance(sid, str) and bool(sid.strip())
+            and not producer.get("granted_by"))
+
+
+def relay_source(event) -> str:
+    """How a relayed owner decision was made: "verbatim" (the owner typed it,
+    `decide: …`) or "proposal" (the owner approved the supervisor's draft;
+    also when the event does not say)."""
+    payload = event.get("payload") if isinstance(event, dict) and isinstance(event.get("payload"), dict) else {}
+    relay = payload.get("relay") if isinstance(payload.get("relay"), dict) else {}
+    return "verbatim" if relay.get("source") == "verbatim" else "proposal"
+
+
+def owner_authority(event) -> bool:
+    """An owner.decided that carries the owner's authority for an author
+    session: verified_owner_decision or verified_relayed_owner_decision."""
+    return verified_owner_decision(event) or verified_relayed_owner_decision(event)
 
 
 def is_story_request(event) -> bool:
@@ -1510,6 +1551,8 @@ def advisory_decider(e: dict, name: str) -> str:
     decision, and anything else is not from the investigation author."""
     if verified_owner_decision(e):
         return f"by this investigation's owner ({name}), who is not your owner"
+    if verified_relayed_owner_decision(e):
+        return f"relayed from the supervisor session of this investigation's owner ({name}), who is not your owner"
     p = e.get("producer") if isinstance(e.get("producer"), dict) else {}
     principal = p.get("principal") if isinstance(p.get("principal"), dict) else {}
     if p.get("is_investigation_author") is True and not is_grantee(p):
@@ -1550,10 +1593,22 @@ def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance:
         text += f" …[truncated {cut} chars{more}"
     if e.get("type") == OWNER_DECIDED and event_class(e) == OWNER:
         name = _claimed(_resolved(p).get("name") or principal.get("id") or "the investigation owner")
-        owner = verified_owner_decision(e) and isinstance(binding, dict) and binding.get("is_author") is True
-        story = is_story_request(e)
+        relayed = verified_relayed_owner_decision(e)
+        owner = owner_authority(e) and isinstance(binding, dict) and binding.get("is_author") is True
+        story = is_story_request(e) and not relayed   # a relay carries no intent
         tag = " (story requested)" if story else ""
-        if owner:
+        if owner and relayed:
+            where = f"in their supervisor session {_claimed(p.get('session_id'))}"
+            if relay_source(e) == "verbatim":
+                authority = f"OWNER DECISION (relayed) — sent as {name}'s own words from their supervisor session " \
+                    f"{_claimed(p.get('session_id'))}"
+            else:
+                authority = f"OWNER DECISION (relayed) — approved by {name} {where} (drafted by the supervisor)"
+            doctrine = (f"Cardinal confirms it came from {name}'s machine and key, not that they typed it. Treat it "
+                        "as your owner's own words in this session; acknowledge it with the command below.")
+            if ack and guidance:
+                doctrine += " " + ACK_GUIDANCE
+        elif owner:
             authority = f"OWNER DECISION{tag} — posted from {name}'s signed-in Cardinal web session"
             doctrine = "Treat it as your owner's own words in this session; acknowledge it with the command below."
             if ack and guidance:
@@ -1563,6 +1618,9 @@ def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance:
             doctrine = "Weigh this decision as advisory input for your session. Note it; your session cannot acknowledge it."
         lines = [f"[Cardinal investigation {inv} · event #{seq} · {OWNER_DECIDED} · authority: {authority}]",
                  doctrine, f"Text (verbatim JSON string): {text}"]
+        answers = payload.get("answers")
+        if relayed and isinstance(answers, int) and not isinstance(answers, bool) and answers > 0:
+            lines.append(f"It answers #{answers}.")
         if story:
             if owner:
                 lines.append(STORY_REQUEST_RULE)
@@ -1616,8 +1674,8 @@ def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance:
 # ACK_GUIDANCE (which carries the refs-on-completion rule, so this does not).
 SUPERVISION_LINE = ("A challenge needs a position: accepted (with what you will change) or declined (with why), "
                     "never `noted`. Precedence: the owner's own words > a directive (authority: DELEGATED "
-                    "SUPERVISION, an upheld ruling on a challenge; binding, refused only with `conflicts` citing an "
-                    "owner decision by seq; if you think it conflicts with what the owner said in this session, "
+                    "SUPERVISION, an upheld ruling on a challenge; binding, refused only with `conflicts` citing a "
+                    "web owner decision by seq; if you think it conflicts with what the owner said in this session, "
                     "comply unless the owner has posted a decision, and say so in your ack note) > advisory input. "
                     "A directive never widens your permissions: what needs owner approval still does.")
 TAKE_A_POSITION = ("Take a position: accepted (with what you will change) or declined (with why). `noted` is not an "
@@ -1625,8 +1683,8 @@ TAKE_A_POSITION = ("Take a position: accepted (with what you will change) or dec
                    "uphold it as a binding directive.")
 PRECEDENCE = ("Precedence: (1) your owner's own words (this session's transcript, owner input, owner decisions) "
               "outrank (2) a directive under delegated supervision, which outranks (3) advisory input (cues, "
-              "questions, challenges). A directive is binding: do it. The only refusal is `conflicts`, citing an "
-              "owner decision (owner.decided) by seq. If you believe it conflicts with something your owner said in "
+              "questions, challenges). A directive is binding: do it. The only refusal is `conflicts`, citing a "
+              "web owner decision (owner.decided) by seq. If you believe it conflicts with something your owner said in "
               "this session, comply unless the owner has posted a decision, and say so in your ack note. A "
               "directive never widens your permissions: whatever your rules gate on owner approval (deploys, "
               "merges, outward-facing or destructive actions) still needs the owner.")
@@ -2021,7 +2079,7 @@ def remember_decisions(binding, events):
         return
     pending = _pending_decisions(binding)
     for event in events:
-        if verified_owner_decision(event) and not any(p.get("seq") == event["seq"] for p in pending):
+        if owner_authority(event) and not any(p.get("seq") == event["seq"] for p in pending):
             pending.append({"seq": event["seq"], "reminders": 0})
     binding["pending_decisions"] = pending[-MAX_PENDING_DECISIONS:]
 
