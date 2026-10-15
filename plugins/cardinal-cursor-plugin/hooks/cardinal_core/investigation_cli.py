@@ -978,7 +978,10 @@ def build_parser(wiring, session_env=()):
             p.add_argument("investigation_id", nargs=None if action in ("bind", "attach") else "?")
         if action in ("events", "reviewed"):
             p.add_argument(
-                "--cursor-file", type=Path, help="#190 durable pending-page review state (requires grant)"
+                "--cursor-file", type=Path,
+                help="#190 durable pending-page review state (requires grant)"
+                     + ("; with --follow and no --auto-review, a watch from the committed position"
+                        if action == "events" else ""),
             )
         if action == "repos":
             p.add_argument("--cwd", action="append", default=[], help="checkout to attach; repeat for multiple repos; saved edits are replayed too")
@@ -1047,11 +1050,13 @@ def build_parser(wiring, session_env=()):
             p.add_argument("--type", dest="event_type", action="append", default=[])
             p.add_argument("--follow", action="store_true")
             p.add_argument(
-                "--auto-review", action="store_true", help="print then commit each full pending batch"
+                "--auto-review", action="store_true",
+                help="with --cursor-file: print then commit each full pending batch (without it, "
+                     "--follow is a watch that never commits)"
             )
             p.add_argument("--interval", type=float, default=5)
             p.add_argument("--timeout", type=float)
-            p.add_argument("--max", type=int, help="stop after N displayed events")
+            p.add_argument("--max", type=int, help="stop after N displayed events (a watch: after that page)")
             p.add_argument("--exclude-self", action="store_true", default=None)
             p.add_argument("--include-self", dest="exclude_self", action="store_false")
             p.add_argument("--fields", choices=("full", "compact"), default="full")

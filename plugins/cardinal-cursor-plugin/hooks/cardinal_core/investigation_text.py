@@ -33,6 +33,7 @@ session. Standard library only; nothing here reads files or the network.
 """
 from __future__ import annotations
 
+import os
 import shlex
 from typing import Optional
 
@@ -199,21 +200,25 @@ def session_text(sid: str, binding: dict, *, cmd: str = CLAUDE_CMD, target: str 
 
 def watch_command(investigation_id: str, *, credential_file: Optional[str] = None,
                   cmd: str = CLAUDE_CMD) -> str:
-    """The one command a supervisor runs to watch an investigation: every new
-    event as it arrives, one compact JSON page at a time. credential_file: a
-    grant's `--out` file (without it, the grant's export line in the
-    environment, or the member key)."""
-    cred = f" --credential-file {shlex.quote(credential_file)}" if credential_file else ""
-    return f"{cmd} events {investigation_id}{cred} --follow --json --fields compact"
+    """The one command a grantee runs to watch an investigation: a line per
+    event its review cursor (next to a grant's `--out` file, else in the
+    supervise skill's default directory) has not committed, so re-running it
+    skips what was committed."""
+    if credential_file:
+        cred = f" --credential-file {shlex.quote(credential_file)}"
+        cursor = shlex.quote(os.path.join(os.path.dirname(credential_file), "cursor.json"))
+    else:
+        cred, cursor = "", f"~/.cardinal/supervise/{shlex.quote(investigation_id)}/cursor.json"
+    return f"{cmd} events {investigation_id}{cred} --cursor-file {cursor} --follow"
 
 
 WATCH_GUIDANCE = """\
-Watching another session's investigation (supervising):
-  cardinal-storyboard investigation events <inv> --follow --json --fields compact
-  --follow replaces hand-written polling loops (sleep, re-read, diff): it
-  prints each new page as it arrives, every --interval seconds (default 5),
-  until --timeout, --max or Ctrl-C. Run ONE --follow per watched
-  investigation, never several on the same one.
+Watching another session's investigation (supervising, with a grant):
+  cardinal-storyboard investigation events <inv> --cursor-file <dir>/cursor.json --follow
+  prints a line per event your review cursor has not committed (re-running
+  it skips what you committed) and never commits. --follow replaces hand-written
+  polling loops: it reads every --interval seconds (default 5) until
+  --timeout, --max or Ctrl-C. Run ONE --follow per watched investigation.
   --exclude-self is the default under --follow with a session (--session,
   or this runtime's session id from the environment) or a grant: your own
   posts and acks are not echoed back; --include-self shows them.

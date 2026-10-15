@@ -136,12 +136,15 @@ def run(args, conn, inv, *, client, legacy_line=None):
             raise ValueError("--cursor-file requires a scoped credential")
         if args.after:
             raise ValueError("--after cannot override a review cursor")
-        if args.follow and not args.auto_review:
-            raise ValueError("--follow with --cursor-file requires --auto-review")
+    # --follow --cursor-file without --auto-review is a watch: it starts at the
+    # committed review position and never reads or writes the pending page. It
+    # is a wake signal, so --max never cuts a page: it returns after the page
+    # that reaches it (--max 1: the first non-empty page).
+    watch = bool(args.cursor_file) and args.follow and not args.auto_review
     if args.exclude_self and not args.session and not conn.get("token"):
         print("--exclude-self needs --session for a member reader; nothing is excluded", file=sys.stderr)
     deadline = time.monotonic() + args.timeout if args.timeout else None
-    cursor, count, failures = args.after, 0, 0
+    cursor, count, failures = (consumer.committed(conn, args.cursor_file) if watch else args.after), 0, 0
     # Claude compatibility lists all pages as one answer. Explicit [inv] also drains the stream.
     explicit = bool(args.investigation_id or args.investigation)
     drain = not args.follow and not args.cursor_file and (explicit or legacy_line is not None)
@@ -154,7 +157,7 @@ def run(args, conn, inv, *, client, legacy_line=None):
             if deadline is not None and time.monotonic() >= deadline:
                 return 0
             try:
-                if args.cursor_file:
+                if args.cursor_file and not watch:
                     page = consumer.read(conn, args.cursor_file, client=client)
                 else:
                     timeout = min(30.0, max(0.1, deadline - time.monotonic())) if deadline else 30.0
@@ -208,7 +211,7 @@ def run(args, conn, inv, *, client, legacy_line=None):
                 if isinstance(e, dict) and isinstance(e.get("seq"), int):
                     seen[e["seq"]] = e
             n, complete = display(
-                page, args, legacy_line=legacy_line, maximum=args.max - count if args.max else None,
+                page, args, legacy_line=legacy_line, maximum=args.max - count if args.max and not watch else None,
                 statuses=sv.challenge_statuses(list(seen.values())),
             )
             count += n

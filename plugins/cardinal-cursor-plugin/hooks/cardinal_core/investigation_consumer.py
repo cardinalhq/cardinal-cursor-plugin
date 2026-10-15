@@ -88,6 +88,13 @@ def load(path: Path, conn: dict) -> dict:
     return state
 
 
+def committed(conn: dict, path: Path) -> int:
+    """The reviewed position, read-only and unlocked (a review may hold the
+    lock): where a watch starts, so re-arming it signals only unreviewed
+    events instead of the whole history."""
+    return load(path, conn)["after"]
+
+
 def read(conn: dict, path: Path, *, client: str) -> dict:
     with locked(path):
         state = load(path, conn)
