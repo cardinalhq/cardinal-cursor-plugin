@@ -39,6 +39,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -129,6 +130,36 @@ def consume_staged(home: Path, sid: str) -> List[str]:
 # Boundaries
 # ---------------------------------------------------------------------------
 
+def naming_reminder(home: Path, sid: str, *, repeat: bool = False) -> Optional[str]:
+    """One local reminder per turn until the author states the question.
+
+    Never read a transcript or send a prompt. Unknown status and joined
+    investigations are deliberately silent. A failed naming request leaves
+    the status provisional, so the next turn can retry.
+    """
+    try:
+        with ie.locked(home, sid, wait=0) as got:
+            if not got:
+                return None
+            b = ie.read_binding(home, sid)
+            if (not b or b.get("is_author") is not True or b.get("question_status") != "provisional"
+                    or (b.get("question_reminded") and not repeat)):
+                return None
+            b["question_reminded"] = True
+            ie.write_binding(home, sid, b)
+        return (
+            "This session's investigation still has the default title. Once the user's task is clear, "
+            "name it now with `cardinal-storyboard investigation question --session "
+            f"{shlex.quote(sid)} \"<short description of the user's task>\"`. "
+            "Use a concise, one-line description of the actual request, including implementation or review tasks. "
+            "Do not wait for findings or a request to publish. This is your statement of the task, not owner "
+            "authority. If the user has not stated a task yet, leave it provisional; if the request fails, "
+            "continue the user's work and retry on a later turn."
+        )
+    except Exception:
+        return None
+
+
 def at_tool(home: Path, sid: str, org: Optional[str], runtime: str, *, is_subagent: bool) -> Delivery:
     """A tool boundary of session `sid`. A subagent's (is_subagent) gets
     nothing and changes nothing: no output, the inbox, the cursor and the
@@ -151,6 +182,9 @@ def at_tool(home: Path, sid: str, org: Optional[str], runtime: str, *, is_subage
         # Count the boundary; re-surface what is still owed only when nothing
         # else was delivered at it.
         ie.resurface(home, sid, None if (delivered or out.agent_context) else out.agent_context.append)
+        reminder = naming_reminder(home, sid)
+        if reminder:
+            out.agent_context.append(reminder)
     except Exception:
         pass
     return out
@@ -180,6 +214,13 @@ def at_turn_end(home: Path, sid: str, conn: Optional[dict], client: str, runtime
             _turn_end_events(home, sid, conn or {}, client, environ, stop_hook_active, deadline, parts.append)
         except Exception:
             pass
+        b = ie.read_binding(home, sid)
+        from . import investigation_grants
+        if (can_block(runtime) and not stop_hook_active and b and b.get("org") == (conn or {}).get("org")
+                and not investigation_grants.token_set(environ)):
+            reminder = naming_reminder(home, sid, repeat=True)
+            if reminder:
+                parts.append(reminder)
         if parts:
             if can_block(runtime):
                 out.turn_end_block = "\n\n".join(parts)
@@ -193,6 +234,12 @@ def at_turn_end(home: Path, sid: str, conn: Optional[dict], client: str, runtime
         with contextlib.suppress(Exception):
             from . import owner_input
             owner_input.turn_ended(home, sid)
+        with contextlib.suppress(Exception):
+            with ie.locked(home, sid, wait=0) as got:
+                b = ie.read_binding(home, sid) if got else None
+                if b:
+                    b["question_reminded"] = False
+                    ie.write_binding(home, sid, b)
     return out
 
 
@@ -223,4 +270,7 @@ def at_prompt(home: Path, sid: str, runtime: str) -> Delivery:
     context. No network. Never raises."""
     out = Delivery()
     out.agent_context.extend(consume_staged(home, sid))
+    reminder = naming_reminder(home, sid, repeat=True)
+    if reminder:
+        out.agent_context.append(reminder)
     return out

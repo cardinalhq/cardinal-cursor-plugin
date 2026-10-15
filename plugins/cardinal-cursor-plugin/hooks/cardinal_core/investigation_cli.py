@@ -503,6 +503,7 @@ class CLI:
         if not self._author_only("question not set"):
             return EXIT_USAGE
         inv_id = args.investigation
+        sid = args.session
         if inv_id is None:
             sid = self._session_arg(args)
             if not sid:
@@ -516,8 +517,6 @@ class CLI:
             inv_id = b["investigation_id"]
         elif not self._investigation_arg(inv_id):
             return EXIT_USAGE
-        own = args.session
-        sid = getattr(args, "session", None) or own
         if not args.text.strip() or len(args.text) > sync.MAX_INVESTIGATION_QUESTION:
             sys.stderr.write(
                 f"question not set: the question is 1 to {sync.MAX_INVESTIGATION_QUESTION} characters (this one has {len(args.text)})\n"
@@ -535,6 +534,17 @@ class CLI:
             return 1
         except ist.FetchError as e:
             return not_recorded(e)
+        # Only a confirmed server write ends naming reminders. Resolve the
+        # environment-derived session too, and never update a different binding.
+        if ie.valid_session(sid):
+            try:
+                with ie.locked(self._home(), sid, wait=0.5) as got:
+                    b = ie.read_binding(self._home(), sid) if got else None
+                    if b and b["investigation_id"] == inv_id and b.get("org") == conn.get("org"):
+                        b["question_status"] = "stated"
+                        ie.write_binding(self._home(), sid, b)
+            except OSError:
+                pass  # Naming succeeded remotely; a local cache failure cannot undo it.
         if args.json:
             print(json.dumps(out, indent=2, ensure_ascii=False))
             return 0

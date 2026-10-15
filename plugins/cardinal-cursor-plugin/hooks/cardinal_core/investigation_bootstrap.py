@@ -426,6 +426,8 @@ def refresh_capabilities(home: Path, sid: str, conn: dict, client: str, *, opene
         cur = ie.read_binding(home, sid)
         if cur is not None and cur["investigation_id"] == inv:
             cur["capabilities"] = caps
+            if not refused and out.get("question_status") in ("provisional", "stated"):
+                cur["question_status"] = out["question_status"]
             _owner_input_gate(home, sid, cur)
             ie.write_binding(home, sid, cur)
     with contextlib.suppress(OSError):
