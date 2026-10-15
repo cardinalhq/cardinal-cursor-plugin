@@ -69,6 +69,7 @@ happened.
    and skip the rest. Otherwise tell the owner once: "You can send the worker an owner
    decision from here: type `decide: <your decision>` and it goes to the worker in your own
    words; or I can draft one for you to `approve <id>`."
+6. **Set the work budget and run the opening step back** (Step backs, below).
 
 ## The review loop
 
@@ -88,7 +89,7 @@ Wake on new events (SKILL.md says how in this agent), then:
    `cardinal-evidence show <ev_…>` for any call you need in full.
 3. **Review**, by event type (below). Do your own checks with your own tools.
 4. **Post** what the review found (below).
-5. **Commit the page only now**:
+5. **Commit the page only now** (with a direction set, tagged and marked: Step backs):
 
    ```
    cardinal-storyboard investigation reviewed --investigation <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --batch <hash>
@@ -193,6 +194,61 @@ the owner's approval, and never type or simulate the owner's prompt.
 - `cardinal-storyboard investigation proposals --session <your_sid>` lists the targets,
   pending drafts and latest outcomes; `withdraw-proposal <id> --session <your_sid>` drops a
   draft; `supervising --remove --name <name> --session <your_sid>` drops a target.
+
+## Step backs on a work budget
+
+Step backs catch an approach bigger than the question needs. Below, `budget …` is
+`cardinal-storyboard investigation budget <inv> --credential-file <dir>/grant.json
+--budget-file <dir>/budget.json …`. The worker never sees budgets, rates or triggers; no post
+names them.
+
+**Each new direction** (set-up; a new question, scope change or pivot from the owner): write a
+facts brief `<dir>/brief-<n>.md`, never your suggestions:
+
+- the owner's current question;
+- the facts that matter for the design, each with its `#seq`;
+- the constraints, each tagged owner, worker or policy, with its `#seq`;
+- the worker's current approach: its components and mechanisms;
+- the code's path and commit.
+
+Then `budget pass estimator --brief <brief> --worker-session <worker_sid>` and `budget pass
+stepback --brief <brief>`, and a fresh-context pass on each copy they write (SKILL.md says
+how; never in your own context, never with the worker's estimate). Save the estimator's JSON
+as `<dir>/plan-<n>.json`:
+
+```
+budget --set --plan <dir>/plan-<n>.json --question "<the owner's question>" --worker-session <worker_sid> --session <your_sid> [--since-seq <the direction's first event>] [--worker-estimate "<what the worker said>"]
+```
+
+Tell the owner in at most two lines the range, its basis, the worker's estimate beside it,
+and any step-back question for them. Corrections: `budget --set --amend --plan <file>`.
+
+**Each review pass**: on the commit, tag each worker event with the milestone(s) it advances
+or `none`, and mark each deliverable the page proves: `reviewed … --tag 208-215:<m> --tag
+220:none --tag 255:<m>+<m2> --done <m>.1@#255` (also `--reopen`, `--redone`; `--tag all:<m>`
+for a one-milestone page). Each `FIRE step back` line is one step back on that milestone
+(`all`: the whole direction): a brief with the worker's approach to it, `budget pass stepback
+--brief <brief> --milestone <m>`, and the pass.
+
+**Route what it found** by who owns the cost:
+
+- A component only an **owner** constraint requires, or an owner constraint with a material
+  price: ask the owner in this terminal, naming the cost; a change goes by `decide:` or a draft
+  they approve.
+- A component the **worker** chose, or an existing mechanism it missed: `--type question` to
+  the worker: `Step back: <the simpler design; existing code at file:line; what it would
+  remove; what could not be verified>`.
+- "On track", or nothing to remove: post nothing; one line in your summary.
+
+Record it: `budget verdict <m|opening|all> on_track|worker_choice|owner_constraint [--post-ref
+"#<seq>"]`; once answered, `budget outcome <m|opening|all> <outcome> [--ref …]` (`declined`
+only when you agree with the decline). Never repeat a point the worker declined or the owner
+overruled without new evidence. A decline you still disagree with goes to the owner once, with
+the worker's argument.
+
+**When the direction ends**: `budget --close --outcome done|stopped|replaced [--missed <m>,…]`
+(reworked or pivoted with no step back). After every 5 recorded outcomes, show the owner
+`budget calibrate`.
 
 ## When the work is done: review the artifacts
 

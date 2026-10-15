@@ -169,6 +169,8 @@ OWNER_RELAYED = "owner_relayed"               # approved in the owner's supervis
 STORY_REQUESTED = "story.requested"
 MAX_AUDIENCE_RENDERED = 400  # escaped characters of a story request's audience
 READ_CLASSES = EVENT_CLASSES + (OWNER,)
+SUPERVISION_RECORDS = "supervision"   # a supervisor's own records (record-supervision): read by their author only,
+                                      # never delivered or rendered (investigation_budget rebuilds its cache from them)
 CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,)   # for an event without `class` only
 OWNER_INPUT_TYPES = ("owner_input.recorded",)   # written by the prompt hook only (owner_input.py)
 GRANTEE = "grantee"                             # producer.principal.kind of an access grant's holder
@@ -495,7 +497,7 @@ def read_events(conn: dict, investigation_id: str, *, after: int = 0, limit: int
     (READ_CLASSES)."""
     if not valid_investigation(investigation_id):
         raise ist.FetchError(f"not an investigation id: {investigation_id!r}")
-    if class_ is not None and class_ not in READ_CLASSES:
+    if class_ is not None and class_ not in READ_CLASSES + (SUPERVISION_RECORDS,):
         raise ist.FetchError(f"the class is one of {', '.join(READ_CLASSES)}")
     body: dict = {"investigation_id": investigation_id, "after": int(after), "limit": int(limit)}
     if to_session_id is not None:

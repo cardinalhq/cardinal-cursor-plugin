@@ -112,12 +112,19 @@ def read(conn: dict, path: Path, *, client: str) -> dict:
         return page
 
 
+def pending(conn: dict, path: Path):
+    """The outstanding page (None when there is none), read under the lock."""
+    with locked(path):
+        return load(path, conn).get("pending")
+
+
 def reviewed(conn: dict, path: Path, batch: str) -> dict:
     with locked(path):
         state = load(path, conn)
         pending = state.get("pending")
         if not pending or pending.get("batch") != batch:
-            raise ValueError("batch is not the outstanding read; cursor unchanged")
+            raise ValueError("--batch is not the outstanding read (cursor unchanged): pass the batch of the page you "
+                             "read last, or read it again with --cursor-file")
         state["after"] = pending["next_after"]
         state["pending"] = None
         private_write(path, state)

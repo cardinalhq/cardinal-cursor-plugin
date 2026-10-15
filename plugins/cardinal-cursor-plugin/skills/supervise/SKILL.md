@@ -41,6 +41,14 @@ When the owner types `decide: …`, `approve <id>` or `reject <id>`, Cardinal's 
 acts on it and shows them the outcome instead of passing the prompt to you; you get the
 outcome at your next tool call. Run nothing to send or approve it.
 
+## Fresh-context passes (step backs)
+
+Step backs (CORE.md) do not run in Cursor. Keep the plan and its review: answer the copy
+`budget pass estimator` wrote yourself, starting `reference_class` with "estimated in the
+supervisor's context". At the opening and at each `FIRE`, tell the owner in one line that the
+step back needs a Claude, Codex or Gemini supervisor, and give them the copy `budget pass
+stepback` wrote.
+
 ## Doing your own checks
 
 Reproduce claims read-only: read files, `git log` / `git diff`, Cardinal query tools
