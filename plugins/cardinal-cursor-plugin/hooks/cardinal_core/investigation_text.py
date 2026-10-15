@@ -174,9 +174,11 @@ def session_text(sid: str, binding: dict, *, cmd: str = CLAUDE_CMD, target: str 
     parts.append(SKILL_LINE.format(sb=sb))
     stated = binding.get("question_status") == "stated" if question_stated is None else question_stated
     if not stated:
-        parts.append("Once the user has clearly said what they want to find out, record it with "
+        parts.append("Once the user has clearly said what they want to find out or get done, immediately record "
+                     "a concise, one-line description of that task with "
                      f"`{_cmd(cmd, 'question', target)} \"<their question>\"` (your statement of it, not "
-                     "owner authority); do not invent one.")
+                     "owner authority); do not invent one. Implementation and review requests also name an "
+                     "investigation; do not wait for findings or a request to publish.")
     if told:
         parts.append(told)
     parts.append(ADVISORY_LINE)
