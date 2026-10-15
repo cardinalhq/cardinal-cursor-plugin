@@ -38,6 +38,12 @@ specific:
     detached), only after the user consented in their own terminal
     (`cardinal-connect --owner-input on`): Cursor has no user-visible,
     non-blocking channel for a per-session disclosure. Never blocks;
+  * relayed owner decisions on beforeSubmitPrompt (cardinal_core.owner_relay):
+    the owner's `decide: <text>` or `approve|reject dp_…` relays (or drops)
+    an owner decision (bounded, only for such a prompt). Such a prompt is
+    blocked ({continue: false, user_message: <the outcome>}), the only way
+    Cursor shows the owner a hook's words; the outcome is also staged for
+    the model's next postToolUse;
   * storyboard authoring (cardinal_core.storyboard_authoring): the preview
     render and hero upload in a matcher-scoped postToolUse entry with a
     long timeout (`--role authoring`), the evidence token on every tool, the
@@ -562,9 +568,19 @@ def handle_before_submit_prompt(payload: dict[str, Any]) -> None:
     except Exception:
         pass
 
-    # Owner input (only with the user's connect-time consent) and the
-    # discovery re-look: neither waits on the network here, and neither
-    # ever blocks the prompt or prints anything.
+    # The owner's decision or approval (owner_relay: a bounded request, only
+    # for such a prompt): the prompt is blocked and the outcome shown to the
+    # owner (user_message shows only for a blocked prompt). Then owner input
+    # (only with the user's connect-time consent) and the discovery re-look:
+    # neither waits on the network here, blocks the prompt or prints.
+    relayed = relay_owner_decision(payload, conv_id)
+    if relayed:
+        try:
+            sys.stdout.write(json.dumps({"continue": False, "user_message": relayed}))
+            sys.stdout.flush()
+        except Exception:
+            pass
+        return
     capture_owner_input(payload, conv_id, cwd)
     spawn_relook(conv_id, cwd)
 
@@ -1523,6 +1539,43 @@ def capture_owner_input(payload: dict[str, Any], conv_id: str, cwd: str) -> str:
         return got.status
     except Exception:
         return "error"
+
+
+# ---------------------------------------------------------------------------
+# Relayed owner decisions (beforeSubmitPrompt): cardinal_core.owner_relay.
+# When the owner's whole prompt is `decide: <text>` (their own words, relayed
+# verbatim to the registered worker), `approve dp_…` (bare `approve` for the
+# only pending proposal) or `reject dp_…`, the decision is relayed to the
+# worker with this machine's key (bounded, ~3 s; only for such a prompt) or
+# dropped. Cursor's beforeSubmitPrompt shows the user a hook's words only for
+# a blocked prompt (user_message), so such a prompt is blocked with the
+# outcome as user_message: the owner reads Cardinal's own words, not the
+# model's retelling. The model never sees that prompt; the outcome is staged
+# for its next tool boundary, and `cardinal-storyboard investigation
+# proposals` lists recent outcomes. Independent of owner-input capture and
+# consent.
+# ---------------------------------------------------------------------------
+
+def relay_owner_decision(payload: dict[str, Any], conv_id: str) -> str | None:
+    """The outcome to show the owner (the prompt is then blocked), or None
+    (not a relay form here: the prompt goes on). Never raises."""
+    try:
+        from cardinal_core import owner_relay
+
+        if not owner_relay.wanted(Path.home(), conv_id, payload.get("prompt")):
+            return None
+        wiring = storyboard_wiring()
+        agent_id = next((payload.get(k) for k in SUBAGENT_KEYS if payload.get(k)), None)
+        got = owner_relay.handle_prompt(Path.home(), conv_id, payload.get("prompt"), runtime="cursor",
+                                        conn=wiring.connection(), client=wiring.client,
+                                        agent_id=agent_id if isinstance(agent_id, str) else None,
+                                        deadline=START + owner_relay.BUDGET)
+        if got.message:
+            stage_for_next_boundary(conv_id, "The owner's last prompt went to Cardinal, not to you: "
+                                    + (got.model_text() or got.message))
+        return got.message
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------

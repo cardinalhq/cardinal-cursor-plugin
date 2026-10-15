@@ -24,7 +24,7 @@ is specific to Cursor.
 Block on the watch until there is something to review:
 
 ```
-<this-skill-directory>/../../scripts/cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --follow --timeout 600 --max 1
+<this-skill-directory>/../../scripts/cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --follow --timeout 600 --max 1 --session <your_sid>
 ```
 
 Starting from your cursor file, the watch signals only events you have not committed, so
@@ -34,6 +34,12 @@ It returns as soon as new events arrive (one line each, your own posts excluded)
 ten quiet minutes. Then run one pass of CORE.md's review loop through your cursor file,
 sweeping the worker's new activity even when the watch timed out, and start the watch
 again. Never write sleep-and-reread loops.
+
+## Owner decisions
+
+When the owner types `decide: …`, `approve <id>` or `reject <id>`, Cardinal's prompt hook
+acts on it and shows them the outcome instead of passing the prompt to you; you get the
+outcome at your next tool call. Run nothing to send or approve it.
 
 ## Doing your own checks
 

@@ -359,6 +359,8 @@ def _bind_join(home: Path, sid: str, inv: str, conn: dict, state: dict, now: flo
 # The plugin does nothing for a capability that is not advertised as enabled.
 PROJECTION = "projection"   # the server keeps the live storyboard up to date from the checkpoints
 OWNER_INPUT = "owner_input"  # the server records the owner's prompts (owner_input.py)
+OWNER_RELAY = "owner_relay"  # owner decisions sent from a supervisor session (owner_relay.py)
+SETTINGS_URL_RE = re.compile(r"(?:https?://[A-Za-z0-9.:-]{1,253})?/[A-Za-z0-9/_.~%?=&#-]{0,250}")   # fullmatch
 CAPABILITY_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,63}")   # fullmatch
 MAX_CAPABILITIES = 32
 
@@ -368,7 +370,8 @@ def capabilities(answer: Any) -> dict:
     {} when it is absent (an older Cardinal) or not an object; an entry whose
     name is not a plain identifier or whose value is not an object is
     dropped; `enabled` is True only for an explicit true. Anything else the
-    server says about a capability is not kept."""
+    server says about a capability is not kept, but for owner_relay's
+    on_for_caller and settings_url (_owner_relay_extra)."""
     caps = answer.get("capabilities") if isinstance(answer, dict) else None
     if not isinstance(caps, dict):
         return {}
@@ -378,6 +381,22 @@ def capabilities(answer: Any) -> dict:
             break
         if isinstance(name, str) and CAPABILITY_NAME_RE.fullmatch(name) and isinstance(v, dict):
             out[name] = {"enabled": v.get("enabled") is True}
+            if name == OWNER_RELAY:
+                out[name].update(_owner_relay_extra(v))
+    return out
+
+
+def _owner_relay_extra(v: dict) -> dict:
+    """What owner_relay also says about the CALLER (owner_relay.py): whether
+    they turned relayed decisions on (on_for_caller, a bool; absent:
+    unknown) and where (settings_url: an http(s) URL or a site path, plain
+    characters only)."""
+    out: dict = {}
+    if isinstance(v.get("on_for_caller"), bool):
+        out["on_for_caller"] = v["on_for_caller"]
+    url = v.get("settings_url")
+    if isinstance(url, str) and SETTINGS_URL_RE.fullmatch(url):
+        out["settings_url"] = url
     return out
 
 

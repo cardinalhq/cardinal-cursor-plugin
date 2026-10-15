@@ -3,13 +3,31 @@
 from __future__ import annotations
 import copy
 import json
+import os
 import sys
 import time
+from pathlib import Path
 from . import investigation_events as ie
 from . import investigation_consumer as consumer
 from . import investigation_state as ist
 from . import investigation_state_sync as sync
+from . import owner_relay
 from . import supervision_status as sv
+
+
+def relay_mark(event, mine):
+    """For a relayed owner decision (authority owner_relayed): "by_you" when
+    this supervisor session's own prompt hook sent it (owner_relay.sent_by),
+    else "unverified": the agent holding the owner's key can relay one
+    itself, naming any supervisor session. None for any other event, or
+    when `mine` is None (not a supervisor's read)."""
+    if mine is None or event.get("type") != ie.OWNER_DECIDED or event.get("authority") != ie.OWNER_RELAYED:
+        return None
+    return "by_you" if (event.get("investigation_id"), event.get("seq")) in mine else "unverified"
+
+
+RELAY_TAGS = {"by_you": " [relayed by you]",
+              "unverified": " [relayed, not by this supervisor session: unverified; tell the owner]"}
 
 
 def status_suffix(event, statuses):
@@ -41,7 +59,7 @@ def is_self(event, viewer, session):
     return who.startswith("grantee:") or (bool(session) and producer.get("session_id") == session)
 
 
-def compact_event(event, principals):
+def compact_event(event, principals, mine=None):
     producer = event.get("producer") if isinstance(event.get("producer"), dict) else {}
     author = principal_key(producer.get("principal"))
     info = principals.get(author) if isinstance(principals.get(author), dict) else {}
@@ -72,21 +90,26 @@ def compact_event(event, principals):
         "refs": payload.get("refs", []),
         "artifacts": payload.get("artifacts", []),
         "gate": payload.get("gate"),
+        **({"relayed": relay_mark(event, mine)} if relay_mark(event, mine) else {}),
     }
 
 
-def compact_line(event, principals):
-    e = compact_event(event, principals)
+def compact_line(event, principals, mine=None):
+    e = compact_event(event, principals, mine)
     at = str(e["at"] or "")
     clock = at[11:16] if len(at) >= 16 else at
     to = f" · to {str(e['to'])[:8]}" if e["to"] else ""
     # Inert one-line strings prevent hostile event text from forging an envelope.
-    return f"#{e['seq']} {clock} {ie._tok(e['type'])} · {ie._one_line(e['author'])}{to}: {ie.json_text(str(e['text']))}"
+    return (f"#{e['seq']} {clock} {ie._tok(e['type'])} · {ie._one_line(e['author'])}{to}: "
+            f"{ie.json_text(str(e['text']))}{RELAY_TAGS.get(e.get('relayed'), '')}")
 
 
 def display(page, args, *, legacy_line=None, maximum=None, statuses=None):
     viewer = page.get("viewer") or {}
     grantee = (principal_key(viewer.get("principal")) or "").startswith("grantee:")
+    # A supervisor (a grantee read) is told which relayed decisions its own session sent.
+    mine = owner_relay.sent_by(Path(os.environ.get("HOME") or str(Path.home())),
+                               getattr(args, "session", None)) if grantee else None
     exclude = args.exclude_self
     if exclude is None:
         exclude = args.follow and (bool(args.session) or grantee)
@@ -102,13 +125,16 @@ def display(page, args, *, legacy_line=None, maximum=None, statuses=None):
     if args.json:
         answer = copy.deepcopy(page)
         answer["events"] = (
-            [compact_event(e, page.get("principals") or {}) for e in shown]
+            [compact_event(e, page.get("principals") or {}, mine) for e in shown]
             if args.fields == "compact"
             else shown
         )
         for e in answer["events"]:
             if isinstance(e.get("producer"), dict):
                 e["producer"].pop("_resolved", None)
+            mark = relay_mark(e, mine) if args.fields != "compact" else None
+            if mark:
+                e["relayed"] = mark
         shown_seqs = {e.get("seq") for e in shown}
         known = {str(k): v for k, v in (statuses or {}).items() if k in shown_seqs}
         if known:
@@ -116,7 +142,8 @@ def display(page, args, *, legacy_line=None, maximum=None, statuses=None):
         print(json.dumps(answer, indent=2, ensure_ascii=False))
     else:
         for e in shown:
-            line = legacy_line(e) if legacy_line else compact_line(e, page.get("principals") or {})
+            line = legacy_line(e) + RELAY_TAGS.get(relay_mark(e, mine), "") if legacy_line \
+                else compact_line(e, page.get("principals") or {}, mine)
             print(line + status_suffix(e, statuses or {}))
     sys.stdout.flush()  # Commit only after successful printing; a crash replays the pending page.
     return len(shown), complete
