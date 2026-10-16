@@ -50,13 +50,7 @@ def principal_key(principal):
 
 
 def is_self(event, viewer, session):
-    if event.get("type") == ie.OWNER_DECIDED:
-        return False
-    producer = event.get("producer") if isinstance(event.get("producer"), dict) else {}
-    who = principal_key(viewer.get("principal"))
-    if not who or principal_key(producer.get("principal")) != who:
-        return False
-    return who.startswith("grantee:") or (bool(session) and producer.get("session_id") == session)
+    return consumer.is_self(event, viewer, session)
 
 
 def compact_event(event, principals, mine=None):
@@ -68,6 +62,10 @@ def compact_event(event, principals, mine=None):
     # The required field is the primary text (a resolution's statement is secondary).
     field = ie.SEMANTIC_FIELDS.get(event.get("type"), ("text",))[0]
     text = payload.get(field) or ""
+    secondary = [f"{name}: {payload[name]}" for name in ie.SEMANTIC_FIELDS.get(event.get("type"), (None, (), ()))[1]
+                 if isinstance(payload.get(name), str) and payload[name]]
+    if secondary:
+        text = "\n".join([text, *secondary])
     if event.get("type") == ie.ACKNOWLEDGED:
         text = f"ack of #{payload.get('ack_of')}: {payload.get('disposition')}" + (
             f" (conflicts with #{payload['conflicts_with']})" if payload.get("conflicts_with") else ""
@@ -90,6 +88,7 @@ def compact_event(event, principals, mine=None):
         "refs": payload.get("refs", []),
         "artifacts": payload.get("artifacts", []),
         "gate": payload.get("gate"),
+        **{name: payload[name] for name in ("tests", "based_on") if name in payload},
         **({"relayed": relay_mark(event, mine)} if relay_mark(event, mine) else {}),
     }
 
@@ -100,8 +99,10 @@ def compact_line(event, principals, mine=None):
     clock = at[11:16] if len(at) >= 16 else at
     to = f" · to {str(e['to'])[:8]}" if e["to"] else ""
     # Inert one-line strings prevent hostile event text from forging an envelope.
+    details = {k: e[k] for k in ("semantic_id", "evidence", "refs", "tests", "based_on", "artifacts", "gate") if e.get(k)}
+    suffix = " · " + ie.json_text(json.dumps(details, ensure_ascii=False)) if details else ""
     return (f"#{e['seq']} {clock} {ie._tok(e['type'])} · {ie._one_line(e['author'])}{to}: "
-            f"{ie.json_text(str(e['text']))}{RELAY_TAGS.get(e.get('relayed'), '')}")
+            f"{ie.json_text(str(e['text']))}{RELAY_TAGS.get(e.get('relayed'), '')}{suffix}")
 
 
 def display(page, args, *, legacy_line=None, maximum=None, statuses=None):
@@ -112,7 +113,7 @@ def display(page, args, *, legacy_line=None, maximum=None, statuses=None):
                                getattr(args, "session", None)) if grantee else None
     exclude = args.exclude_self
     if exclude is None:
-        exclude = args.follow and (bool(args.session) or grantee)
+        exclude = (args.follow or bool(args.cursor_file)) and (bool(args.session) or grantee)
     events = [
         e
         for e in page["events"]
@@ -142,7 +143,7 @@ def display(page, args, *, legacy_line=None, maximum=None, statuses=None):
         print(json.dumps(answer, indent=2, ensure_ascii=False))
     else:
         for e in shown:
-            line = legacy_line(e) + RELAY_TAGS.get(relay_mark(e, mine), "") if legacy_line \
+            line = legacy_line(e) + RELAY_TAGS.get(relay_mark(e, mine), "") if legacy_line and not args.cursor_file \
                 else compact_line(e, page.get("principals") or {}, mine)
             print(line + status_suffix(e, statuses or {}))
     sys.stdout.flush()  # Commit only after successful printing; a crash replays the pending page.
@@ -150,6 +151,16 @@ def display(page, args, *, legacy_line=None, maximum=None, statuses=None):
 
 
 def run(args, conn, inv, *, client, legacy_line=None):
+    signal_only = getattr(args, "signal_only", False)
+    save_directory = getattr(args, "save_page", None)
+    if args.cursor_file and args.auto_review and (args.event_class or args.event_type or args.max is not None):
+        raise ValueError("cursor-backed --auto-review cannot use class/type/max filters: hidden events must not be reviewed")
+    if signal_only and (not args.cursor_file or not args.follow or args.auto_review or args.json or
+                        args.event_class or args.event_type or args.exclude_self is False):
+        raise ValueError("--signal-only requires a cursor-backed follow watch without JSON, filters or auto-review")
+    if save_directory and (not args.cursor_file or args.follow or args.auto_review or args.event_class or
+                           args.event_type or args.max is not None or args.exclude_self is True):
+        raise ValueError("--save-page requires an unfiltered, non-follow cursor read")
     if args.after < 0:
         raise ValueError("--after is a seq, 0 or more")
     if (
@@ -185,7 +196,9 @@ def run(args, conn, inv, *, client, legacy_line=None):
                 return 0
             try:
                 if args.cursor_file and not watch:
-                    page = consumer.read(conn, args.cursor_file, client=client)
+                    page = consumer.read(conn, args.cursor_file, client=client,
+                                         skip_self=args.exclude_self is not False and not args.auto_review and
+                                         not args.event_class and not args.event_type and args.max is None)
                 else:
                     timeout = min(30.0, max(0.1, deadline - time.monotonic())) if deadline else 30.0
                     # Multiple classes form a union. The route accepts one class; union reads stay unfiltered.
@@ -237,10 +250,24 @@ def run(args, conn, inv, *, client, legacy_line=None):
             for e in page["events"]:
                 if isinstance(e, dict) and isinstance(e.get("seq"), int):
                     seen[e["seq"]] = e
-            n, complete = display(
-                page, args, legacy_line=legacy_line, maximum=args.max - count if args.max and not watch else None,
-                statuses=sv.challenge_statuses(list(seen.values())),
-            )
+            if signal_only:
+                visible = [e for e in page["events"] if not is_self(e, page.get("viewer") or {}, args.session)]
+                n, complete = len(visible), True
+                if n:
+                    print(f"Review pending: #{visible[0]['seq']}–#{visible[-1]['seq']} ({n} events). "
+                          "Read the full page through your review cursor; this watch has not reviewed it.")
+                    sys.stdout.flush()
+            elif save_directory and page["next_after"] > page["after"]:
+                saved = consumer.save_page(conn, args.cursor_file, save_directory, page)
+                n, complete = len(page["events"]), True
+                print(json.dumps({"page_file": str(saved), "events": n, "after": page["after"],
+                                  "next_after": page["next_after"]}) if args.json else f"Read full review page: {saved}")
+                sys.stdout.flush()
+            else:
+                n, complete = display(
+                    page, args, legacy_line=legacy_line, maximum=args.max - count if args.max and not watch else None,
+                    statuses=sv.challenge_statuses(list(seen.values())),
+                )
             count += n
             if args.cursor_file and args.auto_review and complete and page["next_after"] > page["after"]:
                 consumer.reviewed(conn, args.cursor_file, page["batch"])

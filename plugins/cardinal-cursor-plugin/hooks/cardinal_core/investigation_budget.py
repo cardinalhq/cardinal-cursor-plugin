@@ -1635,6 +1635,15 @@ def _cursor(fn, *a):
         raise BudgetError("the cursor file is in use by another command (a watch or another review); retry") from None
 
 
+@contextlib.contextmanager
+def _review_cursor(path):
+    try:
+        with consumer.locked(path):
+            yield
+    except BlockingIOError:
+        raise BudgetError("the cursor file is in use by another command (a watch or another review); retry") from None
+
+
 def reviewed(args, *, grant: dict, own_conn: Callable, home: Path, out: Callable = print) -> int:
     """Commit the outstanding page. With an open direction in the budget file
     (--budget-file, default budget.json beside the cursor file): its worker
@@ -1645,7 +1654,16 @@ def reviewed(args, *, grant: dict, own_conn: Callable, home: Path, out: Callable
     bfile = Path(args.budget_file) if getattr(args, "budget_file", None) else cursor.parent / "budget.json"
     flags = [f"--{k} {v}" for k in ("tag", "done", "reopen", "redone") for v in (getattr(args, k, None) or [])]
     inv = grant["investigation_id"]
-    with _locked(bfile):
+    # Lock order is budget -> cursor. Keep the cursor locked across remote
+    # budget writes, so renewal or another review cannot invalidate this page.
+    with _locked(bfile), _review_cursor(cursor):
+        page = consumer.load(cursor, grant).get("pending")
+        page_file = getattr(args, "page_file", None)
+        if page_file:
+            args.batch = consumer.snapshot_batch(grant, Path(page_file), page)
+        if not page or page.get("batch") != args.batch:
+            raise BudgetError("--batch is not the outstanding read (cursor unchanged): pass the batch of the page you "
+                              "read last, or read it again with --cursor-file")
         pre = []
         state = _restored(bfile, grant, own_conn, home)
         if state is not None:
@@ -1657,18 +1675,14 @@ def reviewed(args, *, grant: dict, own_conn: Callable, home: Path, out: Callable
             if flags:
                 raise BudgetError("no open direction for --tag/--done: `budget --set --plan <file>` first, or drop "
                                   "them")
-            out("\n".join(pre + [json.dumps(_cursor(consumer.reviewed, grant, cursor, args.batch), indent=2)]))
+            out("\n".join(pre + [json.dumps(consumer.reviewed_locked(grant, cursor, args.batch), indent=2)]))
             return 0
-        page = _cursor(consumer.pending, grant, cursor)
-        if not page or page.get("batch") != args.batch:
-            raise BudgetError("--batch is not the outstanding read (cursor unchanged): pass the batch of the page you "
-                              "read last, or read it again with --cursor-file")
         through = page["next_after"]
         if state.get("applied_batch") == args.batch:
             lines = state.get("applied_lines") or [f"reviewed through #{through}"]
         else:
             lines = _apply(args, state, bfile, d, page, grant, flags, home, own_conn)
-    _cursor(consumer.reviewed, grant, cursor, args.batch)
+        consumer.reviewed_locked(grant, cursor, args.batch)
     out("\n".join(pre + lines))
     return 0
 
