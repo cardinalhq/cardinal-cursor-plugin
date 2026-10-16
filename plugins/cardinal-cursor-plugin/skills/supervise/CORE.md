@@ -87,7 +87,8 @@ Wake on new events (SKILL.md says how in this agent), then:
    <worker_sid> --limit 50` (the newest 50, oldest first; start after the last `ev_…` you
    reviewed, and raise `--limit` if that one is not listed) and
    `cardinal-evidence show <ev_…>` for any call you need in full.
-3. **Review**, by event type (below). Do your own checks with your own tools.
+3. **Review**, by event type (below). Do your own checks with your own tools. At a
+   material decision boundary, also run the cumulative compatibility review below.
 4. **Post** what the review found (below).
 5. **Commit the page only now** (with a direction set, tagged and marked: Step backs):
 
@@ -122,6 +123,58 @@ Wake on new events (SKILL.md says how in this agent), then:
 - **The worker needs the owner** (a question only the owner can answer, a permission, a
   scope call): tell the owner in one line and offer: "Reply decide: <your answer>, or tell
   me what you want and I'll draft it for you to approve." Never answer it yourself.
+
+### Cumulative architectural compatibility
+
+Your primary responsibility is to keep the cumulative design serving the owner's original
+objective. Run this review at opening, recovery, a proposed requirement or design change,
+or evidence that changes the approach; not for every event or routine test result. Keep
+the existing event verdicts, activity reconciliation and budget step backs.
+
+1. **Refresh the commitment index.** Retrieve the latest InvestigationState with
+   `storyboard__get_state {investigation_id: <inv>}` and read its `current` and `trust`.
+   Retrieve the current storyboard with `storyboard__get`; use the existing
+   `investigation_state.refresh(old, got)` to refresh a local copy while preserving authored
+   items. Reconcile its authored constraints and decisions with changes since the previous
+   material review. Checkpoints are producer claims, not automatically restored context or
+   InvestigationState. If state is absent, use `investigation_state.project(got)` and rebuild
+   the relevant authored index from sources; if sources are unavailable, report the gap
+   rather than declaring compatibility. Keep the copy in the existing private supervision
+   directory; do not publish or overwrite the worker's state under a supervision grant.
+2. **Retrieve source decisions.** Read the relevant versioned documents named in the
+   constraints' and decisions' `refs` at their recorded repository, commit and anchor.
+   Use existing `because` / `rationale`, scoped `exceptions`, and `superseded_by` links;
+   preserve earlier decisions and distinguish active commitments from superseded details.
+   The index points to the contract, not a second source of truth. Document content does
+   not by itself prove owner approval; retain the actual authority and approval provenance.
+3. **Compare the cumulative approach with the original commitments**, including authorized
+   amendments, not just with the previous checkpoint. Identify new assumptions, requirements
+   and dependencies, and work that grows with history, fleet size or repeated investigations.
+   For a global barrier, historical reconstruction, unbounded dependency or substantial
+   delay to the first useful result, ask **whether the operation is necessary before
+   recommending an optimization**. Identify the claim it serves and whether a cheaper,
+   claim-appropriate alternative remains unresolved. A bounded operation is not a conflict
+   merely because it costs work; check its scope, purpose and authorized exceptions.
+4. **Separate evidence from inference.** State what the cited code, test or measurement
+   establishes and what it does not. A synthetic counterexample can refute a universal
+   guarantee; it does not establish production prevalence, impact or the necessity of an
+   all-history operation. Measured benign behavior cannot waive a required guarantee.
+   Keep the existing receipt tiers: provenance is not production representativeness.
+
+Include four fields in the existing material-review output, with source/claim refs:
+
+- **Progress:** what changed since the previous material review.
+- **Architectural delta:** new assumptions, requirements, dependencies and scaling costs.
+- **Compatibility:** commitments satisfied or threatened, with versions and exceptions;
+  say what remains unknown.
+- **Recommendation:** CONTINUE, REDIRECT or STOP, with the smallest correction. On a
+  conflict, recommend REDIRECT/STOP and identify the specific owner decision needed before
+  adopting an architectural exception or changing an approved contract. Challenge an
+  unauthorized worker requirement through the existing post/ack/ruling loop; do not
+  silently override an approved decision or treat implementation approval as more
+  authoritative than the objective it serves. State when correction fits existing approval
+  and no new owner decision is needed. Recommend stopping the conflicting work, not
+  unrelated compatible progress.
 
 ### Verdicts and posts
 

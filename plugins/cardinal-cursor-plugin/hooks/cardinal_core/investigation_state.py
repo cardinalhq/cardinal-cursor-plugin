@@ -226,6 +226,15 @@ cited source: record your own reading as yours; never upgrade it to the owner's 
   words of the statement), receipt, pointer?, shows (what the receipt says)}. Never reword.
 - refs: typed {kind: doc {path, repo?, commit?, anchor?} | commit {sha} | pr {repo,
   number|url} | code {path, symbol?, lines?} | receipt {id, pointer?} | message}.
+- Architectural commitments use these existing constraints and decisions, not a new
+  section: keep the original objective, rationale (because / rationale), authorized scoped
+  exceptions, and superseded_by links. Index the applicable source documents in refs with
+  repo, commit and anchor; retain superseded decisions so later amendments remain traceable.
+  At material design reviews, retrieve the latest state, refresh its derived half, read the
+  relevant source versions and reconcile authored commitments with intervening decisions.
+  refresh() preserves authored items; it does not infer changes from checkpoint history or
+  reread documents. Record unresolved compatibility as an open_question, never implicit
+  approval. A document reference does not upgrade the item's authority.
 - Say what a label is where you use it; terms: [{term, means}] only for labels the
   storyboard prose itself uses.
 Never delete an item because its authority cannot be shown: keep it at the authority its
