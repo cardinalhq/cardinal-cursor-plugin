@@ -48,7 +48,10 @@ skill, "Step backs"). The worker never sees it. Records go to your own investiga
   verdict M|opening|all on_track|worker_choice|owner_constraint [--post-ref "#N"]
   outcome M|opening|all accepted|declined|overruled|changed_constraint|no_response [--ref R]
   --show, calibrate, --close --outcome done|stopped|replaced [--missed M,...]
-Each review pass tags and marks on `reviewed` (--tag, --done, --reopen, --redone)."""
+Each review pass tags and marks on `reviewed` (--tag, --done, --reopen, --redone).
+Tags charge the preceding agent-active interval, not wall-clock soak duration. Before a soak
+starts use a preparation/reporting milestone or explicit none; only current-page worker seqs
+can be tagged. Recorded attribution is not silently retagged."""
 
 
 class CLI:
@@ -634,6 +637,15 @@ class CLI:
             args, conn, inv, client=client, legacy_line=self._event_line if self.legacy else None
         )
 
+    def cmd_renew_cursor(self, args):
+        if not args.credential_file or not args.previous_credential_file or not args.cursor_file:
+            raise ValueError("renew-cursor requires --credential-file, --previous-credential-file and --cursor-file")
+        new, client = self._grantee()
+        old = consumer.credential_connection(args.previous_credential_file)
+        result = consumer.renew_cursor(old, new, args.cursor_file, client=client)
+        print(json.dumps(result, indent=2))
+        return 0
+
     def cmd_post(self, args):
         import secrets
 
@@ -646,6 +658,11 @@ class CLI:
         # The unchanged Claude parity gate includes its pre-#190 environment-token
         # broadcast form. New credential files/outboxes always use #190 rules.
         legacy_token_post = self.legacy and args.credential_file is None and args.outbox_file is None
+        if conn.get("token") and args.credential_file and not args.outbox_file and args.to_session:
+            if args.idempotency_key:
+                raise ValueError("generated outboxes use content-addressed keys; omit --idempotency-key")
+            args.outbox_file = consumer.outbox_path(conn, args.credential_file, ie.POST_TYPES[args.type],
+                                                   args.text, args.to_session, args.ref)
         if conn.get("token") and not legacy_token_post and (not args.to_session or not args.outbox_file):
             raise ValueError("scoped post requires --to-session and --outbox-file")
         own = None if conn.get("token") else args.session
@@ -939,6 +956,7 @@ class CLI:
                                     refs=args.ref or None)
         if args.json:
             out = {**entry, "instruction": owner_relay.INSTRUCTION.format(id=entry["id"])}
+            out.update(relay_status=self._relay_status(), relay_guidance=self._relay_guidance())
             if answers:
                 out["answers_line"] = answers
             print(json.dumps(out, indent=2, ensure_ascii=False))
@@ -952,9 +970,7 @@ class CLI:
         if answers:
             print(answers)
         print(owner_relay.INSTRUCTION.format(id=entry["id"]) + f" Tell the owner it expires at {when}.")
-        off = self._relay_off_line()
-        if off:
-            print("Tell the owner too: " + off)
+        print(self._relay_guidance())
         return 0
 
     def _answered(self, worker: str, seq: int):
@@ -1025,6 +1041,24 @@ class CLI:
         where = link or "your Cardinal settings page (Settings, Investigations)"
         return f"Relayed decisions are off for your account: turn them on once at {where} (web only)."
 
+    def _relay_status(self) -> str:
+        caps = (getattr(self, "_relay_binding", None) or {}).get("capabilities") or {}
+        cap = caps.get(owner_relay.CAPABILITY) if isinstance(caps, dict) else None
+        on = cap.get("on_for_caller") if isinstance(cap, dict) else None
+        return "ready" if on is True else "disabled" if on is False else "unknown"
+
+    def _relay_guidance(self) -> str:
+        status = self._relay_status()
+        if status == "disabled":
+            return ("Relay status: disabled. " + self._relay_off_line() +
+                    " Until enabled, `decide:` and `approve <id>` cannot relay. Use the worker's "
+                    "Investigation web page to post an owner decision, or instruct the worker directly; "
+                    "direct owner prompts in its chat need no decide: prefix.")
+        if status == "unknown":
+            return ("Relay status: unknown. This Cardinal did not report your opt-in status; do not promise "
+                    "delivery. Check Settings, Investigations in your signed-in web session and confirm the prompt-hook outcome.")
+        return "Relay status: ready. The owner can use `decide: <text>` or `approve <id>`; confirm the prompt-hook outcome."
+
     def cmd_supervising(self, args: argparse.Namespace) -> int:
         sid = self._session_arg(args)
         if not sid:
@@ -1059,19 +1093,18 @@ class CLI:
             return code
         t = owner_relay.add_target(home, sid, worker, args.to_session, args.name, replace=args.replace)
         if args.json:
-            print(json.dumps(t, indent=2))
+            print(json.dumps({**t, "relay_status": self._relay_status(),
+                              "relay_guidance": self._relay_guidance()}, indent=2))
             return 0
         n = len(owner_relay.targets(home, sid))
         form = f"decide {t['name']}: <text>" if t.get("name") else "decide: <text>"
         print(f"registered {owner_relay._target_label(t)} of {worker} as a worker target ({n} in this session; "
               "nothing was sent).")
-        print(f"The owner can now type `{form}` here to send that worker their own words as an owner decision"
+        print(f"When relay is ready, the owner can type `{form}` here to send that worker their own words as an owner decision"
               + (" (bare `decide:` while it is the only target)." if t.get("name") else
                  " (while it is the only target; add --name to tell several apart).")
               + " Never type it for them.")
-        off = self._relay_off_line()
-        if off:
-            print("Tell the owner too: " + off)
+        print(self._relay_guidance())
         return 0
 
     def cmd_proposals(self, args: argparse.Namespace) -> int:
@@ -1171,6 +1204,7 @@ def build_parser(wiring, session_env=()):
         "revoke",
         "rule",
         "reviewed",
+        "renew-cursor",
         "show",
         "verify",
         "propose-decision",
@@ -1211,7 +1245,7 @@ def build_parser(wiring, session_env=()):
         p.set_defaults(investigation_id=None)
         if action in ("events", "show", "post", "bind", "attach", "propose-decision", "supervising", "budget"):
             p.add_argument("investigation_id", nargs=None if action in ("bind", "attach") else "?")
-        if action in ("events", "reviewed"):
+        if action in ("events", "reviewed", "renew-cursor"):
             p.add_argument(
                 "--cursor-file", type=Path,
                 help="#190 durable pending-page review state (requires grant)"
@@ -1221,14 +1255,21 @@ def build_parser(wiring, session_env=()):
         if action == "repos":
             p.add_argument("--cwd", action="append", default=[], help="checkout to attach; repeat for multiple repos; saved edits are replayed too")
         elif action == "reviewed":
-            p.add_argument("--batch", required=True)
+            commit = p.add_mutually_exclusive_group(required=True)
+            commit.add_argument("--batch", help="exact hash of the reviewed pending page")
+            commit.add_argument("--page-file", type=Path, help="immutable full page saved by events --save-page")
             p.add_argument("--budget-file", type=Path, help="the step-back cache (default: budget.json beside the "
                            "cursor file); with an open direction every worker event needs a --tag")
             p.add_argument("--tag", action="append", default=[], metavar="SEQS:M",
-                           help="208-215:<m>, 255:<m>+<m2>, 220:none or all:<m> (repeat)")
+                           help="current-page worker seqs only; charges the preceding active interval to <m>: "
+                                "208-215:<m>, 255:<m>+<m2>, 220:none or all:<m>. Before a soak starts use "
+                                "a preparation milestone or none; this is not a wall-clock soak timer")
             for flag in ("done", "reopen", "redone"):
                 p.add_argument("--" + flag, action="append", default=[], metavar="M.N@REF",
                                help=f"mark a deliverable {flag}: <m>.<n>@#<seq> or @ev_<12 hex> (repeat)")
+        elif action == "renew-cursor":
+            p.add_argument("--previous-credential-file", type=Path, required=True,
+                           help="old private grant (may be expired); scopes must match; old challenges keep old ruling authority")
         elif action == "question":
             p.add_argument("text", help="the question (1 to 1000 characters)")
         elif action == "checkpoint":
@@ -1257,7 +1298,8 @@ def build_parser(wiring, session_env=()):
             p.add_argument("--text")
             p.add_argument("--to-session")
             p.add_argument("--ref", action="append", default=[])
-            p.add_argument("--outbox-file", type=Path, help="durable intent; required with a scoped grant")
+            p.add_argument("--outbox-file", type=Path, help="durable intent; with --credential-file defaults to a private "
+                           "content-addressed file in outbox/ beside the credential")
             p.add_argument("--idempotency-key")
         elif action == "ack":
             p.add_argument("seq", type=int)
@@ -1291,6 +1333,10 @@ def build_parser(wiring, session_env=()):
             )
             p.add_argument("--type", dest="event_type", action="append", default=[])
             p.add_argument("--follow", action="store_true")
+            p.add_argument("--signal-only", action="store_true", help="cursor-backed watch: emit short wake signals, "
+                           "never event bodies; read the full pending page after waking")
+            p.add_argument("--save-page", type=Path, help="save the exact full pending page as a private immutable "
+                           "<batch>.json in this directory; prints its path for review and reviewed --page-file")
             p.add_argument(
                 "--auto-review", action="store_true",
                 help="with --cursor-file: print then commit each full pending batch (without it, "
@@ -1331,7 +1377,8 @@ def build_parser(wiring, session_env=()):
             mode.add_argument("--close", action="store_true", help="end the direction (--outcome)")
             mode.add_argument("--pass", dest="pass_", choices=("estimator", "stepback"), help=argparse.SUPPRESS)
             mode.add_argument("--calibrate", action="store_true", help=argparse.SUPPRESS)
-            mode.add_argument("--verdict", nargs=2, metavar=("SCOPE", "VERDICT"), help=argparse.SUPPRESS)
+            mode.add_argument("--verdict", nargs=2, metavar=("SCOPE", "VERDICT"),
+                              help="SCOPE: milestone, opening or all; VERDICT: on_track | worker_choice | owner_constraint")
             mode.add_argument("--stepback-outcome", nargs=2, metavar=("SCOPE", "OUTCOME"), help=argparse.SUPPRESS)
             p.add_argument("--amend", action="store_true", help="--set: re-plan the open direction's milestones")
             p.add_argument("--plan", type=Path, help="--set: the estimator's JSON")
@@ -1365,6 +1412,7 @@ def normalize_argv(argv):
         "--uphold",
         "--withdraw",
         "--follow",
+        "--signal-only",
         "--auto-review",
         "--exclude-self",
         "--include-self",
@@ -1422,7 +1470,7 @@ def cli_main(argv, wiring, session_env=(), *, legacy=False):
                   f"{args.action} without --credential-file and without CARDINAL_INVESTIGATION_TOKEN", file=sys.stderr)
             return EXIT_USAGE
         if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify", "rule", "proposals",
-                                              "withdraw-proposal", "budget"):
+                                              "withdraw-proposal", "budget", "renew-cursor"):
             return EXIT_USAGE if not cli._author_only("not recorded") else 0
         if args.action == "post" and (args.type is None or args.text is None):
             raise ValueError("post requires type and text (positional or --type/--text)")

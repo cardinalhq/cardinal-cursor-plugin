@@ -48,6 +48,16 @@ happened.
    `--credential-file <dir>/grant.json` to **every** later command about the worker's
    Investigation. Never export the token into the environment: that turns your whole shell
    into the grantee, and your own session's Cardinal commands stop working.
+   On renewal, mint a new credential file with the same scopes, then run:
+
+   ```
+   cardinal-storyboard investigation renew-cursor --previous-credential-file <dir>/grant.json --credential-file <dir>/grant-new.json --cursor-file <dir>/cursor.json
+   ```
+
+   Use the new credential on later commands. This preserves the committed position
+   and refetches unreviewed events under the new grant. Never edit cursor JSON or
+   copy pending content between grants. Old-grant challenges retain their original
+   ruling authority; renewal does not authorize the new grant to rule on them.
 3. **Find the worker's session ids**:
    `cardinal-storyboard investigation show <inv> --credential-file <dir>/grant.json --json`
    returns the owner's `question` and the attached `sessions` (the worker's are those
@@ -65,8 +75,14 @@ happened.
    cardinal-storyboard investigation supervising <inv> --to-session <worker_sid> --name <short name, e.g. codex> --session <your_sid>
    ```
 
-   If it says this Cardinal cannot send owner decisions from here, tell the owner that line
-   and skip the rest. Otherwise tell the owner once: "You can send the worker an owner
+   Check the reported relay status before promising delivery. If disabled, show the
+   web settings link and explain that `decide:` and `approve <id>` cannot relay until
+   the owner opts in from their signed-in web session. If unknown, say so and check
+   the prompt-hook outcome. Registration is not proof that relay is ready. Continue
+   supervising while relay is off; the owner can post a decision on the worker's
+   Investigation web page, or instruct the worker directly. A direct owner prompt
+   in the worker chat needs no `decide:` prefix. When ready, tell the owner once:
+   "You can send the worker an owner
    decision from here: type `decide: <your decision>` and it goes to the worker in your own
    words; or I can draft one for you to `approve <id>`."
 6. **Set the work budget and run the opening step back** (Step backs, below).
@@ -78,11 +94,17 @@ Wake on new events (SKILL.md says how in this agent), then:
 1. **Read the pending page through your review cursor**:
 
    ```
-   cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --json --fields compact --session <your_sid>
+   cardinal-storyboard investigation events <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --save-page <dir>/pages --session <your_sid>
    ```
 
-   The page carries a `batch` hash. The same page replays until you commit it, so a crash
-   or a context reset loses nothing.
+   Read the complete private JSON file at the returned absolute path with your file
+   reader. It includes every event field, receipts, refs and the exact batch. The
+   same page replays until you commit it, so a crash or reset loses nothing. Monitor
+   notifications are wake signals only; never review their truncated event excerpts.
+   For a small page, an ordinary read without `--save-page` prints full text and refs;
+   `--json --fields compact` also preserves resolution explanations, tests and based_on.
+   Own-only pages with complete sequence coverage are skipped automatically; unknown
+   metadata, hidden sequence gaps, owner decisions and mixed pages require review.
 2. **Read the activity since your last pass**: `cardinal-evidence list --session
    <worker_sid> --limit 50` (the newest 50, oldest first; start after the last `ev_…` you
    reviewed, and raise `--limit` if that one is not listed) and
@@ -93,12 +115,14 @@ Wake on new events (SKILL.md says how in this agent), then:
 5. **Commit the page only now** (with a direction set, tagged and marked: Step backs):
 
    ```
-   cardinal-storyboard investigation reviewed --investigation <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --batch <hash>
+   cardinal-storyboard investigation reviewed --investigation <inv> --credential-file <dir>/grant.json --cursor-file <dir>/cursor.json --page-file <exact returned path>
    ```
 
    A committed page means *you reviewed it*. Never pass `--auto-review` and never commit a
    page you have not reviewed: delivered and reviewed are different facts and the owner
-   relies on the difference.
+   relies on the difference. `--batch <hash>` remains supported. A saved page is checked
+   against the current pending page under the lock held through budget writes and
+   commit. Never commit a page whose complete contents you have not reviewed.
 
 ### What to do with each kind of event
 
@@ -178,12 +202,16 @@ Include four fields in the existing material-review output, with source/claim re
 
 ### Verdicts and posts
 
-Every post is to the worker's session, with a private outbox file (required for a grant;
-use a new file per post: `<dir>/outbox/<n>.json`):
+Every post is to the worker's session. With an explicit credential file, the CLI
+keeps a private content-addressed outbox beside it automatically; no numbering:
 
 ```
-cardinal-storyboard investigation post <inv> --credential-file <dir>/grant.json --to-session <worker_sid> --outbox-file <dir>/outbox/<n>.json --type <cue|question|challenge> --text "<text>" --ref "#<seq>" --ref <finding_…> --ref <ev_…>
+cardinal-storyboard investigation post <inv> --credential-file <dir>/grant.json --to-session <worker_sid> --type <cue|question|challenge> --text "<text>" --ref "#<seq>" --ref <finding_…> --ref <ev_…>
 ```
+
+Retry uncertain posts with identical content and the same grant. Changing grants
+changes the sender; resolve an uncertain old outbox before reposting under a new
+grant. Explicit `--outbox-file` remains available.
 
 Each finding gets one verdict, written so the owner can read it alone:
 
@@ -282,6 +310,18 @@ or `none`, and mark each deliverable the page proves: `reviewed … --tag 208-21
 for a one-milestone page). Each `FIRE step back` line is one step back on that milestone
 (`all`: the whole direction): a brief with the worker's approach to it, `budget pass stepback
 --brief <brief> --milestone <m>`, and the pass.
+
+Tags name worker sequences in this pending page only. A tag charges the active
+interval preceding its event; it is not a wall-clock soak timer and does not infer
+when a soak milestone started. Tag preparation/reporting to its own milestone or
+`none` until the soak actually begins. Do not tag an entire mixed page to a future
+soak merely because its reports discuss it. Historical recorded attribution is not
+silently rewritten; correct the remaining plan explicitly with an amendment.
+
+External state (GitHub PR diffs/checks, Kubernetes generation/replicas/rollout) still
+needs independent checks. Cite captured `ev_…` or witnessed `rcpt_…` with the
+finding refs, and identify the PR revision or rollout generation checked.
+Existing checkpoint artifact hashes bind files but do not prove live external state.
 
 **Route what it found** by who owns the cost:
 

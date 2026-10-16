@@ -64,6 +64,47 @@ def identity(conn: dict) -> dict:
     return {k: conn.get(k) for k in ("origin", "org", "investigation_id", "grant_id")}
 
 
+def private_directory(path: Path) -> Path:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mode = path.lstat()
+    if not stat.S_ISDIR(mode.st_mode) or mode.st_mode & 0o077 or mode.st_uid != os.getuid():
+        raise ValueError("state directory must be owned by you, private (mode 0700), and not a symlink")
+    return path.absolute()
+
+
+def principal_key(principal):
+    if isinstance(principal, str):
+        return principal
+    if isinstance(principal, dict) and principal.get("kind") and principal.get("id"):
+        return f"{principal['kind']}:{principal['id']}"
+    return None
+
+
+def is_self(event, viewer, session=None):
+    known = {ie.CONTROL: ie.CONTROL_TYPES, ie.SEMANTIC: ie.SEMANTIC_TYPES}
+    if event.get("type") not in known.get(ie.event_class(event), ()):
+        return False
+    producer = event.get("producer") if isinstance(event.get("producer"), dict) else {}
+    who = principal_key(viewer.get("principal"))
+    if not who or principal_key(producer.get("principal")) != who:
+        return False
+    return who.startswith("grantee:") or (bool(session) and producer.get("session_id") == session)
+
+
+def batch_hash(page: dict) -> str:
+    return hashlib.sha256(json.dumps({k: v for k, v in page.items() if k != "batch"},
+                                    sort_keys=True).encode()).hexdigest()
+
+
+def self_only(page: dict) -> bool:
+    events = page.get("events") or []
+    seqs = [e.get("seq") for e in events]
+    return bool(events) and all(type(s) is int for s in seqs) and (
+        len(seqs) == page["next_after"] - page["after"] and
+        all(s == page["after"] + i + 1 for i, s in enumerate(seqs))
+    ) and all(is_self(e, page.get("viewer") or {}) for e in events)
+
+
 @contextlib.contextmanager
 def locked(path: Path):
     import fcntl
@@ -95,20 +136,32 @@ def committed(conn: dict, path: Path) -> int:
     return load(path, conn)["after"]
 
 
-def read(conn: dict, path: Path, *, client: str) -> dict:
+def read(conn: dict, path: Path, *, client: str, skip_self: bool = False) -> dict:
     with locked(path):
         state = load(path, conn)
         if state.get("pending") is not None:
             return state["pending"]
-        page = dict(ie.read_events(conn, conn["investigation_id"], after=state["after"], limit=100, client=client))
-        if page["last_seq"] > page["head_seq"] or page["head_seq"] < state["after"]:
-            raise ValueError("server returned an invalid WAL watermark")
-        page["after"] = state["after"]
-        page["next_after"] = page.pop("last_seq")
-        page["batch"] = hashlib.sha256(json.dumps(page, sort_keys=True).encode()).hexdigest()
-        if page["next_after"] > state["after"]:
-            state["pending"] = page
-            private_write(path, state)
+        for _ in range(10):
+            page = dict(ie.read_events(conn, conn["investigation_id"], after=state["after"], limit=100, client=client))
+            if not state["after"] <= page["last_seq"] <= page["head_seq"]:
+                raise ValueError("server returned an invalid WAL watermark")
+            page["after"] = state["after"]
+            page["next_after"] = page.pop("last_seq")
+            page["batch"] = batch_hash(page)
+            if skip_self and self_only(page):
+                state["after"] = page["next_after"]
+                private_write(path, state)
+                if state["after"] < page["head_seq"]:
+                    continue
+            else:
+                if page["next_after"] > state["after"]:
+                    state["pending"] = page
+                    private_write(path, state)
+                return page
+            break
+        # Only our own, fully covered events were advanced; nothing was reviewed.
+        page.update(after=state["after"], next_after=state["after"], events=[])
+        page["batch"] = batch_hash(page)
         return page
 
 
@@ -120,15 +173,70 @@ def pending(conn: dict, path: Path):
 
 def reviewed(conn: dict, path: Path, batch: str) -> dict:
     with locked(path):
-        state = load(path, conn)
-        pending = state.get("pending")
-        if not pending or pending.get("batch") != batch:
-            raise ValueError("--batch is not the outstanding read (cursor unchanged): pass the batch of the page you "
-                             "read last, or read it again with --cursor-file")
-        state["after"] = pending["next_after"]
-        state["pending"] = None
+        return reviewed_locked(conn, path, batch)
+
+
+def reviewed_locked(conn: dict, path: Path, batch: str) -> dict:
+    """Caller holds the cursor lock continuously through budget writes and commit."""
+    state = load(path, conn)
+    pending = state.get("pending")
+    if not pending or pending.get("batch") != batch:
+        raise ValueError("--batch is not the outstanding read (cursor unchanged): pass the batch of the page you "
+                         "read last, or read it again with --cursor-file")
+    state["after"] = pending["next_after"]
+    state["pending"] = None
+    private_write(path, state)
+    return {"investigation_id": conn["investigation_id"], "after": state["after"]}
+
+
+def save_page(conn: dict, cursor: Path, directory: Path, page: dict) -> Path:
+    with locked(cursor):
+        if load(cursor, conn).get("pending") != page or page.get("batch") != batch_hash(page):
+            raise ValueError("page is no longer the outstanding read; read it again")
+        directory = private_directory(directory)
+        path = directory / (page["batch"] + ".json")
+        snapshot = {"version": 1, "identity": identity(conn), "page": page}
+        try:
+            private_write(path, snapshot, create=True)
+        except FileExistsError:
+            if private_read(path) != snapshot:
+                raise ValueError("saved page contains different content")
+        return path
+
+
+def snapshot_batch(conn: dict, path: Path, pending: dict) -> str:
+    snapshot = private_read(path)
+    page = snapshot.get("page")
+    if snapshot.get("version") != 1 or snapshot.get("identity") != identity(conn) or not isinstance(page, dict):
+        raise ValueError("saved page belongs to another investigation, origin, or grant")
+    if page != pending or page.get("batch") != batch_hash(page):
+        raise ValueError("saved page is stale or changed; cursor unchanged")
+    return page["batch"]
+
+
+def renew_cursor(old: dict, new: dict, path: Path, *, client: str) -> dict:
+    if any(old.get(k) != new.get(k) for k in ("origin", "org", "investigation_id")):
+        raise ValueError("renewal requires the same origin, organization and investigation")
+    if not old.get("scopes") or set(old["scopes"]) != set(new.get("scopes") or []):
+        raise ValueError("renewal requires identical scope sets; start a new cursor for changed scopes")
+    with locked(path):
+        private_read(path)  # Renewal requires an existing cursor.
+        state = load(path, old)
+        page = ie.read_events(new, new["investigation_id"], after=state["after"], limit=1, client=client)
+        if (page.get("investigation_id") != new["investigation_id"] or
+                principal_key((page.get("viewer") or {}).get("principal")) != "grantee:" + str(new.get("grant_id")) or
+                not state["after"] <= page["last_seq"] <= page["head_seq"]):
+            raise ValueError("new grant validation returned an invalid identity or watermark")
+        state.update(identity=identity(new), pending=None)
         private_write(path, state)
-        return {"investigation_id": conn["investigation_id"], "after": state["after"]}
+        return {"after": state["after"], "investigation_id": new["investigation_id"],
+                "note": "Unreviewed events will be fetched again. Old-grant challenges retain their original ruling authority."}
+
+
+def outbox_path(conn: dict, credential: Path, type_: str, text: str, target: str, refs: list) -> Path:
+    payload = ie.text_payload(text, refs or None)
+    key = hashlib.sha256(json.dumps([identity(conn), type_, payload, target], sort_keys=True).encode()).hexdigest()
+    return private_directory(credential.parent / "outbox") / (key + ".json")
 
 
 def post(conn: dict, type_: str, text: str, target: str, refs: list, *, client: str, outbox: Path, session_id=None) -> dict:
