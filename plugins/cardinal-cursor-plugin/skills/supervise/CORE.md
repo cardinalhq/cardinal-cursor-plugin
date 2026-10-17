@@ -39,9 +39,11 @@ happened.
    the web UI's "Delegate supervision"), use it. Otherwise mint one with this machine's key:
 
    ```
-   cardinal-storyboard investigation grant --investigation <inv> --scope read,supervise,evidence:read --label "<agent> <model> supervisor" --out <dir>/grant.json
+   cardinal-storyboard investigation grant --investigation <inv> --scope read,supervise,evidence:read --label "<agent> <model> supervisor" --session <your_sid> --out <dir>/grant.json
    ```
 
+   `--session <your_sid>` (your own session id) records this session's own Investigation
+   as the supervisor, so the worker's Storyboard shows "Supervised by" linking to yours.
    `<dir>` is a new private directory, `~/.cardinal/supervise/<inv>/` (create it 0700).
    The label is how the owner sees you on the timeline: name your agent and model
    honestly. The grant lasts 4 hours by default (`--ttl`, up to 24h). Pass

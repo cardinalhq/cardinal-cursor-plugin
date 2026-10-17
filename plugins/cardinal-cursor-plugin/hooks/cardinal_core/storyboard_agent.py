@@ -41,8 +41,8 @@ from typing import Any, Callable, Iterable, List, Optional
 from . import storyboard_context, storyboard_discovery, storyboard_files
 from .paths import AgentPaths
 
-SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\Z")
+COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}\Z")
 CONTEXT_DISABLE_ENV = "CARDINAL_STORYBOARD_CONTEXT"
 # No storyboard text at session start at all (the session id line and the
 # discovery block); CARDINAL_STORYBOARD_DISCOVERY=0 drops the block only.
@@ -172,9 +172,11 @@ class Wiring:
             return None
 
     def collect(self, cwd: str, session_id: Optional[str], *, gh: bool) -> dict:
+        # associations_api: repo_host only for a server that accepts it.
         return storyboard_context.collect(cwd, client=self.client, actor_email=self.actor_email(),
                                           pr_resolver=self.pr_resolver(gh),
-                                          edited_paths=self.edited_paths(session_id))
+                                          edited_paths=self.edited_paths(session_id),
+                                          associations_api=self.caps())
 
 
 def valid_session(session_id: Any) -> bool:

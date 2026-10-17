@@ -233,6 +233,19 @@ def session_context(home: Path, sid: str, conn: dict, context: Optional[dict] = 
     return clean
 
 
+def sendable_context(home: Path, conn: dict, context: Optional[dict]) -> Optional[dict]:
+    """context as it may be sent to conn now: `repo_host` (kept in the saved
+    snapshot and staged repo labels) only while conn's origin is cached at
+    associations_api >= 2 (storyboard_context's gate), since an older
+    maestro answers 400 to the unknown key. The saved copies are unchanged."""
+    if not isinstance(context, dict) or "repo_host" not in context:
+        return context
+    from . import storyboard_context, storyboard_discovery
+    if storyboard_context.sends_repo_host(storyboard_discovery.read_caps_any(home, conn.get("origin"))):
+        return context
+    return {k: v for k, v in context.items() if k != "repo_host"}
+
+
 def ensure(home: Path, sid: str, conn: dict, client: str, *, wanted: Optional[str] = None,
            context: Optional[dict] = None,
            started_at: Optional[str] = None, opener=None, timeout: float = TIMEOUT, force: bool = False,
@@ -284,7 +297,8 @@ def _ensure(home, sid, conn, client, wanted, started_at, context, opener, timeou
             return {"status": "backoff", "binding": b, "error": st.get("last_error"), "reason": st.get("reason")}
         try:
             out = sync.ensure_session_investigation(conn, sid, investigation_id=join, started_at=started_at,
-                                                    context=context, client=client, opener=opener, timeout=timeout)
+                                                    context=sendable_context(home, conn, context), client=client,
+                                                    opener=opener, timeout=timeout)
         except Exception as e:
             if isinstance(e, sync.ServerError) and sync.unsupported(e):
                 # An older Maestro: behave as before (an explicit join still binds
@@ -426,15 +440,16 @@ def refresh_capabilities(home: Path, sid: str, conn: dict, client: str, *, opene
     refused = False
     try:
         out = sync.ensure_session_investigation(conn, sid, investigation_id=inv, client=client, opener=opener,
-                                                context=session_context(home, sid, conn), timeout=timeout)
+                                                context=sendable_context(home, conn, session_context(home, sid, conn)),
+                                                timeout=timeout)
         caps = capabilities(out)
         from . import session_repos
         runtime = client.split("/", 1)[0]
         runtime = "claude" if runtime == "claude-code" else runtime
         if not session_repos.disabled(home, runtime) and b.get("is_author") is not False:
             for context in session_repos.pending(home, sid, conn.get("org")):
-                sync.ensure_session_investigation(conn, sid, investigation_id=inv, client=client,
-                                                  opener=opener, context=context, timeout=timeout)
+                sync.ensure_session_investigation(conn, sid, investigation_id=inv, client=client, opener=opener,
+                                                  context=sendable_context(home, conn, context), timeout=timeout)
     except sync.ServerError as e:
         if not (sync.unsupported(e) or (400 <= e.status < 500 and e.status not in (408, 429))):
             raise
