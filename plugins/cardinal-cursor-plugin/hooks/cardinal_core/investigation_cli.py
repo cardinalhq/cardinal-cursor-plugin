@@ -716,6 +716,38 @@ class CLI:
             )
         return 0
 
+    def _grant_supervisor(self, args, inv: str, scopes: list, conn: dict):
+        """{investigation_id, session_id} of the session minting a supervise
+        grant on an explicit --investigation with an explicit --session (never
+        the defaulted agent session: an owner minting for someone else from
+        an unrelated session must not link it): its own investigation from
+        the local session binding, so the worker's storyboard links to it as
+        "Supervised by". None for any other grant: without --investigation,
+        --session names the granted investigation; a session bound to the
+        granted investigation itself is its owner minting for someone else
+        (both silently); a session with no usable binding (with a note)."""
+        sid = getattr(args, "session", None)
+        if (gr.SUPERVISE not in scopes or not sid or not getattr(args, "session_explicit", False)
+                or getattr(args, "investigation", None) is None):
+            return None
+        why = None
+        if not ie.valid_session(sid):
+            why = f"not a session id: {sid!r}"
+        else:
+            b = ie.read_binding(self._home(), sid)
+            if not b:
+                why = f"session {sid} has no investigation of its own yet"
+            elif b.get("is_author") is not True:
+                why = f"session {sid} joined someone else's investigation"
+            elif b.get("org") not in (None, conn.get("org")):
+                why = f"session {sid} is bound in another organization"
+            elif b["investigation_id"] == inv:
+                return None
+            else:
+                return {"investigation_id": b["investigation_id"], "session_id": sid}
+        print(f"not linking a supervisor storyboard: {why}", file=sys.stderr)
+        return None
+
     def cmd_grant(self, args):
         if not self._author_only("no access granted"):
             return EXIT_USAGE
@@ -729,12 +761,23 @@ class CLI:
         if inv is None:
             return EXIT_USAGE
         conn, client = self.connection()
+        supervisor = self._grant_supervisor(args, inv, scopes, conn)
         if args.out:
             fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
         remote_ok = False
         try:
-            out = gr.grant(conn, inv, scopes, ttl_seconds=ttl, label=args.label, client=client)
+            try:
+                out = gr.grant(conn, inv, scopes, ttl_seconds=ttl, label=args.label, client=client,
+                               supervisor=supervisor)
+            except sync.ServerError as e:
+                if supervisor is None or not gr.supervisor_unsupported(e):
+                    raise
+                # An older Cardinal: its strict schema rejects the two fields.
+                print("this Cardinal does not link supervisors yet; minted without the supervisor link",
+                      file=sys.stderr)
+                supervisor = None
+                out = gr.grant(conn, inv, scopes, ttl_seconds=ttl, label=args.label, client=client)
             remote_ok = True
             if args.out:
                 consumer.private_write(args.out, {"token": out["token"], "origin": conn["origin"]})
@@ -751,6 +794,14 @@ class CLI:
             elif not sys.stdout.isatty():
                 print("no file written: the grant failed (see above)", file=sys.stderr)
                 args.grant_failure_notice = True
+            if supervisor and gr.supervisor_invalid(e):
+                print(
+                    f"no access granted: Cardinal refused to link {supervisor['investigation_id']} (session "
+                    f"{supervisor['session_id']}) as the supervisor: it must be your own investigation and one "
+                    f"of its sessions, never {inv} itself. Pass --session <your own session id>.",
+                    file=sys.stderr,
+                )
+                return 1
             if isinstance(e, sync.ServerError):
                 said = gr.refusal(e)
                 print(
@@ -775,6 +826,9 @@ class CLI:
                 f"investigation revoke {out['grant_id']}`.",
                 file=sys.stderr,
             )
+        if supervisor:
+            print(f"{inv}'s storyboard now links to this session's ({supervisor['investigation_id']}) as "
+                  "\"Supervised by\".", file=sys.stderr)
         print(f"The grantee watches it with `{watch}` (one --follow per investigation; it replaces polling loops; "
               "`events --help` says more).", file=sys.stderr)
         return 0
@@ -1177,6 +1231,15 @@ def not_recorded(err, *, outbox=None):
     return 3
 
 
+class _ExplicitSession(argparse.Action):
+    """--session that records it was given (grant: only an explicit session
+    is linked as the supervisor)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.session_explicit = True
+
+
 def build_parser(wiring, session_env=()):
     parser = argparse.ArgumentParser(
         prog="cardinal-storyboard investigation",
@@ -1223,7 +1286,16 @@ def build_parser(wiring, session_env=()):
         )
         if action == "checkpoint":
             p.usage = "%(prog)s [--session SID] [--key K] [--json]"
-        p.add_argument("--session", default=default_sid)
+        if action == "grant":
+            p.add_argument(
+                "--session", default=default_sid, action=_ExplicitSession,
+                help="this session (default: the agent's own); passed explicitly with --investigation and "
+                     "--scope supervise, its own investigation is recorded as the supervisor, linking the two "
+                     "storyboards",
+            )
+            p.set_defaults(session_explicit=False)
+        else:
+            p.add_argument("--session", default=default_sid)
         p.add_argument("--json", action="store_true")
         p.add_argument(
             "--credential-file",

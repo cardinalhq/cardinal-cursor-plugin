@@ -363,6 +363,59 @@ def write_caps(caps_path: Optional[Path], origin: Optional[str], version: int,
         pass
 
 
+# The runtimes whose capability caches (<runtime home>/cardinal/server-caps.json)
+# all describe the same server per origin, and the environment variable that
+# moves a runtime's home where the runtime has one (Claude Code, Codex).
+CAPS_RUNTIMES = ("claude", "codex", "cursor", "gemini")
+RUNTIME_HOME_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}
+
+
+def caps_paths(home: Optional[Path], environ: Optional[dict] = None) -> list:
+    """Every server-caps.json a runtime may keep under home: the runtime's
+    custom home (RUNTIME_HOME_ENV, when set to an absolute path) and the
+    default <home>/.<runtime> (AgentPaths). Duplicates removed, order kept."""
+    env = os.environ if environ is None else environ
+    out: list = []
+    for runtime in CAPS_RUNTIMES:
+        var = RUNTIME_HOME_ENV.get(runtime)
+        custom = env.get(var) if var else None
+        bases = [Path(custom)] if isinstance(custom, str) and os.path.isabs(custom) else []
+        if home is not None:
+            bases.append(Path(home) / f".{runtime}")
+        for base in bases:
+            path = base / "cardinal" / "server-caps.json"
+            if path not in out:
+                out.append(path)
+    return out
+
+
+def read_caps_any(home: Optional[Path], origin: Optional[str], now: Optional[float] = None,
+                  environ: Optional[dict] = None) -> Optional[int]:
+    """origin's associations_api from the freshest entry (within CAPS_TTL_S)
+    of any runtime's cache (caps_paths), or None: for a caller that sends to
+    a connection without knowing which runtime cached it (the session
+    bootstrap). Never raises."""
+    if not origin:
+        return None
+    best, best_at = None, None
+    now = time.time() if now is None else now
+    try:
+        paths = caps_paths(home, environ)
+    except Exception:
+        return None
+    for path in paths:
+        version = read_caps(path, origin, now)
+        if version is None:
+            continue
+        try:
+            at = read_json(path)[origin]["at"]
+        except Exception:
+            continue
+        if best_at is None or at > best_at:
+            best, best_at = version, at
+    return best
+
+
 def caps_from_answer(found: Any) -> int:
     """A find answer's associations_api (0 from a server without it)."""
     v = found.get("associations_api") if isinstance(found, dict) else None
@@ -1014,6 +1067,7 @@ def _discover(cwd: str, conn: dict, pr_resolver, opener, deadline: float, *,
 
     def work() -> None:
         try:
+            # No associations_api: find's discovery context never carries repo_host.
             ctx = discovery_context(storyboard_context.collect(cwd, client=None, pr_resolver=pr_resolver))
             if not ctx:
                 box["no_context"] = True

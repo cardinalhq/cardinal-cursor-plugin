@@ -307,7 +307,7 @@ def investigations_unsupported(err: "ServerError") -> bool:
     issues = err.body.get("issues")
     return any(isinstance(i, dict) and i.get("path") in ("", None, [])
                and isinstance(i.get("message"), str) and _UNRECOGNIZED_RE.match(i["message"])
-               for i in issues if isinstance(issues, list))
+               for i in (issues if isinstance(issues, list) else []))
 
 
 def _issues(body: dict) -> str:
@@ -422,6 +422,18 @@ def attach_storyboard(conn: dict, investigation_id: str, storyboard_id: str, *, 
                  client=client, opener=opener)
 
 
+def unknown_context_key(err: "ServerError", key: str) -> bool:
+    """maestro's 400 for a context key it does not know (storyboard/context.ts
+    unknownContextKeyMessage: issue path "context", message `context:
+    unknown key "<key>"; ...`)."""
+    body = err.body if isinstance(err.body, dict) else {}
+    issues = body.get("issues")
+    return err.status == 400 and body.get("error") == "invalid_body" and isinstance(issues, list) and any(
+        isinstance(i, dict) and i.get("path") in ("context", ["context"])
+        and isinstance(i.get("message"), str) and f'unknown key "{key}"' in i["message"]
+        for i in issues)
+
+
 def ensure_session_investigation(conn: dict, session_id: str, *, investigation_id: Optional[str] = None,
                                  started_at: Optional[str] = None, context: Optional[dict] = None, client: str, opener=None,
                                  timeout: float = 30.0) -> dict:
@@ -445,16 +457,23 @@ def ensure_session_investigation(conn: dict, session_id: str, *, investigation_i
     try:
         out = _post(conn, "ensure-session-investigation", body, client=client, opener=opener, timeout=timeout)
     except ServerError as err:
+        issues = err.body.get("issues")
+        if context and "repo_host" in context and unknown_context_key(err, "repo_host"):
+            # A maestro before associations_api 2 (a stale capability cache):
+            # the rest of the context still goes.
+            body["context"] = {k: v for k, v in context.items() if k != "repo_host"}
+            if not body["context"]:
+                del body["context"]
         # Servers predating session context reject the new top-level key.
         # Retry only that precise schema refusal; never hide a real error.
-        issues = err.body.get("issues")
-        if not (context and err.status == 400 and err.body.get("error") == "invalid_body"
+        elif context and err.status == 400 and err.body.get("error") == "invalid_body" \
                 and isinstance(issues, list) and any(
                     isinstance(i, dict) and i.get("path") in ("", None, [])
                     and re.fullmatch(r'''Unrecognized key(?:s|\(s\) in object)?: ["']context["']''',
-                                     i.get("message", "")) for i in issues)):
+                                     i.get("message", "")) for i in issues):
+            del body["context"]
+        else:
             raise
-        del body["context"]
         out = _post(conn, "ensure-session-investigation", body, client=client, opener=opener, timeout=timeout)
     inv, sb = out.get("investigation_id"), out.get("storyboard_id")
     if not isinstance(inv, str) or not ist.INVESTIGATION_ID_RE.match(inv) \
