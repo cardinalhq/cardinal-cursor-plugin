@@ -255,9 +255,90 @@ def post(conn: dict, type_: str, text: str, target: str, refs: list, *, client: 
             raise ValueError("outbox contains another advisory; retry its exact content or use a new file")
         # Always retry through the server: it checks revocation/expiry and deduplicates.
         producer = {"session_id": session_id} if not conn.get("token") and session_id else {}
-        result = ie.append_event(conn, conn["investigation_id"], type_, payload,
-                                 idempotency_key=key, to_session_id=target, client=client,
-                                 producer_client=client, **producer)
+        try:
+            result = ie.append_event(conn, conn["investigation_id"], type_, payload,
+                                     idempotency_key=key, to_session_id=target, client=client,
+                                     producer_client=client, **producer)
+        except Exception as e:
+            settle_refused(outbox, saved, e)
+            raise
         saved["result"] = result
         private_write(outbox, saved)
         return result
+
+
+def settle_refused(outbox: Path, saved: dict, err: Exception) -> None:
+    """A definite refusal (a 4xx) resolves an outbox: nothing was recorded,
+    so it no longer blocks a grant succession (unresolved_outboxes). A 5xx
+    or a network failure leaves it unresolved."""
+    status = getattr(err, "status", None)
+    if isinstance(status, int) and 400 <= status < 500:
+        saved["refused"] = {"status": status, "error": (getattr(err, "body", None) or {}).get("error")}
+        private_write(outbox, saved)
+
+
+def unresolved_outboxes(credential: Path, conn: dict) -> list:
+    """The outboxes beside `credential` (outbox/*.json) written under this
+    grant's identity that have neither a result nor a definite refusal: an
+    uncertain post or verdict (the server may have it)."""
+    directory = credential.parent / "outbox"
+    out = []
+    for path in sorted(directory.glob("*.json")) if directory.is_dir() else ():
+        try:
+            saved = private_read(path)
+        except (OSError, ValueError):
+            out.append(path)   # unreadable: it may be unresolved
+            continue
+        intent = saved.get("intent") if isinstance(saved.get("intent"), dict) else {}
+        if intent.get("identity") == identity(conn) and "result" not in saved and "refused" not in saved:
+            out.append(path)
+    return out
+
+
+def verdict_outbox_path(conn: dict, credential: Path, unresolved: dict) -> Path:
+    """verdict-<sha256 of the grant identity and the unresolved verdict
+    input>.json in outbox/ beside the credential: the same command finds its
+    earlier resolved payload, whatever HEAD is now."""
+    key = hashlib.sha256(json.dumps([identity(conn), "verdict", unresolved], sort_keys=True).encode()).hexdigest()
+    return private_directory(credential.parent / "outbox") / f"verdict-{key}.json"
+
+
+def verdict(conn: dict, outbox: Path, build, *, client: str) -> tuple:
+    """(answer, replayed): record a verdict through its outbox. A new outbox
+    gets build() -> (payload, key), written BEFORE the first POST; an
+    existing one resends exactly what it holds (or answers its stored
+    result). A definite refusal is recorded in it (settle_refused)."""
+    with locked(outbox):
+        try:
+            saved = private_read(outbox)
+            replayed = True
+        except FileNotFoundError:
+            payload, key = build()
+            saved = {"intent": {"identity": identity(conn), "type": ie.VERIFICATION, "payload": payload, "key": key}}
+            private_write(outbox, saved, create=True)
+            replayed = False
+        intent = saved.get("intent") if isinstance(saved.get("intent"), dict) else {}
+        if intent.get("identity") != identity(conn) or intent.get("type") != ie.VERIFICATION:
+            raise ValueError("verdict outbox belongs to another grant or holds something else")
+        if "result" in saved:
+            return saved["result"], True
+        saved.pop("refused", None)
+        try:
+            result = grants.record_verification(conn, conn["investigation_id"], intent["payload"],
+                                                idempotency_key=intent["key"], client=client)
+        except Exception as e:
+            settle_refused(outbox, saved, e)
+            raise
+        saved["result"] = result
+        private_write(outbox, saved)
+        return result, replayed
+
+
+def resolve_verdict(outbox: Path, result: dict) -> None:
+    """Record `result` (the stored identical verdict a 409 named) as the
+    outbox's answer."""
+    with locked(outbox):
+        saved = private_read(outbox)
+        saved.pop("refused", None)
+        saved["result"] = result
+        private_write(outbox, saved)

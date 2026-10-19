@@ -15,6 +15,7 @@ from . import investigation_consumer as consumer
 from . import investigation_grants as gr
 from . import investigation_text
 from . import owner_relay
+from . import supervision_status as sv
 
 EXIT_USAGE = 2
 
@@ -620,6 +621,8 @@ class CLI:
         elif e.get("type") == ie.RULING:
             body = (f"{ie._tok(payload.get('outcome'))} ruling on #{ie._tok(str(payload.get('ruling_of')))}"
                     f" (authority {ie._tok(e.get('authority'))}): {ie.json_text(str(payload.get('text', '')))}")
+        elif e.get("type") == ie.VERIFICATION:
+            body = f"{ie.verification_words(payload)}: {ie.json_text(str(payload.get('text', '')))}"
         else:
             body = ie.json_text(str(payload.get("text", "")))
         return (
@@ -751,6 +754,8 @@ class CLI:
     def cmd_grant(self, args):
         if not self._author_only("no access granted"):
             return EXIT_USAGE
+        if args.succeeds_credential_file is not None:
+            return self._succeed(args)
         ttl = gr.parse_ttl(args.ttl)
         scopes = gr.parse_scopes(args.scope, owner_input=args.owner_input)
         if not gr.TTL_MIN <= ttl <= gr.TTL_MAX:
@@ -832,6 +837,130 @@ class CLI:
         print(f"The grantee watches it with `{watch}` (one --follow per investigation; it replaces polling loops; "
               "`events --help` says more).", file=sys.stderr)
         return 0
+
+    def _succeed(self, args) -> int:
+        """grant --succeeds-credential-file OLD: renew a live grant by
+        succession (capability grant_succession), so the new grant keeps
+        ruling and verdict authority over the old one's challenges. Refuses
+        while an outbox of the old grant is unresolved; reserves --out; mints
+        with `succeeds` (a retry after an uncertain answer is idempotent);
+        writes the new token, renews the review cursor, then deletes OLD."""
+        old_path = args.succeeds_credential_file
+        old = consumer.credential_connection(old_path)
+        inv = old["investigation_id"]
+        if not args.out:
+            raise ValueError("--succeeds-credential-file needs --out <the new credential file>")
+        if args.investigation is not None and args.investigation != inv:
+            raise ValueError(f"{old_path} is a grant on {inv}, not {args.investigation}")
+        if not gr.valid_grant_id(old.get("grant_id")):
+            raise ValueError(f"{old_path} names no grant id")
+        old_scopes = [x for x in gr.SCOPES if x in (old.get("scopes") or [])]
+        scopes = gr.parse_scopes(args.scope, owner_input=args.owner_input) \
+            if args.scope is not None or args.owner_input else old_scopes
+        if set(scopes) != set(old_scopes):
+            raise ValueError(f"a successor has exactly its predecessor's scopes ({','.join(old_scopes)}); drop --scope")
+        ttl = gr.parse_ttl(args.ttl)
+        if not gr.TTL_MIN <= ttl <= gr.TTL_MAX:
+            raise ValueError("--ttl is 5m to 24h")
+        if args.label is not None and not gr.valid_label(args.label):
+            raise ValueError(f"--label is 1 to {gr.MAX_LABEL} printable characters")
+        conn, client = self.connection()
+        if str(conn.get("origin") or "").rstrip("/") != old["origin"]:
+            raise ValueError(f"{old_path} is a grant of {old['origin']}, not of this machine's Cardinal")
+        able = gr.supports(conn, inv, gr.SUCCESSION_CAPABILITY, client=client)
+        if able is None:
+            able = gr.supports(old, inv, gr.SUCCESSION_CAPABILITY, client=client)
+        if able is not True:
+            print("not renewed: this Cardinal does not support grant succession yet. A new grant (`investigation "
+                  "grant`, then `renew-cursor`) cannot rule on or verify the old grant's challenges", file=sys.stderr)
+            return 1
+        unresolved = consumer.unresolved_outboxes(old_path, old)
+        if unresolved:
+            print("not renewed: resolve or retry these posts first (once the old grant is revoked an uncertain post "
+                  "cannot be retried, and re-posting it under the new grant could duplicate it): "
+                  + ", ".join(str(x) for x in unresolved) + ". Explicit --outbox-file outboxes are not checked.",
+                  file=sys.stderr)
+            return 1
+        try:
+            kept = consumer.private_read(args.out)
+        except FileNotFoundError:
+            kept = None
+        except (OSError, ValueError):
+            raise ValueError(f"{args.out} exists and is not this succession's reservation")
+        if kept is not None and (kept.get("succession_of") != old["grant_id"] or not isinstance(kept.get("request"), dict)):
+            raise ValueError(f"{args.out} exists and is not this succession's reservation")
+        if kept is not None:
+            # A retry resends the earlier request unchanged: the server answers the same successor.
+            request = kept["request"]
+            print(f"resending the succession reserved in {args.out} unchanged", file=sys.stderr)
+        else:
+            request = self._succession_request(args, conn, client, inv, old, scopes, ttl)
+            if request is None:
+                return 1
+            consumer.private_write(args.out, {"succession_of": old["grant_id"], "request": request}, create=True)
+        recover = (f"{args.out} stays reserved. If the successor exists but its token was lost, find it with "
+                   f"`cardinal-storyboard investigation grants --investigation {inv}` and revoke it, or ask your owner "
+                   "for a grant from the web")
+        try:
+            out = gr.grant(conn, inv, request["scopes"], ttl_seconds=request["ttl_seconds"], label=request.get("label"),
+                           client=client, supervisor=request.get("supervisor"),
+                           succeeds={"grant_id": old["grant_id"], "token": old["token"]})
+        except sync.ServerError as e:
+            said = gr.refusal(e) or self.refused(e, "no access granted")
+            if e.status < 500 and kept is None and e.body.get("error") != "predecessor_succeeded":
+                args.out.unlink()   # a first attempt refused: nothing was minted
+                print("not renewed: " + said, file=sys.stderr)
+                return 1
+            print(f"not renewed: {said}. {recover}", file=sys.stderr)
+            return 1
+        except ist.FetchError as e:
+            print(f"the succession may have happened ({ie._one_line(e)}): run the same command again (it is "
+                  f"idempotent while the old grant lives); {args.out} stays reserved", file=sys.stderr)
+            return 3
+        consumer.private_write(args.out, {"token": out["token"], "origin": conn["origin"]})
+        cursor = args.cursor_file or (old_path.parent / "cursor.json")
+        renewed = None
+        if args.cursor_file or cursor.exists():
+            try:
+                renewed = consumer.renew_cursor(old, consumer.credential_connection(args.out), cursor, client=client)
+            except (ValueError, OSError, sync.ServerError, ist.FetchError) as e:
+                print(f"the new grant is in {args.out}, but the review cursor was not renewed ({ie._one_line(e)}); "
+                      f"{old_path} is kept: run `cardinal-storyboard investigation renew-cursor "
+                      f"--previous-credential-file {old_path} --credential-file {args.out} --cursor-file {cursor}`, "
+                      "then delete it", file=sys.stderr)
+                return 1
+        old_path.unlink()
+        shown = {k: v for k, v in out.items() if k != "token"}
+        shown.update(credential_file=str(args.out), succeeded=old["grant_id"])
+        if renewed is not None:
+            shown["cursor"] = renewed
+        print(json.dumps(shown, indent=2, ensure_ascii=False))
+        print(f"{old['grant_id']} is revoked (succeeded by {ie._tok(out.get('grant_id'))}); {old_path} was deleted. "
+              f"Restart your watch on {args.out}: one on the old file now gets 401. Explicit --outbox-file outboxes "
+              "were not checked: an uncertain one of the old grant can no longer be retried.", file=sys.stderr)
+        return 0
+
+    def _succession_request(self, args, conn, client, inv, old, scopes, ttl):
+        """The successor's request: the old grant's label and supervisor link
+        (list-investigation-grants, this machine's key) unless --label /
+        --session --investigation give them. None (said why) when the old
+        grant cannot be read."""
+        try:
+            row = next((g for g in gr.list_grants(conn, inv, client=client) if gr.grant_id_of(g) == old["grant_id"]),
+                       None)
+        except (sync.ServerError, ist.FetchError) as e:
+            print(f"not renewed: could not read the old grant's label and supervisor link ({ie._one_line(e)})",
+                  file=sys.stderr)
+            return None
+        if row is None:
+            print(f"not renewed: {old['grant_id']} is not a grant of {inv} this machine's key can list", file=sys.stderr)
+            return None
+        label = args.label if args.label is not None else row.get("label") if gr.valid_label(row.get("label")) else None
+        supervisor = self._grant_supervisor(args, inv, scopes, conn)
+        sup_inv, sup_sid = row.get("supervisor_investigation_id"), row.get("supervisor_session_id")
+        if supervisor is None and ie.valid_investigation(sup_inv) and ie.valid_session(sup_sid):
+            supervisor = {"investigation_id": sup_inv, "session_id": sup_sid}
+        return {"scopes": scopes, "ttl_seconds": ttl, "label": label, "supervisor": supervisor}
 
     def cmd_grants(self, args: argparse.Namespace) -> int:
 
@@ -944,19 +1073,42 @@ class CLI:
             sys.stderr.write(f"not checkpointed: stdin is not JSON ({e})\n")
             return EXIT_USAGE
         conn, client = self.connection()
+        key, outbox = args.key, None
+        if ie.wants_auto_revision(data) and not ie.capability(b, "checkpoint_revision"):
+            data = ie.with_revision(data, None)
+            print("warning: this Cardinal server does not support checkpoint revision; field stripped", file=sys.stderr)
+        elif ie.wants_auto_revision(data):
+            # Resolve once; every retry of this input resends the same batch and key.
+            try:
+                data, key, outbox = self._resolved_checkpoint(sid, b, data, args.key)
+            except ie.CheckpointInputError as e:
+                sys.stderr.write(f"not checkpointed: {e}\n")
+                return EXIT_USAGE
         t = time.monotonic()
         try:
-            out = ie.checkpoint(
-                conn,
-                b["investigation_id"],
-                sid,
-                data,
-                idempotency_key=args.key,
-                client=client,
-                producer_client=self.client(),
-                timing=timing,
-                home=self._home(),
-            )
+            keep = outbox is not None
+            try:
+                out = ie.checkpoint(
+                    conn,
+                    b["investigation_id"],
+                    sid,
+                    data,
+                    idempotency_key=key,
+                    client=client,
+                    producer_client=self.client(),
+                    timing=timing,
+                    home=self._home(),
+                )
+                keep = False
+            except (ie.CheckpointInputError, ie.EvidenceRefused):
+                keep = False
+                raise
+            except sync.ServerError as e:
+                keep = e.status >= 500
+                raise
+            finally:
+                if outbox is not None and not keep:
+                    outbox.unlink(missing_ok=True)
         except ie.CheckpointInputError as e:
             sys.stderr.write(f"not checkpointed: {e}\n")
             return EXIT_USAGE
@@ -973,6 +1125,8 @@ class CLI:
             sys.stderr.write(f"not checkpointed: {ie.checkpoint_refusal(e)}\n")
             return 1
         except ist.FetchError as e:
+            if outbox is not None:
+                print("the resolved checkpoint is kept: run the same command again to resend it", file=sys.stderr)
             return not_recorded(e)
         finally:
             timing["request"] = time.monotonic() - t - timing["upload"]
@@ -982,6 +1136,231 @@ class CLI:
             sys.stdout.write(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
         else:
             sys.stdout.write(ie.checkpoint_line(out) + "\n")
+        return 0
+
+    def _resolved_checkpoint(self, sid: str, b: dict, data, key):
+        """(events, key, outbox) for an input with "revision": "auto": the
+        kept outbox of this exact input when an earlier send was uncertain
+        (said, with the commit it carries), else the input resolved against
+        this checkout, written to a new outbox before anything is sent."""
+        home, inv = self._home(), b["investigation_id"]
+        outbox = ie.checkpoint_outbox(home, sid, inv, data, key)
+        saved = ie.read_checkpoint_outbox(outbox)
+        if saved is not None:
+            sent, head = saved.get("commit"), ie.head_commit(os.getcwd())
+            note = f"replayed an earlier send at {ie._tok(str(sent)[:7])}"
+            if head and sent and head != sent:
+                note += f"; HEAD is now {ie._tok(head[:7])}: checkpoint again for the new commit"
+            print(note, file=sys.stderr)
+            return saved["events"], saved["key"], outbox
+        revision = ie.resolve_revision(os.getcwd())
+        events = ie.checkpoint_capabilities(ie.checkpoint_events(ie.with_revision(data, revision)), b)
+        key = key or ie.checkpoint_key(inv, sid, events)
+        ie._ensure_dirs(home)
+        ie.write_json(outbox, {"version": 1, "commit": revision["commit"], "key": key, "events": events})
+        return events, key, outbox
+
+    # -- delegated supervision verdicts and the challenge table (supervisor side)
+
+    def _supervise_grant(self, args, what: str):
+        """(conn, client, inv) of a supervise grant's credential, or None
+        (the reason printed)."""
+        got = self._target(args) if self.scoped else None
+        conn = got[0] if got is not None else {}
+        if not self.scoped or (got is not None and not conn.get("token")):
+            print(f"{what}: this needs a supervise grant's credential (--credential-file); the investigation's "
+                  "author mints one with `cardinal-storyboard investigation grant --scope supervise`", file=sys.stderr)
+            return None
+        if got is None:
+            return None
+        scopes = conn.get("scopes") if isinstance(conn.get("scopes"), list) else None
+        if scopes and gr.SUPERVISE not in scopes:
+            print(f"{what}: this grant's scopes are {','.join(ie._tok(x) for x in scopes)}, without supervise",
+                  file=sys.stderr)
+            return None
+        return got
+
+    def cmd_verdict(self, args: argparse.Namespace) -> int:
+        """Supervisor: a scoped, revision-bound verdict on a challenge's
+        current correction (--correction) or on a claim (record-verification)."""
+        got = self._supervise_grant(args, "no verdict recorded")
+        if got is None:
+            return EXIT_USAGE
+        conn, client, inv = got
+        verdict = "verified" if args.verified else "rejected" if args.rejected else "unverifiable"
+        if args.revision is not None and args.revision != "auto":
+            raise ValueError("--revision takes only auto (this checkout's HEAD); else --repo/--commit")
+        if args.revision and (args.repo or args.commit or args.pr is not None):
+            raise ValueError("--revision auto or --repo/--commit/--pr, not both")
+        if args.credential_file is None:
+            raise ValueError("verdict needs --credential-file: its outbox lives beside it")
+        # A verdict follows a review, never a fetch.
+        cursor = args.cursor_file or (args.credential_file.parent / "cursor.json")
+        if args.correction is not None and (args.cursor_file or cursor.exists()):
+            try:
+                watermark = consumer.committed(conn, cursor)
+            except ValueError:
+                raise ValueError(f"{cursor} belongs to another grant, origin or investigation: renew it with "
+                                 "`renew-cursor`, or pass this grant's --cursor-file")
+            if watermark is not None and args.correction > watermark:
+                print(f"no verdict recorded: review the page containing #{args.correction} first (your committed "
+                      f"review position is #{watermark})", file=sys.stderr)
+                return EXIT_USAGE
+        unresolved = {"seq": args.seq, "verdict": verdict, "scope": args.scope, "correction": args.correction,
+                      "repo": args.repo, "commit": args.commit, "pr": args.pr, "revision": args.revision,
+                      "artifact": args.artifact, "target": args.target, "observed_at": args.observed_at,
+                      "text": args.text, "evidence": args.evidence, "ref": args.ref, "supersedes": args.supersedes}
+        outbox = consumer.verdict_outbox_path(conn, args.credential_file, unresolved)
+        if gr.supports(conn, inv, gr.VERIFICATIONS_CAPABILITY, client=client) is False:
+            print(gr.VERIFICATIONS_UNSUPPORTED, file=sys.stderr)
+            return 1
+
+        def build():
+            target = self._verdict_target(conn, client, inv, args.seq)
+            if target == ie.CHALLENGE and args.correction is None:
+                raise ValueError(f"#{args.seq} is a challenge: name the correction you verified with --correction "
+                                 "<seq> (`investigation challenges` lists it)")
+            if target not in (None, ie.CHALLENGE) and args.correction is not None:
+                raise ValueError(f"--correction is only for a challenge; #{args.seq} is a {ie._tok(target)}")
+            if target not in (None, ie.CHALLENGE) and verdict == "rejected":
+                raise ValueError(gr.VERIFICATION_REFUSALS["refute_with_challenge"])
+            subject = {"repo": args.repo, "commit": args.commit, "pr": args.pr, "target": args.target,
+                       "observed_at": args.observed_at}
+            if args.revision:
+                subject.update(ie.resolve_revision(os.getcwd()))   # the supervisor's own checkout
+            if args.artifact:
+                subject["artifacts"] = [artifact_hash(a) for a in args.artifact]
+            if args.supersedes is not None:
+                verdicts = [e for e in self._read_stream(conn, client, inv)[0]
+                            if e.get("type") == ie.VERIFICATION and isinstance(e.get("payload"), dict)]
+                if any(v["seq"] == args.supersedes for v in verdicts) \
+                        and len(sv.chain(verdicts, args.supersedes)) - 1 >= sv.MAX_REVISIONS:
+                    raise ValueError(gr.VERIFICATION_REFUSALS["verdict_revision_limit"])
+            payload = gr.verification_payload(args.seq, verdict, args.scope, args.text, correction=args.correction,
+                                              subject=subject, evidence=args.evidence, refs=args.ref or None,
+                                              supersedes=args.supersedes)
+            return payload, gr.verification_key(conn, payload)
+
+        try:
+            out, replayed = consumer.verdict(conn, outbox, build, client=client)
+        except ie.CheckpointInputError as e:
+            raise ValueError(str(e))
+        except sync.ServerError as e:
+            return self._verdict_refused(e, conn, client, inv, outbox)
+        except ist.FetchError as e:
+            if getattr(e, "network", False) or getattr(e, "ambiguous", False):
+                if outbox.exists():
+                    print("the resolved verdict is kept beside the credential: run the same command again to resend "
+                          "it", file=sys.stderr)
+                return not_recorded(e)
+            print("no verdict recorded: " + ie._one_line(e, 1000), file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            return 0
+        ev = out["event"]
+        said = "already recorded" if out.get("duplicate") or replayed else "recorded"
+        print(f"{said} verdict #{ev['seq']}: {ie.verification_words(ev.get('payload') or {})}")
+        return 0
+
+    def _verdict_target(self, conn, client, inv, seq):
+        """The type of event `seq` (None when it cannot be read: the server judges)."""
+        try:
+            page = ie.read_events(conn, inv, after=seq - 1, limit=1, client=client, timeout=10.0)
+        except sync.ServerError:
+            return None
+        e = next((e for e in page["events"] if e.get("seq") == seq), None)
+        if e is None:
+            raise ValueError(f"there is no event #{seq} this grant can read in {inv}")
+        return e.get("type")
+
+    def _verdict_refused(self, e, conn, client, inv, outbox) -> int:
+        code = e.body.get("error") if isinstance(e.body, dict) else None
+        if gr.verification_unsupported(e) or (
+                e.status in (401, 403) and code in (None, "token_scope_mismatch", "Invalid token")
+                and gr.supports(conn, inv, gr.VERIFICATIONS_CAPABILITY, client=client) is False):
+            print(gr.VERIFICATIONS_UNSUPPORTED, file=sys.stderr)
+            return 1
+        if code == "verification_exists" and isinstance(e.body.get("seq"), int):
+            given = e.body.get("verification")
+            stored = self._stored_event(conn, client, inv, e.body["seq"])   # with its grant's label
+            if stored is None and isinstance(given, dict) and isinstance(given.get("payload"), dict) \
+                    and given.get("seq") == e.body["seq"]:
+                stored = given
+            intent = consumer.private_read(outbox)["intent"]
+            if stored is not None and stored.get("payload") == intent["payload"]:
+                consumer.resolve_verdict(outbox, {"event": stored, "duplicate": True})
+                print(f"already recorded as verdict #{stored['seq']} by {stored_grant(stored)}: "
+                      f"{ie.verification_words(stored['payload'])}")
+                return 0
+            who = f" by {stored_grant(stored)}" if stored is not None else ""
+            own = e.body["same_lineage"] if isinstance(e.body.get("same_lineage"), bool) else \
+                stored is not None and sv.lineage(stored) == conn.get("grant_id")
+            fix = (f"to revise your own verdict, run the same command with --supersedes {e.body['seq']}" if own else
+                   "another lineage's verdict stays; a changed judgment needs a new correction")
+            print(f"no verdict recorded: verdict #{e.body['seq']}{who} already judges that correction (or claim) in "
+                  f"that scope with other content; {fix}", file=sys.stderr)
+            return 1
+        if code == "verdict_already_superseded":
+            # A retried supersede (a renewed grant is a new principal): success when the
+            # verdict that superseded it is this one.
+            intent = consumer.private_read(outbox)["intent"]
+            old = intent["payload"].get("supersedes_verdict")
+            events = self._read_stream(conn, client, inv)[0]
+            verdicts = [e for e in events if e.get("type") == ie.VERIFICATION and isinstance(e.get("payload"), dict)]
+            by = sv.revised_by(verdicts).get(old)
+            stored = next((v for v in verdicts if v["seq"] == by), None)
+            if stored is not None and stored["payload"] == intent["payload"]:
+                consumer.resolve_verdict(outbox, {"event": stored, "duplicate": True})
+                print(f"already recorded as verdict #{stored['seq']} by {stored_grant(stored)}: "
+                      f"{ie.verification_words(stored['payload'])}")
+                return 0
+        said = gr.VERIFICATION_REFUSALS.get(code)
+        if code == "correction_not_current":
+            current = next((e.body[k] for k in ("current_correction", "correction", "current")
+                            if isinstance(e.body.get(k), int)), None)
+            if current is not None:
+                said += f": the current correction is #{current} (review it, then verify that one)"
+        print("no verdict recorded: " + (f"Cardinal refused ({said})" if said else ie.plain(e)), file=sys.stderr)
+        return 1
+
+    def _stored_event(self, conn, client, inv, seq):
+        try:
+            page = ie.read_events(conn, inv, after=seq - 1, limit=1, client=client, timeout=10.0)
+        except (sync.ServerError, ist.FetchError):
+            return None
+        return next((x for x in page["events"] if x.get("seq") == seq and isinstance(x.get("payload"), dict)), None)
+
+    def _read_stream(self, conn, client, inv):
+        """(every event this connection can read, the principals map)."""
+        events, principals, after = [], {}, 0
+        while True:
+            page = ie.read_events(conn, inv, after=after, limit=ie.PAGE_LIMIT, client=client)
+            events += page["events"]
+            principals.update(page.get("principals") or {})
+            if page["last_seq"] <= after or page["last_seq"] >= page["head_seq"]:
+                return events, principals
+            after = page["last_seq"]
+
+    def cmd_challenges(self, args: argparse.Namespace) -> int:
+        """One row per challenge: status, position, current correction,
+        verdicts (superseded / revision mismatch / revoked), next action;
+        --check-heads asks `gh` (read-only) where each named PR's head is."""
+        got = self._target(args)
+        if got is None:
+            return EXIT_USAGE
+        conn, client, inv = got
+        rows = challenge_rows(*self._read_stream(conn, client, inv))
+        heads = check_heads(rows) if args.check_heads else None
+        if args.json:
+            print(json.dumps({"investigation_id": inv, "heads": heads or "not requested", "challenges": rows},
+                             indent=2, ensure_ascii=False))
+            return 0
+        for row in rows:
+            print(challenge_line(row))
+        if args.check_heads and heads == "unchecked":
+            print("heads unchecked: gh is not available here", file=sys.stderr)
+        print(f"{len(rows)} challenge{'s' if len(rows) != 1 else ''} in {inv}", file=sys.stderr)
         return 0
 
     # -- relayed owner decisions (supervisor side). Nothing here sends a
@@ -1216,6 +1595,165 @@ class CLI:
         return 0
 
 
+def stored_grant(e: dict) -> str:
+    """The grant a stored verdict was recorded with: its principal and label."""
+    producer = e.get("producer") if isinstance(e.get("producer"), dict) else {}
+    pr = producer.get("principal") if isinstance(producer.get("principal"), dict) else {}
+    return f"{ie._tok(pr.get('kind'))}:{ie._tok(pr.get('id'))} ({ie.grantee_label(producer)})"
+
+
+def artifact_hash(path: str) -> dict:
+    """{path, sha256} of a repo-relative file (the verdict's subject)."""
+    import hashlib
+    ie.validate_structured("artifacts", [{"path": path, "sha256": "0" * 64}], "--artifact")
+    with open(path, "rb") as f:
+        return {"path": path, "sha256": hashlib.sha256(f.read()).hexdigest()}
+
+
+def challenge_rows(events: list, principals: dict) -> list:
+    """The `investigation challenges` rows, from structured state only."""
+    rows = []
+    for c, info in sorted(sv.challenge_report(events).items()):
+        k = info["correction"]
+        rev = (k.get("payload") or {}).get("revision") if k is not None else None
+        rev = rev if isinstance(rev, dict) else None
+        revised = sv.revised_by(info["verdicts"])
+        verdicts = []
+        for v in info["verdicts"]:
+            p, producer = v.get("payload") or {}, v.get("producer") if isinstance(v.get("producer"), dict) else {}
+            subject = p.get("subject") if isinstance(p.get("subject"), dict) else {}
+            gid = (producer.get("principal") or {}).get("id") if isinstance(producer.get("principal"), dict) else None
+            grant = principals.get(f"grantee:{gid}") if isinstance(principals.get(f"grantee:{gid}"), dict) else {}
+            verdicts.append({
+                "seq": v["seq"], "verdict": p.get("verdict"), "scope": p.get("scope"), "correction": p.get("correction"),
+                **{f: subject[f] for f in ("repo", "commit", "pr", "dirty", "tree", "target", "observed_at")
+                   if f in subject},
+                "superseded": k is None or p.get("correction") != k["seq"],
+                "revised_by": revised.get(v["seq"]),
+                "revision_mismatch": sv.revision_mismatch(rev, subject),
+                "snapshot_unbound": sv.snapshot_unbound(rev) or sv.snapshot_unbound(subject),
+                "grant": gid, "grant_label": grant.get("label"),
+                "revoked": bool(grant.get("revoked") is True or grant.get("revoked_at"))
+                and grant.get("revoked_reason") != "succeeded",
+            })
+        pos = info["position"]
+        nxt = sv.next_action(info, sv.deciding_staleness(events, info), c)
+        rows.append({
+            "seq": c, "status": info["status"], "ruling_seq": info["ruling_seq"], "owner_seq": info["owner_seq"],
+            "position": {"seq": pos["seq"], "of": (pos.get("payload") or {}).get("ack_of"),
+                         "disposition": (pos.get("payload") or {}).get("disposition")} if pos else None,
+            "correction": {"seq": k["seq"], "revision": rev, "snapshot_unbound": sv.snapshot_unbound(rev),
+                           "artifacts": len((k.get("payload") or {}).get("artifacts") or [])} if k else None,
+            "verification_seq": info["verification_seq"], "verdicts": verdicts,
+            "next": nxt,
+        })
+    return rows
+
+
+def _rollup(checks) -> str:
+    states = []
+    for x in checks if isinstance(checks, list) else ():
+        if not isinstance(x, dict):
+            continue
+        if "state" in x:
+            states.append(str(x.get("state")).upper())
+        else:
+            states.append(str(x.get("conclusion")).upper() if x.get("status") == "COMPLETED" else "PENDING")
+    if not states:
+        return "none"
+    if any(s in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE") for s in states):
+        return "failing"
+    if any(s in ("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "NONE") for s in states):
+        return "pending"
+    return "passing"
+
+
+def check_heads(rows: list) -> str:
+    """Mark every PR a correction or verdict names with its live head
+    (`gh pr view`, read-only): head, head_moved, ci. "checked", or
+    "unchecked" without gh. Nothing is written anywhere."""
+    import shutil
+    import subprocess
+    if shutil.which("gh") is None:
+        return "unchecked"
+    seen: dict = {}
+    hosts = {"github.com": True}
+
+    def trusted(host):
+        # gh sends GH_ENTERPRISE_TOKEN / GITHUB_TOKEN to the host it is asked
+        # about, and the repo is the worker's claim: only github.com and hosts
+        # gh is authenticated for.
+        if host not in hosts:
+            try:
+                hosts[host] = subprocess.run(["gh", "auth", "status", "--hostname", host], capture_output=True,
+                                             timeout=15, check=False).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                hosts[host] = False
+        return hosts[host]
+
+    def head(repo, pr):
+        if not trusted(repo.split("/", 1)[0]):
+            return "untrusted"
+        if (repo, pr) not in seen:
+            seen[(repo, pr)] = None
+            try:
+                out = subprocess.run(["gh", "pr", "view", str(pr), f"--repo={repo}", "--json",
+                                      "headRefOid,statusCheckRollup"], capture_output=True, text=True, timeout=15,
+                                     check=False)
+                data = json.loads(out.stdout) if out.returncode == 0 else None
+            except (OSError, ValueError, subprocess.SubprocessError):
+                data = None
+            if isinstance(data, dict) and isinstance(data.get("headRefOid"), str):
+                seen[(repo, pr)] = (data["headRefOid"], _rollup(data.get("statusCheckRollup")))
+        return seen[(repo, pr)]
+
+    for row in rows:
+        k = row["correction"]
+        named = ([(k["revision"], k)] if k and k["revision"] else []) + [(v, v) for v in row["verdicts"]]
+        for item, mark in named:
+            if isinstance(item.get("pr"), int) and isinstance(item.get("repo"), str) and item.get("commit"):
+                got = head(item["repo"], item["pr"])
+                mark["head"] = {"unchecked": "host not trusted"} if got == "untrusted" else \
+                    {"sha": got[0], "moved": got[0] != item["commit"], "ci": got[1]} if got else {"unreadable": True}
+    return "checked"
+
+
+def challenge_line(row: dict) -> str:
+    def head(item):
+        h = item.get("head")
+        if not h:
+            return ""
+        if h.get("unreadable"):
+            return " [head unreadable]"
+        if h.get("unchecked"):
+            return f" [head unchecked ({h['unchecked']})]"
+        return (" [head moved]" if h["moved"] else "") + f" [CI {h['ci']}]"
+
+    parts = [f"#{row['seq']} {row['status']}"]
+    pos = row["position"]
+    if pos:
+        parts.append(f"position #{pos['seq']} {ie._tok(pos['disposition'])}"
+                     + (f" of directive #{pos['of']}" if pos["of"] != row["seq"] else ""))
+    k = row["correction"]
+    if k:
+        rev = k["revision"]
+        what = f"correction #{k['seq']}" + (f" {ie.subject_words(rev)}" if rev else "") \
+            + (f" {k['artifacts']} artifacts" if k["artifacts"] else "")
+        parts.append(what + head(k))
+    for v in row["verdicts"]:
+        at = ie.subject_words(v)
+        parts.append(f"verdict #{v['seq']} {ie._tok(v['verdict'])} {ie._tok(v['scope'])}" + (f" {at}" if at else "")
+                     + (f" [superseded by #{k['seq']}]" if v["superseded"] and k else "")
+                     + (f" [revised by #{v['revised_by']}]" if v["revised_by"] else "")
+                     + (" [revision mismatch]" if v["revision_mismatch"] else "")
+                     + (" [snapshot unbound]" if v["snapshot_unbound"] else "")
+                     + (" [grant revoked]" if v["revoked"] else "") + head(v))
+    nxt = row["next"]
+    parts.append(f"next: {nxt['actor']} {nxt['action_kind']}"
+                 + (f" ({nxt['action']})" if nxt["action_kind"] != "none" else ""))
+    return " · ".join(parts)
+
+
 def not_recorded(err, *, outbox=None):
     reason = ie._one_line(err, 500)
     if not getattr(err, "network", False):
@@ -1266,6 +1804,8 @@ def build_parser(wiring, session_env=()):
         "grants",
         "revoke",
         "rule",
+        "verdict",
+        "challenges",
         "reviewed",
         "renew-cursor",
         "show",
@@ -1315,14 +1855,19 @@ def build_parser(wiring, session_env=()):
             ),
         )
         p.set_defaults(investigation_id=None)
-        if action in ("events", "show", "post", "bind", "attach", "propose-decision", "supervising", "budget"):
+        if action in ("events", "show", "post", "bind", "attach", "propose-decision", "supervising", "budget",
+                      "challenges"):
             p.add_argument("investigation_id", nargs=None if action in ("bind", "attach") else "?")
-        if action in ("events", "reviewed", "renew-cursor"):
+        if action in ("events", "reviewed", "renew-cursor", "verdict", "grant"):
             p.add_argument(
                 "--cursor-file", type=Path,
                 help="#190 durable pending-page review state (requires grant)"
                      + ("; with --follow and no --auto-review, a watch from the committed position"
-                        if action == "events" else ""),
+                        if action == "events" else
+                        "; --correction must be at or below its committed position (default: cursor.json beside "
+                        "the credential)" if action == "verdict" else
+                        "; with --succeeds-credential-file, renewed for the new grant (default: cursor.json beside "
+                        "the old credential)" if action == "grant" else ""),
             )
         if action == "repos":
             p.add_argument("--cwd", action="append", default=[], help="checkout to attach; repeat for multiple repos; saved edits are replayed too")
@@ -1363,6 +1908,9 @@ def build_parser(wiring, session_env=()):
                 "require read; supervise implies read,advise and adds binding rulings on its own challenges)",
             )
             p.add_argument("--owner-input", action="store_true")
+            p.add_argument("--succeeds-credential-file", type=Path, metavar="OLD",
+                           help="renew the live grant in OLD by succession (keeps its ruling and verdict authority): "
+                                "needs --out; renews the cursor, then deletes OLD")
         elif action == "revoke":
             p.add_argument("grant_id")
         elif action == "post":
@@ -1398,6 +1946,33 @@ def build_parser(wiring, session_env=()):
             outcome.add_argument("--withdraw", action="store_true", help="close the challenge")
             p.add_argument("--text", required=True, help="the directive, or why it is withdrawn (1-4000 chars)")
             p.add_argument("--ref", action="append", default=[])
+        elif action == "verdict":
+            p.description = ("A scoped, revision-bound verdict on a challenge's current correction (--correction) "
+                             "or on a claim. The scope is what you actually checked; never merge_readiness or "
+                             "deployment from a fixture run.")
+            p.add_argument("seq", type=int, help="the challenge (with --correction) or the claim you verified")
+            verdict = p.add_mutually_exclusive_group(required=True)
+            for flag in gr.VERDICTS:
+                verdict.add_argument("--" + flag, action="store_true")
+            p.add_argument("--scope", required=True, choices=gr.VERIFICATION_SCOPES)
+            p.add_argument("--correction", type=int, metavar="SEQ", help="the challenge's current correction "
+                           "(required for a challenge)")
+            p.add_argument("--supersedes", type=int, metavar="SEQ", help="revise your own lineage's active verdict on "
+                           "the same correction and scope")
+            p.add_argument("--repo", help="<host>/<owner>/<name>")
+            p.add_argument("--commit", help="40 lowercase hex")
+            p.add_argument("--pr", type=int)
+            p.add_argument("--revision", metavar="auto", help="auto: your own checkout's HEAD, origin, open PR")
+            p.add_argument("--artifact", action="append", default=[], help="a repo-relative file you checked (repeat)")
+            p.add_argument("--target", help="deployment / rollout_observed: what was observed (1-200 chars)")
+            p.add_argument("--observed-at", help="deployment / rollout_observed: RFC 3339 time")
+            p.add_argument("--text", required=True, help="what was checked and the deciding result (1-2000 chars)")
+            p.add_argument("--evidence", action="extend", nargs="+", default=[], help="ev_… / rcpt_… (>=1 unless "
+                           "--unverifiable)")
+            p.add_argument("--ref", action="append", default=[])
+        elif action == "challenges":
+            p.add_argument("--check-heads", action="store_true", help="read-only `gh pr view` of every PR named in a "
+                           "correction or verdict: head moved, CI rollup")
         elif action == "events":
             p.add_argument("--after", type=int, default=0)
             p.add_argument(
@@ -1496,6 +2071,10 @@ def normalize_argv(argv):
         "--close",
         "--amend",
         "--calibrate",
+        "--verified",
+        "--rejected",
+        "--unverifiable",
+        "--check-heads",
         "--help",
         "-h",
     }
@@ -1542,7 +2121,7 @@ def cli_main(argv, wiring, session_env=(), *, legacy=False):
                   f"{args.action} without --credential-file and without CARDINAL_INVESTIGATION_TOKEN", file=sys.stderr)
             return EXIT_USAGE
         if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify", "rule", "proposals",
-                                              "withdraw-proposal", "budget", "renew-cursor"):
+                                              "withdraw-proposal", "budget", "renew-cursor", "verdict", "challenges"):
             return EXIT_USAGE if not cli._author_only("not recorded") else 0
         if args.action == "post" and (args.type is None or args.text is None):
             raise ValueError("post requires type and text (positional or --type/--text)")

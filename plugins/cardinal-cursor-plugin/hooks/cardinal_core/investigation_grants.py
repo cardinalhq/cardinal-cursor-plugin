@@ -40,6 +40,7 @@ from typing import Any, Optional
 from . import investigation_events as ie
 from . import investigation_state as ist
 from . import investigation_state_sync as sync
+from . import supervision_status as sv
 
 READ = "read"
 OWNER_INPUT_READ = "owner_input:read"
@@ -108,13 +109,16 @@ def valid_label(v: Any) -> bool:
 
 def grant(conn: dict, investigation_id: str, scopes: list, *, ttl_seconds: Optional[int] = None,
           label: Optional[str] = None, client: str, opener=None,
-          supervisor: Optional[dict] = None) -> dict:
+          supervisor: Optional[dict] = None, succeeds: Optional[dict] = None) -> dict:
     """grant-investigation-access: the grant, its token shown once.
 
     supervisor: {investigation_id, session_id} of the minting session (the
     supervisor's own investigation), sent as supervisor_investigation_id /
     supervisor_session_id so the storyboards link "Supervising" / "Supervised
-    by". Only with the supervise scope; never the granted investigation."""
+    by". Only with the supervise scope; never the granted investigation.
+    succeeds: {grant_id, token} of the live predecessor (grant succession,
+    capability grant_succession): the server revokes it as `succeeded` and a
+    retry with the same token answers the same successor (duplicate)."""
     if not ie.valid_investigation(investigation_id):
         raise ist.FetchError(f"not an investigation id: {investigation_id!r}")
     if not scopes or any(s not in SCOPES for s in scopes):
@@ -140,6 +144,11 @@ def grant(conn: dict, investigation_id: str, scopes: list, *, ttl_seconds: Optio
             raise ValueError("an investigation cannot supervise itself")
         body["supervisor_investigation_id"] = sup_inv
         body["supervisor_session_id"] = sup_sid
+    if succeeds is not None:
+        if not valid_grant_id(succeeds.get("grant_id")) or not isinstance(succeeds.get("token"), str) \
+                or not _TOKEN_RE.fullmatch(succeeds["token"]):
+            raise ValueError("succession needs the predecessor's grant id and token")
+        body["succeeds"] = {"grant_id": succeeds["grant_id"], "token": succeeds["token"]}
     out = sync._post(conn, "grant-investigation-access", body, client=client, opener=opener)
     tok = out.get("token")
     if out.get("investigation_id") != investigation_id or not valid_grant_id(out.get("grant_id")) \
@@ -194,12 +203,28 @@ def supervisor_invalid(err: Any) -> bool:
             and body.get("error") == "supervisor_invalid")
 
 
+SUCCESSION_REFUSALS = {
+    "predecessor_expired": ("the old grant has expired (or the signing secret rotated): succession needs the live "
+                            "predecessor. Mint a new grant; only a grant your owner mints from the web can rule on or "
+                            "verify the old grant's challenges"),
+    "predecessor_revoked": "the old grant was revoked: a revoked grant cannot be succeeded",
+    "predecessor_succeeded": ("the old grant already has a different successor (another scope set or label, or that "
+                              "successor was revoked or expired); succession is one successor per grant"),
+    "succession_scope_mismatch": "a successor has exactly its predecessor's scopes",
+    "owner_web_does_not_succeed": ("the old grant was minted from the web; it needs no succession (it may already "
+                                   "rule on and verify earlier supervise grants' challenges)"),
+}
+
+
 def refusal(err: "sync.ServerError") -> Optional[str]:
     """A grant refusal that needs more than its code: grant_limit_reached
     names which limit (scope "active": unrevoked, unexpired grants;
-    "lifetime": every grant ever made for the investigation) and how many.
-    None for anything else (the caller says it as usual)."""
+    "lifetime": every grant ever made for the investigation) and how many;
+    a succession refusal says what it means. None for anything else (the
+    caller says it as usual)."""
     body = err.body if isinstance(err.body, dict) else {}
+    if body.get("error") in SUCCESSION_REFUSALS:
+        return SUCCESSION_REFUSALS[body["error"]]
     if err.status != 409 or body.get("error") != "grant_limit_reached":
         return None
     scope, limit = body.get("scope"), body.get("limit")
@@ -319,17 +344,22 @@ def ruling_unsupported(err: "sync.ServerError") -> bool:
     return err.status in (404, 405) and code not in _RULING_ROUTE_404S
 
 
-def supports_rulings(conn: dict, investigation_id: str, *, client: str, opener=None) -> Optional[bool]:
-    """Whether the server advertises capabilities.delegated_supervision
-    (get-investigation, with the same grant token); None when that cannot
-    be read either (the token itself is refused, or the network)."""
+def supports(conn: dict, investigation_id: str, name: str, *, client: str, opener=None) -> Optional[bool]:
+    """Whether the server advertises capabilities.<name> (get-investigation,
+    with the same connection); None when that cannot be read (the token or
+    key is refused, or the network)."""
     try:
         out = sync.get_investigation(conn, investigation_id, client=client, opener=opener)
     except Exception:
         return None
     caps = out.get("capabilities") if isinstance(out.get("capabilities"), dict) else {}
-    cap = caps.get("delegated_supervision")
+    cap = caps.get(name)
     return isinstance(cap, dict) and cap.get("enabled") is True
+
+
+def supports_rulings(conn: dict, investigation_id: str, *, client: str, opener=None) -> Optional[bool]:
+    """Whether the server advertises capabilities.delegated_supervision."""
+    return supports(conn, investigation_id, "delegated_supervision", client=client, opener=opener)
 
 
 def ruling_payload(challenge_seq: int, outcome: str, text: str, refs: Optional[list] = None) -> dict:
@@ -365,3 +395,150 @@ def issue_ruling(conn: dict, investigation_id: str, challenge_seq: int, outcome:
     if not isinstance(ev, dict) or ev.get("investigation_id") != investigation_id or not isinstance(ev.get("seq"), int):
         raise ist.FetchError("issue-ruling answered without the ruling")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Supervisor side: a verdict on a correction or a claim (record-verification)
+# ---------------------------------------------------------------------------
+#
+# conductor docs/specs/supervision-verdicts.md §2: {investigation_id,
+# idempotency_key, payload: {verifies, correction?, verdict, scope, subject,
+# text, evidence, refs?}} -> {event, duplicate?}, with a supervise grant's
+# token. The server checks every rule; verification_payload only turns a
+# malformed verdict into a usable message before anything is sent.
+
+VERIFICATIONS_CAPABILITY = "supervision_verifications"
+SUCCESSION_CAPABILITY = "grant_succession"
+VERDICTS = ("verified", "rejected", "unverifiable")
+VERIFICATION_SCOPES = sv.VERIFICATION_SCOPES
+REVISION_SCOPES = ("code_review", "test_run", "fixture_validation")
+TARGET_SCOPES = ("deployment", "rollout_observed")
+MAX_VERDICT_TEXT = 2000
+MAX_VERDICT_EVIDENCE = 20
+MAX_TARGET = 200
+_RFC3339_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})")   # fullmatch
+VERIFICATIONS_UNSUPPORTED = ("this Cardinal server does not support verdicts yet (it needs a newer Maestro); nothing "
+                             "was recorded. Until then post the verdict as a cue: `Review: upheld — …` or "
+                             "`Review: unverifiable — …`")
+_VERIFICATION_ROUTE_404S = ("investigation_not_found", "verification_target_not_found", "ack_target_not_found")
+
+VERIFICATION_REFUSALS = {
+    "verification_requires_supervise_grant": ("only a grantee holding the supervise scope records verdicts; ask the "
+                                              "investigation's author for `investigation grant --scope supervise`"),
+    "verification_target_not_own_challenge": ("a verdict on a challenge is only for the grant that posted it (or its "
+                                              "successors, or a supervise grant your owner minted from the web)"),
+    "correction_not_found": "nothing cites that challenge after the worker's position yet: there is no correction to verify",
+    "correction_not_current": "--correction is not the challenge's current correction",
+    "verification_requires_correction": ("the challenge has no correction to judge (it is open, accepted, declined, a "
+                                         "directive, conflicted, withdrawn or overruled)"),
+    "refute_with_challenge": "disagreement with a claim is a challenge (it needs the worker's position), not a rejected verdict",
+    "verify_the_challenge": "that claim is the current correction of a challenge: verify the challenge with --correction",
+    "invalid_verification": "the server refused the verdict as malformed (scope and subject must match)",
+    "verification_exists": "a verdict for that correction (or claim) and scope already exists",
+    "supersede_not_own_verdict": ("--supersedes names an active verdict of your own grant lineage on the same "
+                                  "challenge or claim, correction and scope"),
+    "verdict_already_superseded": "that verdict was already revised; supersede the latest one",
+    "verdict_revision_limit": "a verdict is revised at most 3 times (per chain of revisions)",
+    "dirty_subject_requires_tree": ("a dirty subject needs its tree: --revision auto binds it, except with a dirty "
+                                    "submodule or a failing git filter (then commit or stash first)"),
+    "merge_readiness_requires_clean": "merge_readiness is judged on a clean tree at the PR head",
+}
+
+
+def verification_payload(verifies: int, verdict: str, scope: str, text: str, *, correction: Optional[int] = None,
+                         subject: Optional[dict] = None, evidence: Optional[list] = None,
+                         refs: Optional[list] = None, supersedes: Optional[int] = None) -> dict:
+    """The record-verification payload, checked before anything is sent: a
+    scope is never wider than the subject it names (code_review, test_run,
+    fixture_validation: repo + commit, and tree when dirty; merge_readiness:
+    + pr, on a clean tree; deployment, rollout_observed: target +
+    observed_at); evidence >= 1 unless unverifiable; supersedes: this
+    lineage's own earlier verdict it revises. ValueError otherwise."""
+    for name, v in (("the event number", verifies), ("--correction", correction), ("--supersedes", supersedes)):
+        if v is not None and (not isinstance(v, int) or isinstance(v, bool) or v < 1):
+            raise ValueError(f"{name} is a positive integer")
+    if verdict not in VERDICTS:
+        raise ValueError(f"the verdict is one of {', '.join(VERDICTS)}")
+    if scope not in VERIFICATION_SCOPES:
+        raise ValueError(f"--scope is one of {', '.join(VERIFICATION_SCOPES)}")
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_VERDICT_TEXT \
+            or any(ord(c) < 32 and c not in "\n\t" for c in text):
+        raise ValueError(f"--text is 1-{MAX_VERDICT_TEXT} characters (no control characters but newline and tab): what "
+                         "was checked and the deciding result")
+    subject = {k: v for k, v in (subject or {}).items() if v is not None}
+    revision = {k: subject[k] for k in ("repo", "commit", "pr", "dirty") if k in subject}
+    if revision:
+        try:
+            ie.validate_revision(revision, "subject")
+        except ie.CheckpointInputError as e:
+            raise ValueError(str(e))
+    if "artifacts" in subject:
+        try:
+            ie.validate_structured("artifacts", subject["artifacts"], "subject")
+        except ie.CheckpointInputError as e:
+            raise ValueError(str(e))
+    if "target" in subject and (not isinstance(subject["target"], str) or not 1 <= len(subject["target"]) <= MAX_TARGET
+                                or not subject["target"].isprintable()):
+        raise ValueError(f"--target is 1-{MAX_TARGET} printable characters")
+    if "observed_at" in subject and not (isinstance(subject["observed_at"], str)
+                                         and _RFC3339_RE.fullmatch(subject["observed_at"])):
+        raise ValueError("--observed-at is an RFC 3339 time, e.g. 2026-10-18T14:05:00Z")
+    need = (("repo", "commit") if scope in REVISION_SCOPES else ("repo", "commit", "pr") if scope == "merge_readiness"
+            else ("target", "observed_at"))
+    if scope == "merge_readiness" and subject.get("dirty") is True:
+        raise ValueError("--scope merge_readiness needs a clean tree: your checkout has uncommitted changes (commit or "
+                         "stash them, or record what you checked under code_review / test_run)")
+    if scope in REVISION_SCOPES and subject.get("dirty") is True and "tree" not in subject:
+        raise ValueError(VERIFICATION_REFUSALS["dirty_subject_requires_tree"])
+    missing = [k for k in need if k not in subject]
+    if missing:
+        raise ValueError(f"--scope {scope} names {' + '.join(need)} (missing {', '.join(missing)}): a verdict is never "
+                         "wider than what it names")
+    evidence = list(evidence or [])
+    if any(not isinstance(x, str) or not (ie.RECEIPT_REF_RE.fullmatch(x) or ie.CAPTURED_REF_RE.fullmatch(x))
+           for x in evidence) or len(evidence) > MAX_VERDICT_EVIDENCE:
+        raise ValueError(f"--evidence is at most {MAX_VERDICT_EVIDENCE} rcpt_<24 hex> / ev_<12 hex> ids")
+    if not evidence and verdict != "unverifiable":
+        raise ValueError("a verified or rejected verdict cites its deciding evidence (--evidence ev_… / rcpt_…)")
+    payload: dict = {"verifies": verifies}
+    if correction is not None:
+        payload["correction"] = correction
+    if supersedes is not None:
+        payload["supersedes_verdict"] = supersedes
+    payload.update(verdict=verdict, scope=scope, subject=subject, text=text, evidence=evidence)
+    if refs:
+        payload["refs"] = ie.text_payload("x", refs)["refs"]
+    return payload
+
+
+def verification_key(conn: dict, payload: dict) -> str:
+    """The content-addressed idempotency key of a verdict for this grant."""
+    material = json.dumps([{k: conn.get(k) for k in ("origin", "org", "investigation_id", "grant_id")}, payload],
+                          sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    import hashlib
+    return "verify:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def record_verification(conn: dict, investigation_id: str, payload: dict, *, idempotency_key: str, client: str,
+                        opener=None) -> dict:
+    """record-verification: {event, duplicate?}, with a supervise grant's
+    token only."""
+    if not ie.valid_investigation(investigation_id):
+        raise ist.FetchError(f"not an investigation id: {investigation_id!r}")
+    if not conn.get("token"):
+        raise ist.FetchError("a verdict needs a supervise grant's token (--credential-file)")
+    body = {"investigation_id": investigation_id, "type": ie.VERIFICATION, "payload": payload,
+            "idempotency_key": idempotency_key, "client": client}
+    out = sync._post(conn, "record-verification", body, client=client, opener=opener)
+    ev = out.get("event")
+    if not isinstance(ev, dict) or ev.get("investigation_id") != investigation_id or not isinstance(ev.get("seq"), int):
+        raise ist.FetchError("record-verification answered without the verdict")
+    return out
+
+
+def verification_unsupported(err: "sync.ServerError") -> bool:
+    """The refusal itself shows an older server: no route (404 / 405 not of
+    the route's own). An old pod answering 403 token_scope_mismatch is told
+    apart with supports()."""
+    code = err.body.get("error") if isinstance(err.body, dict) else None
+    return err.status in (404, 405) and code not in _VERIFICATION_ROUTE_404S
