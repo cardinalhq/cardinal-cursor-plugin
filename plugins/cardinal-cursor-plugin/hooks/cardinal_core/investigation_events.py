@@ -114,6 +114,7 @@ import json
 import os
 import re
 import secrets
+import tempfile
 import time
 import sys
 import unicodedata
@@ -141,7 +142,8 @@ RESERVED_KEY_PREFIXES = ("oi:", "ckpt:", "od:")
 
 CHALLENGE = "challenge.added"
 RULING = "ruling.issued"         # a supervisor's ruling on its own challenge (delegated supervision)
-DELIVERABLE = ("cue.added", "question.added", CHALLENGE, RULING)
+VERIFICATION = sv.VERIFICATION   # a supervisor's verdict on a correction or a claim (supervision-verdicts.md)
+DELIVERABLE = ("cue.added", "question.added", CHALLENGE, RULING, VERIFICATION)
 ACKNOWLEDGED = "acknowledged"
 POST_TYPES = {"cue": "cue.added", "question": "question.added", "challenge": CHALLENGE}
 DISPOSITIONS = ("accepted", "declined", "noted", "conflicts")
@@ -245,6 +247,7 @@ _PLAIN = {
     # The pre-review name of ruling_requires_position (a decline was required then).
     "ruling_requires_decline": ("a challenge can be upheld only once the worker took a position on it; withdraw it "
                                 "instead, or wait for the worker's position"),
+    "verification_takes_no_position": "a verdict is acknowledged as noted only; it takes no position",
     "Invalid token": ("CARDINAL_INVESTIGATION_TOKEN is not valid (expired, malformed or for another server); ask "
                       "the investigation's author for a new grant"),
 }
@@ -641,6 +644,8 @@ def ack_rule(target: Optional[dict], disposition: str, note: Optional[str],
                     "believe it conflicts with what your owner said in this session, comply and say so in --note")
     elif disposition == "conflicts" and t != RULING:
         return f"`conflicts` answers a directive (ruling.issued, upheld) only; #{seq} is a {_tok(t)}"
+    elif t == VERIFICATION and disposition != "noted":
+        return f"#{seq} is a supervisor's verdict: acknowledge it with --disposition noted (it takes no position)"
     return None
 
 
@@ -846,7 +851,37 @@ def refresh_binding_capabilities(home, sid, conn, client, *, opener=None):
     return read_binding(home, sid) or binding
 
 
+REVISION_COMMIT_RE = re.compile(r"[0-9a-f]{40}")   # fullmatch
+MAX_PR = 10 ** 9
+
+
+def validate_revision(value: Any, where: str = "checkpoint") -> dict:
+    """{repo, commit, pr?, dirty?, tree?}: repo <host>/<owner>/<name>
+    (REPO_RE, lowercase), commit 40 lowercase hex, pr 1..10^9, dirty only
+    true, tree (40 lowercase hex: the dirty working state's git tree) only
+    with dirty. Shape only: the server never contacts the forge."""
+    from .storyboard_context import REPO_RE
+    if value == "auto":
+        raise CheckpointInputError(f"{where}: \"revision\": \"auto\" is resolved only by `cardinal-storyboard "
+                                   "investigation checkpoint`; give {repo, commit, pr?, dirty?} here")
+    if not isinstance(value, dict) or set(value) - {"repo", "commit", "pr", "dirty", "tree"} \
+            or not isinstance(value.get("repo"), str) or len(value["repo"]) > 200 \
+            or not REPO_RE.fullmatch(value["repo"]) or "/" not in value["repo"].split("/", 1)[1] \
+            or not isinstance(value.get("commit"), str) or not REVISION_COMMIT_RE.fullmatch(value["commit"]) \
+            or ("pr" in value and (not isinstance(value["pr"], int) or isinstance(value["pr"], bool)
+                                   or not 1 <= value["pr"] <= MAX_PR)) \
+            or ("dirty" in value and value["dirty"] is not True) \
+            or ("tree" in value and (value.get("dirty") is not True or not isinstance(value["tree"], str)
+                                     or not REVISION_COMMIT_RE.fullmatch(value["tree"]))):
+        raise CheckpointInputError(f"{where}: revision takes repo (<host>/<owner>/<name>, lowercase), commit (40 "
+                                   "lowercase hex), pr (1-10^9), dirty (true) and, only with dirty, tree (40 "
+                                   "lowercase hex), or \"auto\" from the CLI")
+    return dict(value)
+
+
 def validate_structured(name: str, value: Any, where: str = "checkpoint") -> Any:
+    if name == "revision":
+        return validate_revision(value, where)
     if name == "artifacts":
         if not isinstance(value, list) or len(value) > 20:
             raise CheckpointInputError(f"{where}: artifacts is a list of at most 20 objects")
@@ -886,6 +921,10 @@ def checkpoint_capabilities(events: list, binding: dict) -> list:
         if stripped:
             print("warning: this Cardinal server does not support checkpoint artifacts/gate; fields stripped",
                   file=sys.stderr)
+    if not capability(binding, "checkpoint_revision") and any("revision" in e["payload"] for e in events):
+        for e in events:
+            e["payload"].pop("revision", None)
+        print("warning: this Cardinal server does not support checkpoint revision; field stripped", file=sys.stderr)
     return events
 
 
@@ -915,7 +954,7 @@ def _semantic_event(e: Any, i: int) -> dict:
     if not isinstance(sid, str) or not sid.startswith(prefix) or not SEMANTIC_ID_RE.fullmatch(sid):
         raise CheckpointInputError(f"{where}: \"id\" is {_id_shape((prefix,))}, the same id in its later events")
     required, texts, lists = SEMANTIC_FIELDS[t]
-    structured = {"artifacts", "gate"} if t in STRUCTURED_TYPES else set()
+    structured = ({"artifacts", "gate"} if t in STRUCTURED_TYPES else set()) | {"revision"}
     unknown = sorted(str(k) for k in set(fields) - {required, *texts, *lists} - structured)
     if unknown:
         takes = ", ".join(("id", required) + texts + lists)
@@ -1102,6 +1141,184 @@ def checkpoint_key(investigation_id: str, session_id: str, events: list) -> str:
     canon = json.dumps({"investigation_id": investigation_id, "session_id": session_id, "events": events},
                        sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return "c" + hashlib.sha256(canon.encode("utf-8")).hexdigest()[:40]
+
+
+# "revision": "auto" (CLI only): resolved once from the checkout, then the
+# resolved batch and its key are kept in a private checkpoint outbox keyed by
+# the unresolved input, so a retry resends the identical body (the server
+# answers duplicate) even after HEAD moved or `gh` became unreachable.
+
+def _raw_events(raw: Any) -> list:
+    if isinstance(raw, dict) and set(raw) == {"events"}:
+        raw = raw["events"]
+    elif isinstance(raw, dict):
+        raw = [raw]
+    return raw if isinstance(raw, list) else []
+
+
+def wants_auto_revision(raw: Any) -> bool:
+    """Some event of the checkpoint input asks for "revision": "auto"."""
+    for e in _raw_events(raw):
+        fields = e.get("payload") if isinstance(e, dict) and isinstance(e.get("payload"), dict) else e
+        if isinstance(fields, dict) and fields.get("revision") == "auto":
+            return True
+    return False
+
+
+def with_revision(raw: Any, revision: Optional[dict]) -> list:
+    """The input's events with every "revision": "auto" replaced (None:
+    removed, for a server without checkpoint_revision)."""
+    def put(fields: dict) -> dict:
+        fields = dict(fields)
+        if revision is None:
+            fields.pop("revision")
+        else:
+            fields["revision"] = dict(revision)
+        return fields
+
+    out = []
+    for e in _raw_events(raw):
+        if isinstance(e, dict) and isinstance(e.get("payload"), dict) and e["payload"].get("revision") == "auto":
+            e = dict(e, payload=put(e["payload"]))
+        elif isinstance(e, dict) and e.get("revision") == "auto":
+            e = put(e)
+        out.append(e)
+    return out
+
+
+def _open_pr(cwd: str, timeout: float = 5.0) -> Optional[int]:
+    """The open PR of the checkout's branch via `gh` (read-only), or None:
+    without gh, unauthenticated, no PR, or not open. Never guessed."""
+    import subprocess
+    try:
+        out = subprocess.run(["gh", "pr", "view", "--json", "number,state"], cwd=cwd, capture_output=True,
+                             text=True, timeout=timeout, check=False)
+        data = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if not isinstance(data, dict) or data.get("state") != "OPEN":
+        return None
+    number = data.get("number")
+    return number if isinstance(number, int) and not isinstance(number, bool) and 1 <= number <= MAX_PR else None
+
+
+def _status(cwd: str) -> Optional[list]:
+    """`git status --porcelain=v2 --untracked-files=all
+    --ignore-submodules=none` lines (whatever status.showUntrackedFiles or
+    submodule config say; GIT_OPTIONAL_LOCKS=0, so it never takes
+    index.lock), or None when git fails or times out."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "status", "--porcelain=v2", "--untracked-files=all", "--ignore-submodules=none"],
+                             cwd=cwd, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"), capture_output=True, text=True,
+                             timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.splitlines() if out.returncode == 0 else None
+
+
+def _dirty_submodule(lines: list, top: str) -> bool:
+    """A status line for a submodule (<sub> field S<c><m><u>) with a changed
+    commit, tracked changes or untracked files, or an untracked nested git
+    repository (`? dir/` holding a .git): `git add -A` would record only a
+    commit id for either, not its working state."""
+    for line in lines:
+        parts = line.split(" ")
+        if parts[0] in ("1", "2") and len(parts) > 2 and parts[2].startswith("S") and parts[2] != "S...":
+            return True
+        if line.startswith("? ") and line.endswith("/") and os.path.exists(os.path.join(top, line[2:], ".git")):
+            return True
+    return False
+
+
+def snapshot_tree(cwd: str) -> Optional[str]:
+    """The git tree id of the full working state (tracked and untracked,
+    ignored files excluded): the real index (`git rev-parse --git-path
+    index`, keeping sparse-checkout / skip-worktree bits and the stat cache)
+    copied to a private temporary index, then `git add -A` and `git
+    write-tree` with GIT_INDEX_FILE on the copy, which is deleted after; the
+    real index is never touched. None (snapshot-unbound) when the real index
+    cannot be copied, or git add / write-tree fails (a missing required
+    filter)."""
+    import shutil
+    import subprocess
+    from .initiative import git
+    real = git(["rev-parse", "--git-path", "index"], cwd)
+    if not real:
+        return None
+    tmp = tempfile.mkdtemp(prefix="cardinal-snapshot-")
+    try:
+        index = os.path.join(tmp, "index")
+        shutil.copyfile(os.path.join(cwd, real), index)
+        env = dict(os.environ, GIT_INDEX_FILE=index)
+        tree = None
+        for args in (["add", "-A"], ["write-tree"]):
+            out = subprocess.run(["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=120,
+                                 check=False)
+            if out.returncode != 0:
+                return None
+            tree = out.stdout.strip()
+        return tree if REVISION_COMMIT_RE.fullmatch(tree or "") else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def resolve_revision(cwd: str) -> dict:
+    """{repo, commit, pr?, dirty?, tree?} of the checkout at `cwd`: HEAD, the
+    origin remote as <host>/<owner>/<name> (lowercase), the branch's open PR
+    when `gh` can say, dirty when status (_status) lists anything or cannot
+    be read, and then the working state's tree when it can be bound
+    (snapshot_tree; never with a dirty submodule or an unread status).
+    Records what is true; never refuses a dirty tree. CheckpointInputError
+    outside a git worktree or without a nameable origin."""
+    from .initiative import git
+    from .storyboard_context import host_of_url, repo_of_url
+    if git(["rev-parse", "--is-inside-work-tree"], cwd) != "true":
+        raise CheckpointInputError("\"revision\": \"auto\" needs a git worktree: run it from the checkout")
+    commit = git(["rev-parse", "HEAD"], cwd)
+    if not commit or not REVISION_COMMIT_RE.fullmatch(commit):
+        raise CheckpointInputError("\"revision\": \"auto\": this checkout has no commit yet")
+    url = git(["remote", "get-url", "origin"], cwd)
+    repo, host = repo_of_url(url), host_of_url(url)
+    if not repo or not host:
+        raise CheckpointInputError("\"revision\": \"auto\": the checkout has no origin remote Cardinal can name")
+    out: dict = {"repo": f"{host}/{repo}", "commit": commit}
+    pr = _open_pr(cwd)
+    if pr is not None:
+        out["pr"] = pr
+    lines = _status(cwd)
+    if lines is None or lines:
+        out["dirty"] = True   # an unread status is never clean
+        top = git(["rev-parse", "--show-toplevel"], cwd) or cwd   # porcelain paths are from the top
+        tree = snapshot_tree(cwd) if lines is not None and not _dirty_submodule(lines, top) else None
+        if tree is not None:
+            out["tree"] = tree
+    return validate_revision(out, "revision auto")
+
+
+def head_commit(cwd: str) -> Optional[str]:
+    from .initiative import git
+    return git(["rev-parse", "HEAD"], cwd)
+
+
+def checkpoint_outbox(home: Path, sid: str, investigation_id: str, raw: Any, key: Optional[str]) -> Path:
+    """<sid>.checkpoint.<sha256 of the unresolved input>.json in the sessions
+    directory (pruned with the session)."""
+    canon = json.dumps({"investigation_id": investigation_id, "session_id": sid, "input": raw, "key": key},
+                       sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()[:32]
+    return sessions_dir(home) / f"{binding_path(home, sid).stem}.checkpoint.{digest}.json"
+
+
+def read_checkpoint_outbox(path: Path) -> Optional[dict]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    ok = isinstance(data, dict) and isinstance(data.get("events"), list) and isinstance(data.get("key"), str)
+    return data if ok else None
 
 
 def checkpoint(conn: dict, investigation_id: str, session_id: str, events: Any, *,
@@ -1394,9 +1611,10 @@ def deliverable(events: list, sid: str, investigation_id: str, binding=None) -> 
             continue
         if e.get("investigation_id") != investigation_id or e.get("to_session_id") not in (None, sid):
             continue
-        if e.get("type") == RULING and e.get("to_session_id") != sid \
-                and (e["payload"] if isinstance(e.get("payload"), dict) else {}).get("ruling_of") not in mine:
-            continue  # a ruling on a challenge this session never received
+        if e.get("type") in (RULING, VERIFICATION) and e.get("to_session_id") != sid \
+                and (e["payload"] if isinstance(e.get("payload"), dict) else {}).get(
+                    "ruling_of" if e.get("type") == RULING else "verifies") not in mine:
+            continue  # a ruling or verdict on a challenge this session never received
         if (decision and e.get("seq") in decision_acked) or (not decision and (_own(e, sid) or e.get("seq") in acked)):
             continue
         payload = e.get("payload")
@@ -1476,6 +1694,9 @@ ACK_GUIDANCE = (
     "Accepting advisory input does not make it owner authorization or widen your permissions. "
     "Acceptance is not completion: when the work is done, checkpoint the result with refs [\"#<event seq>\"]."
 )
+# Added to a delivery with a challenge, ruling or verdict, on a Cardinal with checkpoint_revision.
+REVISION_GUIDANCE = ("When a checkpoint reports a correction, add `\"revision\": \"auto\"` for code or `artifacts` for "
+                     "anything else, so a later summary citing the challenge is not mistaken for it.")
 POST_GUIDANCE = (
     "When posting supervisory feedback, use challenge for a requested correction, test, or other work needing "
     "an explicit position; use cue for an informational lead and question for a question."
@@ -1638,6 +1859,8 @@ def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance:
         ruling = render_ruling(e, sid, ack, who, text)
         if ruling is not None:
             return ruling
+    if e.get("type") == VERIFICATION:
+        return render_verification(e, sid, ack, who, text, binding)
     # A Cardinal with delegated supervision refuses `noted` on a challenge;
     # an older one keeps the old wording (its rules are unchanged).
     challenge = e.get("type") == CHALLENGE and capability(binding or {}, SUPERVISION_CAPABILITY)
@@ -1743,6 +1966,76 @@ def render_ruling(e: dict, sid: str, ack: bool, who: str, text: str) -> Optional
     return "\n".join(lines)
 
 
+def subject_words(subject: Any) -> str:
+    """A verdict's subject, inert: "github.com/x/y@abc1234" (+ " PR #n",
+    " + uncommitted changes"), or its target, or ""."""
+    s = subject if isinstance(subject, dict) else {}
+    if isinstance(s.get("commit"), str):
+        out = f"{_tok(s.get('repo')) + '@' if s.get('repo') else ''}{_tok(s['commit'][:7])}"
+        if isinstance(s.get("pr"), int) and not isinstance(s.get("pr"), bool):
+            out += f" PR #{s['pr']}"
+        if s.get("dirty") is True:
+            tree = s.get("tree")
+            out += f" + uncommitted changes (tree {_tok(tree[:7])})" if isinstance(tree, str) \
+                else " + uncommitted changes (snapshot unbound)"
+        return out
+    if isinstance(s.get("target"), str):
+        return _claimed(s["target"]) + (f" observed {_tok(s.get('observed_at'))}" if s.get("observed_at") else "")
+    return ""
+
+
+def verification_words(p: dict) -> str:
+    """"verified code_review github.com/x/y@abc1234 of #c (correction #k)", inert."""
+    p = p if isinstance(p, dict) else {}
+    at = subject_words(p.get("subject"))
+    words = f"{_tok(p.get('verdict'))} {_tok(p.get('scope'))}" + (f" {at}" if at else "")
+    words += f" of #{_tok(str(p.get('verifies')))}"
+    return words + (f" (correction #{_tok(str(p['correction']))})" if p.get("correction") is not None else "")
+
+
+def rejection_line(c: Any, k: Any, v: Any, text: str) -> str:
+    """The rejected-correction sentence (delivery and every re-surfacing)."""
+    return (f"Your correction #{_tok(str(k))} for #{_tok(str(c))} was rejected (#{_tok(str(v))}): {text}. Checkpoint "
+            f"a new correction with refs [\"#{_tok(str(c))}\", \"#{_tok(str(v))}\"] (and \"revision\": \"auto\" when it is "
+            "code).")
+
+
+def render_verification(e: dict, sid: str, ack: bool, who: str, text: str, binding=None) -> str:
+    """A verification.recorded: a rejected correction (with what to do, and
+    the directive it leaves open), or a verified / unverifiable verdict as
+    information. A verdict itself binds nothing; it is acknowledged as
+    noted."""
+    inv, seq = e["investigation_id"], e["seq"]
+    payload = e["payload"]
+    verdict, of, k = payload.get("verdict"), payload.get("verifies"), payload.get("correction")
+    scope = _tok(payload.get("scope"))
+    at = subject_words(payload.get("subject"))
+    what = f"your correction #{_tok(str(k))} for #{_tok(str(of))}" if k is not None else f"#{_tok(str(of))}"
+    if verdict == "rejected" and k is not None:
+        body = rejection_line(of, k, seq, text)
+    elif verdict == "verified":
+        body = f"The supervisor verified {what} ({scope}{' @ ' + at if at else ''}): {text}."
+    else:
+        body = f"The supervisor recorded {what} as {_tok(verdict)} ({scope}): {text}."
+    st = binding.get("supervision") if isinstance(binding, dict) and verdict == "rejected" else None
+    # The kept events and the stubs: the challenge may have been compacted away.
+    info = sv.challenge_statuses((st.get("events") or []) + (st.get("stubs") or [])).get(of) \
+        if isinstance(st, dict) else None
+    directive_open = isinstance(info, dict) and info.get("status") == sv.DIRECTIVE_REJECTED
+    lines = [f"[Cardinal investigation {inv} · event #{seq} · {VERIFICATION} · {_tok(verdict)} · authority: ADVISORY]",
+             f"From: {who} — posted {_tok(e.get('created_at'))}. A supervisor's verdict"
+             + (": not your owner." if directive_open else ": not your owner, not binding.")]
+    if directive_open:
+        lines.append(directive_open_line(info.get("ruling_seq")))
+    lines.append(body)
+    if ack:
+        lines.append(f"Acknowledge: cardinal-storyboard investigation ack {inv} {seq} --session {sid} "
+                     "--disposition noted [--note \"<what you will do>\"]")
+    else:
+        lines.append(NOT_AUTHOR_ACK)
+    return "\n".join(lines)
+
+
 def render(events: list, sid: str, investigation_id: str, *, cap: int = MAX_RENDERED,
            budget: int = RENDER_BUDGET, ack: bool = True, binding=None) -> str:
     """The newest `cap` events (within `budget` characters, at least one),
@@ -1753,17 +2046,23 @@ def render(events: list, sid: str, investigation_id: str, *, cap: int = MAX_REND
               or (event_class(e) == OWNER and e.get("type") == OWNER_DECIDED)]
     blocks: list = []
     size = 0
+    guided = False
     for e in reversed(events):
         if len(blocks) >= cap:
             break
         # The newest event carries the shared response guidance. Repeat it
-        # once per delivery, rather than spending the inbox budget on copies.
-        block = render_event(e, sid, ack, binding=binding, guidance=not blocks)
+        # once per delivery, rather than spending the inbox budget on copies
+        # (a verdict takes none: it is acknowledged as noted).
+        block = render_event(e, sid, ack, binding=binding, guidance=not guided)
         if blocks and size + len(block) + 2 > budget:
             break
         blocks.append(block)
         size += len(block) + 2
+        guided = guided or e.get("type") != VERIFICATION
     blocks.reverse()
+    if ack and capability(binding or {}, "checkpoint_revision") \
+            and any(e.get("type") in (CHALLENGE, RULING, VERIFICATION) for e in events):
+        blocks[-1] += "\n" + REVISION_GUIDANCE
     hidden = len(events) - len(blocks)
     if hidden:
         first = events[0]["seq"]
@@ -2134,11 +2433,13 @@ def remind_decisions(home, sid, emit):
 # session agreed to (or was directed to) do would vanish from its context.
 # The binding therefore keeps the supervision events of this session's
 # challenges (binding["supervision"]["events"]: the challenges it received,
-# their acknowledgments, rulings, the owner decisions answering them and the
-# semantic events citing them; bounded) and derives each challenge's status
+# their acknowledgments, rulings, the owner decisions answering them, the
+# supervisor's verdicts on them and the semantic events citing them; bounded)
+# and derives each challenge's status
 # from them (supervision_status.challenge_statuses, the mirror of maestro's
 # challengeStatuses). Every MAIN-thread tool boundary counts; an event whose
-# status is accepted / directive / directive_accepted is shown again every
+# status is accepted / directive / directive_accepted (or rejected /
+# directive_rejected: the verdict's rejection is shown) is shown again every
 # RESURFACE_EVERY boundaries in its state (after RESURFACE_BACKOFF_AFTER
 # showings, every RESURFACE_BACKOFF_EVERY), until a checkpoint cites it
 # (addressed / directive_addressed) or the owner overrules it: at most one
@@ -2150,7 +2451,7 @@ def remind_decisions(home, sid, emit):
 # delegated_supervision. While anything is due the file
 # <sid>.supervision exists, so the sh fast path starts Python at each tool
 # boundary. Stop: an open directive (directive / directive_accepted) blocks
-# Stop once per directive. Only an author session (it can take positions)
+# Stop once per directive, and once more for each rejection of its correction. Only an author session (it can take positions)
 # tracks anything, and only when its Cardinal advertises
 # delegated_supervision (supervising()).
 
@@ -2160,6 +2461,7 @@ RESURFACE_BACKOFF_EVERY = 20   # ... this many boundaries (a directive still blo
 MAX_SUPERVISION_EVENTS = 100   # kept in the binding (rewritten at every poll): the newest
 MAX_KEPT_TEXT = 2000           # characters of a kept challenge / ruling text (a note: MAX_KEPT_NOTE)
 MAX_KEPT_NOTE = 300
+MAX_KEPT_VERDICT = 500         # characters of a kept verdict's text
 REMINDER_TEXT = 1500           # escaped characters of an event's text in its one Stop block
 REMINDER_EXCERPT = 160         # ... and in a periodic re-surfacing: a pointer, not a re-delivery
                                # (the agent already received the full text; each repeat costs context)
@@ -2221,12 +2523,12 @@ def tracked_event(b: Optional[dict], seq: Any) -> Optional[dict]:
     return None
 
 
-def _slim(e: dict, *payload_fields: str) -> dict:
+def _slim(e: dict, *payload_fields: str, text_cap: int = MAX_KEPT_TEXT) -> dict:
     payload = e.get("payload") if isinstance(e.get("payload"), dict) else {}
     out = {k: e[k] for k in ("investigation_id", "seq", "type", "class", "authority", "to_session_id",
                              "created_at", "producer") if k in e}
     out["payload"] = {k: payload[k] for k in payload_fields if k in payload}
-    for k, cap in (("text", MAX_KEPT_TEXT), ("note", MAX_KEPT_NOTE)):
+    for k, cap in (("text", text_cap), ("note", MAX_KEPT_NOTE)):
         v = out["payload"].get(k)
         if isinstance(v, str) and len(v) > cap:
             out["payload"][k] = v[:cap]
@@ -2247,6 +2549,7 @@ def track_supervision(b: dict, events: list, sid: str) -> bool:
     stubs = {e["seq"]: e for e in view["stubs"]}
     known = {e["seq"] for e in have} | set(stubs)
     targets = {e["seq"] for e in have + list(stubs.values()) if e.get("type") in (CHALLENGE, RULING)}
+    challenges = {e["seq"] for e in have + list(stubs.values()) if e.get("type") == CHALLENGE}
     ruling_of = {e["seq"]: (e.get("payload") or {}).get("ruling_of") for e in have + list(stubs.values())
                  if e.get("type") == RULING}
     added = []
@@ -2262,6 +2565,7 @@ def track_supervision(b: dict, events: list, sid: str) -> bool:
                 and isinstance(payload.get("text"), str):
             keep = _slim(e, "text", "refs")
             targets.add(seq)
+            challenges.add(seq)
         elif t == RULING and cls == CONTROL and payload.get("ruling_of") in targets \
                 and e.get("to_session_id") in (None, sid):   # the same addressing as deliverable()
             keep = _slim(e, "ruling_of", "outcome", "text", "refs")
@@ -2270,22 +2574,32 @@ def track_supervision(b: dict, events: list, sid: str) -> bool:
             keep = _slim(e, "ack_of", "disposition", "conflicts_with", "note")
         elif t == OWNER_DECIDED and cls == OWNER and payload.get("answers") in targets:
             keep = _slim(e, "answers")
+        elif t == VERIFICATION and cls == CONTROL and payload.get("verifies") in challenges:
+            keep = _slim(e, "verifies", "correction", "verdict", "scope", "supersedes_verdict", "text",
+                         text_cap=MAX_KEPT_VERDICT)
         elif cls == SEMANTIC and sv.cites(e, targets):
             keep = _slim(e, "semantic_id", "refs")
+            # What correction_of reads of it (a revision, artifacts), not the values.
+            for field in ("revision", "artifacts"):
+                if payload.get(field):
+                    keep["payload"]["has_" + field] = True
         if keep is not None:
             p = keep.get("producer")
             if isinstance(p, dict):
                 keep["producer"] = {k: p[k] for k in ("principal", "is_investigation_author", "session_id", "key_id",
-                                                       "client", "granted_by", "_resolved") if k in p}
+                                                       "client", "granted_by", "lineage_root_id", "_resolved")
+                                    if k in p}
             if t == RULING:
                 ruling_of[seq] = payload.get("ruling_of")
-            # A ruling, position or owner decision about a compacted-away
-            # challenge brings its stubs back (it may reopen it); a checkpoint
-            # citing it cannot change a settled status, so it is not kept.
+            # A ruling, position, verdict or owner decision about a
+            # compacted-away challenge brings its stubs back (it may reopen
+            # it); so does a checkpoint citing it that changes its status or
+            # current correction (a revision after a verdict, an answer to a
+            # rejection); any other citing checkpoint is not kept.
             about = _challenges_of(keep, ruling_of)
             stubbed = {c for c in about if any(x.get("type") == CHALLENGE and x["seq"] == c for x in stubs.values())}
-            if cls == SEMANTIC:
-                if about and about <= stubbed:
+            if cls == SEMANTIC and stubbed and not _changes(list(stubs.values()), stubbed, keep, ruling_of):
+                if about <= stubbed:
                     continue
             elif stubbed:
                 for x in [x for x in stubs.values() if _challenges_of(x, ruling_of) & stubbed]:
@@ -2297,13 +2611,19 @@ def track_supervision(b: dict, events: list, sid: str) -> bool:
     st = _supervision(b)
     st["stubs"] = [e for e in st["stubs"] if e["seq"] in stubs]
     merged = sorted(st["events"] + added, key=lambda e: e["seq"])
+    # A rejection of a directive's correction blocks Stop once more.
+    statuses = sv.challenge_statuses(merged)
+    for e in added:
+        info = statuses.get((e.get("payload") or {}).get("verifies")) if e.get("type") == VERIFICATION else None
+        if info and info["status"] == sv.DIRECTIVE_REJECTED and info["verification_seq"] == e["seq"]:
+            st["stop_blocked"] = [x for x in st["stop_blocked"] if x != info["ruling_seq"]]
     st["events"] = compact_supervision(merged)
     # A non-final challenge compacted away keeps its essential events as
     # stubs: a later ruling or position on it is still tracked and delivered,
     # and its status comes back exactly as it was.
     kept = {e["seq"] for e in st["events"]}
     by_seq = {e["seq"]: e for e in merged}
-    for c, info in sv.challenge_statuses(merged).items():
+    for c, info in sv.challenge_report(merged).items():
         if c in kept or info["status"] in FINAL_STATUSES:
             continue
         for x in sorted(essential_events(merged, c, info)):
@@ -2315,6 +2635,15 @@ def track_supervision(b: dict, events: list, sid: str) -> bool:
             st["stubs"].append(stub)
     st["stubs"] = sorted({e["seq"]: e for e in st["stubs"]}.values(), key=lambda e: e["seq"])[-MAX_SUPERVISION_STUBS:]
     return True
+
+
+def _changes(stubs: list, stubbed: set, e: dict, ruling_of: dict) -> bool:
+    """Whether semantic event `e` changes the status or current correction
+    of a stubbed challenge (its stubs are exactly what the derivation reads)."""
+    group = [x for x in stubs if _challenges_of(x, ruling_of) & stubbed]
+    before, after = sv.challenge_statuses(group), sv.challenge_statuses(group + [e])
+    return any((before.get(c) or {}).get(k) != (after.get(c) or {}).get(k)
+               for c in stubbed for k in ("status", "correction_seq"))
 
 
 def supervising(b: Any) -> bool:
@@ -2329,7 +2658,8 @@ def supervising(b: Any) -> bool:
 # author position supersedes a conflicted or addressed directive).
 FINAL_STATUSES = (sv.WITHDRAWN, sv.OVERRULED)
 # Owed work right now (dropped last).
-LIVE_STATUSES = (sv.OPEN, sv.ACCEPTED, sv.DECLINED, sv.DIRECTIVE, sv.DIRECTIVE_ACCEPTED)
+LIVE_STATUSES = (sv.OPEN, sv.ACCEPTED, sv.DECLINED, sv.DIRECTIVE, sv.DIRECTIVE_ACCEPTED, sv.REJECTED,
+                 sv.DIRECTIVE_REJECTED)
 MAX_SUPERVISION_STUBS = 500
 MAX_STUB_TEXT = 200
 
@@ -2346,6 +2676,8 @@ def _challenges_of(e: dict, ruling_of: dict) -> set:
         seqs = [payload.get("ack_of")]
     elif t == OWNER_DECIDED:
         seqs = [payload.get("answers")]
+    elif t == VERIFICATION:
+        seqs = [payload.get("verifies")]   # never its refs
     else:
         refs = payload.get("refs") if isinstance(payload.get("refs"), list) else []
         seqs = [int(r[1:]) for r in refs if isinstance(r, str) and SEQ_REF_RE.fullmatch(r)]
@@ -2353,9 +2685,16 @@ def _challenges_of(e: dict, ruling_of: dict) -> set:
 
 
 def essential_events(events: list, c: int, info: dict) -> set:
-    """The seqs challenge_statuses reads for challenge `c`: the challenge,
-    its ruling, the latest author position on each and the latest author
-    checkpoint citing either. The rest cannot change its status."""
+    """The seqs challenge_statuses reads for challenge `c`, now and as later
+    events arrive: the challenge, its ruling, the latest author position on
+    each; for the correction fold (sv.correction_fold), the current
+    correction k, every author checkpoint citing c after k, and every
+    verdict on k with its revision chain; without a correction, the latest
+    author checkpoint citing c. Events before k cannot change the result: a
+    "#v" answers only a verdict on the current k. One exception: when k
+    itself answered a verdict on the correction it replaced (info's
+    "previous", from sv.challenge_report), that correction and the verdicts
+    k cites (with their chains) stay, so k stays substantive."""
     out = {c}
     r = info.get("ruling_seq")
     targets = [(c, sv.CHALLENGE_POSITIONS)]
@@ -2368,10 +2707,27 @@ def essential_events(events: list, c: int, info: dict) -> set:
                and (e.get("payload") or {}).get("disposition") in positions]
         if pos:
             out.add(max(pos))
-    cited = [e["seq"] for e in events if sv.is_semantic(e) and sv.by_author(e)
+    cited = [e for e in events if sv.is_semantic(e) and sv.by_author(e)
              and sv.cites(e, (c,) if r is None else (c, r))]
-    if cited:
-        out.add(max(cited))
+    k = info.get("correction_seq")
+    if k is None:
+        if cited:
+            out.add(max(e["seq"] for e in cited))
+        return out
+    verdicts = sv.verdicts_on(events, c)
+    keep = {v["seq"] for v in verdicts if (v.get("payload") or {}).get("correction") == k}
+    current = next((e for e in cited if e["seq"] == k), None)
+    previous = info.get("previous")
+    if current is not None and isinstance(previous, dict):
+        answered = {v["seq"] for v in verdicts if (v.get("payload") or {}).get("correction") == previous["seq"]
+                    and sv.cites(current, (v["seq"],))}
+        if answered:
+            out.add(previous["seq"])
+            keep |= answered
+    for x in list(keep):
+        keep.update(sv.chain(verdicts, x))
+    out.update(keep)
+    out.update(e["seq"] for e in cited if e["seq"] >= k)
     return out
 
 
@@ -2380,16 +2736,15 @@ def compact_supervision(events: list, cap: Optional[int] = None) -> list:
     changing the status of any challenge that can still change. Dropped
     first, oldest challenge first: events about no kept challenge, then
     every event of a FINAL (withdrawn / overruled) challenge, all at once;
-    then anything a non-final challenge's status does not read (it reads
-    the challenge, its ruling, the latest position on each and the latest
-    author checkpoint citing either); last, whole non-final challenges,
-    settled ones (addressed, directive_addressed, conflicted) before owed
-    ones, oldest first: track_supervision keeps their essential events as
-    stubs."""
+    then, all at once, anything a non-final challenge's status cannot read
+    (essential_events); last, whole non-final challenges, settled ones
+    (addressed, directive_addressed, verified, unverifiable, conflicted)
+    before owed ones, oldest first: track_supervision keeps their essential
+    events as stubs."""
     cap = MAX_SUPERVISION_EVENTS if cap is None else cap
     if len(events) <= cap:
         return events
-    statuses = sv.challenge_statuses(events)
+    statuses = sv.challenge_report(events)   # the statuses, and each correction's predecessor
     ruling_of = {e["seq"]: (e.get("payload") or {}).get("ruling_of") for e in events if e.get("type") == RULING}
     about = {e["seq"]: _challenges_of(e, ruling_of) & set(statuses) for e in events}
     final = {c for c, info in statuses.items() if info["status"] in FINAL_STATUSES}
@@ -2408,9 +2763,10 @@ def compact_supervision(events: list, cap: Optional[int] = None) -> list:
         gone.add(c)
         if drop(lambda e: about[e["seq"]] <= gone):
             return kept
-    for e in [e for e in kept if e["seq"] not in essential]:
-        if drop(lambda x, s=e["seq"]: x["seq"] == s):
-            return kept
+    # All at once: a partial drop could leave a plain checkpoint whose
+    # predecessors and verdicts are gone, and it would become the correction.
+    if drop(lambda x: x["seq"] not in essential):
+        return kept
     settled = sorted(c for c in statuses if c not in final and statuses[c]["status"] not in LIVE_STATUSES)
     owed = sorted(c for c in statuses if statuses[c]["status"] in LIVE_STATUSES)
     for c in settled + owed:
@@ -2469,7 +2825,41 @@ def _status_words(info: dict) -> str:
     s = info.get("status")
     return {sv.ACCEPTED: "you accepted it; not yet addressed",
             sv.DIRECTIVE: "a directive you have not acknowledged",
-            sv.DIRECTIVE_ACCEPTED: "a directive you accepted; not yet addressed"}.get(s, _tok(s))
+            sv.DIRECTIVE_ACCEPTED: "a directive you accepted; not yet addressed",
+            sv.REJECTED: "your correction was rejected",
+            sv.DIRECTIVE_REJECTED: "your correction of a directive was rejected"}.get(s, _tok(s))
+
+
+def directive_open_line(r: Any) -> str:
+    return (f"Directive #{_tok(str(r))} stays binding until a correction is accepted, the supervisor rules again or "
+            "the owner overrules it.")
+
+
+def render_rejection(v: dict, c: int, info: dict, *, stop: bool = False) -> str:
+    """A re-surfaced rejected correction: the verdict's rejection (excerpt;
+    at Stop, the longer form) and what to checkpoint next."""
+    inv = v.get("investigation_id")
+    payload = v.get("payload") if isinstance(v.get("payload"), dict) else {}
+    text, cut = clipped_json_text(str(payload.get("text", "")), REMINDER_TEXT if stop else REMINDER_EXCERPT)
+    if cut or payload.get("_cut") is True:
+        text += f" …[truncated; read it with: cardinal-storyboard investigation events {_tok(inv)} --after {v['seq'] - 1}]"
+    lines = [f"[Cardinal investigation {_tok(inv)} · event #{v['seq']} · {VERIFICATION} · authority: ADVISORY · "
+             f"still open: {_status_words(info)}]"]
+    r = info.get("ruling_seq")
+    if info.get("status") == sv.DIRECTIVE_REJECTED:
+        if stop:
+            lines.append(f"Before you stop: directive #{r} is still open.")
+        lines.append(directive_open_line(r) if stop else f"Binding: directive #{_tok(str(r))} is still open.")
+    lines.append(rejection_line(c, info.get("correction_seq"), v["seq"], text))
+    return "\n".join(lines)
+
+
+def _reminder(b: dict, target: int, c: int, info: dict, sid: str, *, stop: bool = False) -> str:
+    v = tracked_event(b, info.get("verification_seq")) if info.get("status") in (sv.REJECTED, sv.DIRECTIVE_REJECTED) \
+        else None
+    if v is not None:
+        return render_rejection(v, c, info, stop=stop)
+    return render_reminder(tracked_event(b, target), info, sid, stop=stop)
 
 
 def render_reminder(e: dict, info: dict, sid: str, *, stop: bool = False) -> str:
@@ -2517,13 +2907,13 @@ def resurface(home: Path, sid: str, emit: Optional[Callable[[str], None]]) -> bo
             due = _settle(b)
             emitted = False
             if emit is not None:
-                for target, _, info in due:
+                for target, c, info in due:
                     entry = st["shown"][str(target)]
                     times = int(_num(entry[2])) if len(entry) > 2 else 0
                     every = RESURFACE_EVERY if times < RESURFACE_BACKOFF_AFTER else RESURFACE_BACKOFF_EVERY
                     if st["boundaries"] - int(_num(entry[1])) < every:
                         continue
-                    emit(render_reminder(tracked_event(b, target), info, sid))
+                    emit(_reminder(b, target, c, info, sid))
                     st["shown"][str(target)] = [entry[0], st["boundaries"], times + 1]
                     emitted = True
                     break
@@ -2546,10 +2936,10 @@ def supervision_stop(home: Path, sid: str, emit: Callable[[str], None]) -> bool:
             if b is None or not supervising(b) or not _supervision(b)["events"]:
                 return False
             st = b["supervision"]
-            for target, _, info in _settle(b):
+            for target, c, info in _settle(b):
                 if info["status"] not in sv.OPEN_DIRECTIVE or target in st["stop_blocked"]:
                     continue
-                emit(render_reminder(tracked_event(b, target), info, sid, stop=True))
+                emit(_reminder(b, target, c, info, sid, stop=True))
                 st["stop_blocked"].append(target)
                 st["stop_blocked"] = st["stop_blocked"][-MAX_SUPERVISION_EVENTS:]
                 write_binding(home, sid, b)
@@ -2566,13 +2956,15 @@ def mark_shown(b: dict, delivered: list, *, stop: bool = False) -> None:
     if not isinstance(b, dict) or not isinstance(b.get("supervision"), dict):
         return
     st = _supervision(b)
-    _settle(b)
+    due = _settle(b)
     for e in delivered or ():
-        entry = st["shown"].get(str(e.get("seq")))
-        if entry is not None:
-            entry[1] = st["boundaries"]
-            if stop and entry[0] in sv.OPEN_DIRECTIVE and e["seq"] not in st["stop_blocked"]:
-                st["stop_blocked"].append(e["seq"])
+        # A delivered verdict stands for the target it re-surfaces under.
+        for target in [e.get("seq")] + [t for t, _, info in due if info.get("verification_seq") == e.get("seq")]:
+            entry = st["shown"].get(str(target))
+            if entry is not None:
+                entry[1] = st["boundaries"]
+                if stop and entry[0] in sv.OPEN_DIRECTIVE and target not in st["stop_blocked"]:
+                    st["stop_blocked"].append(target)
 
 
 def record_supervision(home: Path, sid: str, events: list) -> None:

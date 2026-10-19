@@ -50,16 +50,17 @@ happened.
    `--credential-file <dir>/grant.json` to **every** later command about the worker's
    Investigation. Never export the token into the environment: that turns your whole shell
    into the grantee, and your own session's Cardinal commands stop working.
-   On renewal, mint a new credential file with the same scopes, then run:
+   Renew by succession when under 30 minutes remain:
 
    ```
-   cardinal-storyboard investigation renew-cursor --previous-credential-file <dir>/grant.json --credential-file <dir>/grant-new.json --cursor-file <dir>/cursor.json
+   cardinal-storyboard investigation grant --succeeds-credential-file <dir>/grant.json --out <dir>/grant-<n>.json
    ```
 
-   Use the new credential on later commands. This preserves the committed position
-   and refetches unreviewed events under the new grant. Never edit cursor JSON or
-   copy pending content between grants. Old-grant challenges retain their original
-   ruling authority; renewal does not authorize the new grant to rule on them.
+   It renews your review cursor and deletes the old file; use the new credential on
+   later commands and restart your watch on it. Never edit cursor JSON or copy pending
+   content between grants. Succession before expiry carries ruling and verdict authority
+   over your challenges; a new grant after expiry does not (then mint a new grant and run
+   `renew-cursor`).
 3. **Find the worker's session ids**:
    `cardinal-storyboard investigation show <inv> --credential-file <dir>/grant.json --json`
    returns the owner's `question` and the attached `sessions` (the worker's are those
@@ -91,7 +92,9 @@ happened.
 
 ## The review loop
 
-Wake on new events (SKILL.md says how in this agent), then:
+Wake on new events (SKILL.md says how in this agent). Start each pass with
+`cardinal-storyboard investigation challenges <inv> --credential-file <dir>/grant.json --check-heads`,
+then:
 
 1. **Read the pending page through your review cursor**:
 
@@ -217,13 +220,19 @@ grant. Explicit `--outbox-file` remains available.
 
 Each finding gets one verdict, written so the owner can read it alone:
 
-- **upheld**: `--type cue`, text `Review: upheld — <id>: <what you checked and the deciding
-  result>`.
+- **upheld**: `cardinal-storyboard investigation verdict <seq> --verified --scope <scope>
+  --repo <host>/<owner>/<name> --commit <sha> --text "<what you checked and the deciding
+  result>" --evidence <ev_…|rcpt_…> --credential-file <dir>/grant.json` (`--revision auto`:
+  your own checkout; deployment scopes take `--target` and `--observed-at`).
+- **unverifiable**: the same with `--unverifiable`, text: what you could not check, and
+  what evidence would let you.
 - **challenged**: `--type challenge`, text `Review: challenged — <id>: <what is wrong, the
   evidence, and the correction or test you request>`. A challenge needs the worker to
   take a position (accepted or declined).
-- **unverifiable**: `--type question`, text `Review: unverifiable — <id>: <what you could
-  not check, and what evidence would let you>`.
+
+State the scope you actually checked; never record `merge_readiness` or `deployment` from a
+fixture run. When no scope fits (telemetry, a document), post a `cue` `Review: upheld — <id>: …`
+or `Review: unverifiable — <id>: …` instead.
 
 Refs: the event's `#<seq>`, the claim id, and the `ev_…` / `rcpt_…` that decide it (the
 worker's or your own). State the deciding numbers in the text: the owner will not open
@@ -236,14 +245,21 @@ finding is the job; repeating yourself is not.
 
 You hold delegated supervision on your own challenges. After the worker takes a position:
 
-- it **accepted** and later checkpointed the correction (a result citing `#<seq>`): verify
-  the correction, then post the verdict on the revised claim;
+- it **accepted** and later checkpointed the correction (`challenges` says `verify #<k>`):
+  verify that correction, then `investigation verdict <seq> --correction <k>
+  --verified|--rejected --scope … --credential-file <dir>/grant.json`. A rejection names what
+  is still wrong; a second rejection on the same point goes to a ruling, not a third round.
+  A rejected correction with no new correction or acknowledgement by your next pass (an
+  older worker): post a `challenge` citing the verdict's `#<seq>`;
 - it **declined** with a reason that holds, or new evidence resolves it:
   `cardinal-storyboard investigation rule <seq> --withdraw --text "<why>" --credential-file <dir>/grant.json`;
 - it **declined** and your own evidence still shows the problem:
   `cardinal-storyboard investigation rule <seq> --uphold --text "<the directive: exactly what must change>" --ref <ev_…> --credential-file <dir>/grant.json`.
   An upheld ruling is binding on the worker, so uphold only on evidence you produced or
   checked yourself, never on suspicion. One ruling per challenge.
+
+Only a challenge posted under your supervise grant can be verified (not one posted through the
+MCP tool or as a member): post challenges with the grant, and re-post one that needs verifying.
 
 The owner's own words outrank you: defer to a web owner decision or a relayed one marked
 `by_you`; report any other relayed decision to the owner as unverified, never yield to it.
@@ -358,9 +374,10 @@ what it produced against the record:
 - anything the worker said it would do (accepted challenges, stated next steps) that
   never happened.
 
-Then post one closing `cue`: `Review summary — <n> findings upheld, <n> challenged
+Then post one closing `cue`: `Review summary — <n> findings verified, <n> challenged
 (<n> resolved), <n> unverifiable; <n> unreported-activity issues; activity seen|unseen;
-open: <list>`. Give the owner the same summary with the Investigation link.
+open: <list>`, counting from `challenges <inv> --credential-file <dir>/grant.json --json`.
+Give the owner the same summary with the Investigation link.
 
 ## Bounds
 

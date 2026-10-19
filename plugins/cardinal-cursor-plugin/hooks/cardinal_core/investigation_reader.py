@@ -72,6 +72,8 @@ def compact_event(event, principals, mine=None):
         ) + (f" {payload['note']}" if payload.get("note") else "")
     elif event.get("type") == ie.RULING:
         text = f"{payload.get('outcome')} ruling on #{payload.get('ruling_of')}: {text}"
+    elif event.get("type") == ie.VERIFICATION:
+        text = f"{ie.verification_words(payload)}: {text}"
     if ie.event_class(event) is None:
         text, payload = "[unknown class]", {}
     return {
