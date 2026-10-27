@@ -20,10 +20,11 @@ Per runtime:
            checks-gate.py): the change applies to the running session.
   codex    <plugin>/skills/checks/ (plugin.json "skills": "./skills/").
   cursor   <plugin>/skills/checks/ (plugin.json "skills": "./skills/").
+  copilot  <plugin>/skills/checks/ (.plugin/plugin.json "skills": "skills").
   gemini   ~/.gemini/extensions/cardinal/skills/checks/ (Gemini CLI loads an
            extension's skills/; cardinal-connect builds that extension), only
            when that extension is Cardinal's.
-  On codex and cursor a change takes effect at the next session: no skill
+  On codex, cursor and copilot a change takes effect at the next session: no skill
   reload, no skill-tool deny. On gemini, BeforeTool --role checks-gate denies
   activate_skill for the skill while off; the user's /skills reload applies
   on / off to a running session (a hook cannot reload skills).
@@ -52,8 +53,9 @@ from typing import Optional, Tuple
 
 from .paths import AgentPaths
 
-RUNTIMES = ("claude", "codex", "cursor", "gemini")
-DISPLAY = {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "gemini": "Gemini CLI"}
+RUNTIMES = ("claude", "codex", "cursor", "gemini", "copilot")
+DISPLAY = {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "gemini": "Gemini CLI",
+           "copilot": "Copilot CLI"}
 TEMPLATE_DIR = Path("checks") / "skill"
 SKILL_DIR = "checks"
 # Written into the installed copy so only a copy this plugin made is ever
@@ -124,6 +126,8 @@ def behavior_registered(runtime: str, home: Optional[Path] = None) -> bool:
       claude   always: the plugin's .mcp.json ships it
       codex    [mcp_servers.cardinal-behavior] in ~/.codex/config.toml
       cursor   mcpServers.cardinal-behavior in ~/.cursor/mcp.json
+      copilot  mcpServers.cardinal-behavior in ~/.copilot/mcp-config.json
+               ($COPILOT_HOME/mcp-config.json when COPILOT_HOME is set)
       gemini   mcpServers.cardinal-behavior in Cardinal's extension manifest
                or ~/.gemini/settings.json (a --no-extension install)
     A connection made before the Checks preview has none until its repair
@@ -139,8 +143,19 @@ def behavior_registered(runtime: str, home: Optional[Path] = None) -> bool:
             return False
     if runtime == "cursor":
         return BEHAVIOR_SERVER in _json_servers(agent / "mcp.json")
+    if runtime == "copilot":
+        return BEHAVIOR_SERVER in _json_servers(copilot_mcp_config(home))
     return any(BEHAVIOR_SERVER in _json_servers(path)
                for path in (gemini_extension_dir(home) / "gemini-extension.json", agent / "settings.json"))
+
+
+def copilot_mcp_config(home: Optional[Path] = None) -> Path:
+    """Copilot CLI's user MCP config: $COPILOT_HOME/mcp-config.json (an
+    absolute COPILOT_HOME, and only without an explicit `home`), else
+    ~/.copilot/mcp-config.json."""
+    custom = os.environ.get("COPILOT_HOME") if home is None else None
+    base = Path(custom) if custom and os.path.isabs(custom) else home_dir(home) / ".copilot"
+    return base / "mcp-config.json"
 
 
 def is_connected(runtime: str, home: Optional[Path] = None) -> bool:
@@ -150,7 +165,7 @@ def is_connected(runtime: str, home: Optional[Path] = None) -> bool:
 def repair_command(runtime: str, root: Path) -> Optional[str]:
     """The command that registers cardinal-behavior on an existing
     connection without new credentials (None for claude: nothing to repair).
-    Codex: --repair-hooks; Cursor and Gemini CLI: a re-run without --rotate."""
+    Codex: --repair-hooks; Cursor, Gemini CLI and Copilot CLI: a re-run without --rotate."""
     if _runtime(runtime) == "claude":
         return None
     script = shlex.quote(str(Path(root) / "scripts" / "cardinal-connect"))

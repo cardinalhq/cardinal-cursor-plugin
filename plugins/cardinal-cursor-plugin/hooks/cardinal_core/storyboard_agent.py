@@ -114,7 +114,11 @@ class Wiring:
     def connection(self) -> dict:
         """{origin, org, key} or {}."""
         try:
-            from .evidence_promote import agent_paths_connection
+            from .evidence_promote import agent_paths_connection, connection_for
+            # Explicit process-scoped env connections match Claude's existing
+            # mode and never fall back to a saved key for a different endpoint.
+            if self.environ.get("CARDINAL_CONNECTION") == "env":
+                return connection_for(self.environ.get("CARDINAL_MCP_URL"), self.environ.get("CARDINAL_MCP_API_KEY"))
             home = Path(self.environ.get("HOME") or str(Path.home()))
             return agent_paths_connection(self.paths)(home, dict(self.environ)) or {}
         except Exception:

@@ -48,6 +48,7 @@ import urllib.request
 from typing import Any, Optional
 
 from . import investigation_state as ist
+from . import tls as _tls  # noqa: F401  (a pinned self-signed Cardinal host verifies)
 
 CHECKER = "cardinal_core.investigation_state"
 MAX_RESPONSE_BYTES = 4 << 20
@@ -180,7 +181,10 @@ class _GrantHTTPHandler(urllib.request.HTTPHandler):
 
 class _GrantHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, req):
-        return self.do_open(_grant_connection(http.client.HTTPSConnection, req), req, context=self._context)
+        # A pinned Cardinal host (cardinal_core.tls) verifies against its pin.
+        from .tls import context_for
+        context = context_for(urllib.parse.urlsplit(req.full_url).hostname or "") or self._context
+        return self.do_open(_grant_connection(http.client.HTTPSConnection, req), req, context=context)
 
 
 

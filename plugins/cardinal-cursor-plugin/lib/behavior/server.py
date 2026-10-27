@@ -22,6 +22,19 @@ from range_runner import RangeRunner
 from compilation.files import private_json, private_text
 from compilation.hosted import APIRejected, Authoring, SDK_IDENTITIES
 
+
+def _pin_handlers():
+    """A pinned self-signed Cardinal host (docs/specs/tls-trust.md) verifies
+    against its pin when the plugin's vendored core is beside this runtime."""
+    hooks = Path(__file__).resolve().parents[2] / "hooks"
+    if hooks.is_dir() and str(hooks) not in sys.path:
+        sys.path.append(str(hooks))
+    try:
+        from cardinal_core.tls import https_handler
+    except ImportError:
+        return ()
+    return (https_handler(),)
+
 ROOT = Path(__file__).resolve().parent
 VERSION = '87dde6be3a806f1c9a0346f82d6e861a6ab9bba7aad9d9a70ab884e6427d35f0'
 POPULATION = 'cardinal-investigator'
@@ -32,7 +45,7 @@ DESCRIPTION = ('Flag an investigator run when the assistant states it has enough
                'that its evidence was sufficient or insufficient, or that submission succeeded.')
 
 
-RUNTIMES = ('claude', 'codex', 'cursor', 'gemini')
+RUNTIMES = ('claude', 'codex', 'cursor', 'gemini', 'copilot')
 
 
 def resolve_runtime(runtime=None, environ=None):
@@ -306,7 +319,7 @@ class Behavior(Authoring):
         # Compiler/acceptance teaching checks run under the API's five-minute bound.
         timeout = 310 if method == 'POST' and (path in ('/api/v1/behavior-programs/compile', '/api/v1/behavior-programs/test') or path.endswith('/accept')) else 60
         try:
-            with urllib.request.build_opener(NoRedirect()).open(request, timeout=timeout) as response:
+            with urllib.request.build_opener(NoRedirect(), *_pin_handlers()).open(request, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             status = exc.code

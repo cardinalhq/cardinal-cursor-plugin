@@ -777,19 +777,21 @@ def _submit(home, sid, prompt, conn, client, deadline, now, opener) -> str:
 # The gate: every runtime's prompt hook (capture), the kill switch, consent
 # ---------------------------------------------------------------------------
 
-RUNTIMES = ("claude", "codex", "cursor", "gemini")
-RUNTIME_NAMES = {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "gemini": "Gemini CLI"}
+RUNTIMES = ("claude", "codex", "cursor", "gemini", "copilot")
+RUNTIME_NAMES = {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "gemini": "Gemini CLI",
+                 "copilot": "Copilot CLI"}
 KILL_ENV = "CARDINAL_OWNER_INPUT"
 OFF_VALUES = ("0", "false", "off", "no")
 KILL_FILE = Path(".cardinal") / "owner-input.json"   # under the user's home: {"<runtime>": "off"}
 OPT_OUT = "Set CARDINAL_OWNER_INPUT=0 to turn this off on this machine."
 
 # A runtime with no user-visible, non-blocking message per session (Cursor:
-# CORE_GAPS.md) cannot show DISCLOSURE before the first capture: it captures
+# CORE_GAPS.md; Copilot CLI: sessionStart context reaches only the model and
+# userPromptSubmitted output is dropped) cannot show DISCLOSURE before the first capture: it captures
 # only after the user consented, in their own terminal, to CONSENT_TEXT
 # (`cardinal-connect --owner-input on`). The consent is versioned by the
 # text's sha256: changing the text asks again.
-CONSENT_REQUIRED = frozenset({"cursor"})
+CONSENT_REQUIRED = frozenset({"cursor", "copilot"})
 CONSENT_TEXT = ("Cardinal records the prompts you type in each {runtime} session to that session's Cardinal "
                 "Investigation as owner input (credentials scrubbed, up to 32 KiB); only you and grantees you "
                 "authorize can read them. Run `cardinal-connect --owner-input off` to stop.")

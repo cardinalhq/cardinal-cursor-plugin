@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .paths import AgentPaths, atomic_write_json_compact, read_json
+from . import tls as _tls  # noqa: F401  (a pinned self-signed Cardinal host verifies)
 
 FETCH_TIMEOUT_SEC = 2.0
 # Default refresh cadence when the server response carried no ttl_seconds.

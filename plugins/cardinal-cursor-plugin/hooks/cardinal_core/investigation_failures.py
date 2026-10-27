@@ -21,6 +21,7 @@ SHELL_TOOLS = {
     "codex": {"Bash", "exec", "exec_command", "functions.exec_command"},
     "cursor": {"Shell", "run_terminal_cmd"},
     "gemini": {"run_shell_command"},
+    "copilot": {"bash", "powershell"},
 }
 
 

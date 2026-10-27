@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 from .evidence_promote import no_redirect_opener
+from . import tls as _tls  # noqa: F401  (a pinned self-signed Cardinal host verifies)
 
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 # Pillow downscale target: twice the card (1200x630), so a retina render

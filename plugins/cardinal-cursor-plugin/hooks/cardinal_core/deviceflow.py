@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Callable
+from . import tls as _tls  # noqa: F401  (a pinned self-signed Cardinal host verifies)
 
 DEFAULT_POLL_TIMEOUT_SECS = 600
 DEFAULT_POLL_INTERVAL_SECS = 5
@@ -60,6 +61,25 @@ def _post_json(url: str, body: dict, timeout: int = 15) -> tuple[int, dict | Non
             return exc.code, None
 
 
+def resolve_url(host: str, url):
+    """A URL the server sent, absolute. A Cardinal without MAESTRO_BASE_URL
+    (a self-hosted install that does not know its own public name) answers
+    with paths (`/connect?code=…`, `/api/orgs/<id>/mcp`): they mean the host
+    the plugin was pointed at."""
+    if isinstance(url, str) and url.startswith("/") and not url.startswith("//"):
+        return host.rstrip("/") + url
+    return url
+
+
+def resolve_bundle_urls(host: str, bundle: dict) -> dict:
+    """resolve_url over every URL a token bundle carries (in place)."""
+    for block, key in (("ingest", "endpoint"), ("mcp", "url"), ("act", "endpoint"), ("limits", "status_url")):
+        inner = bundle.get(block)
+        if isinstance(inner, dict) and key in inner:
+            inner[key] = resolve_url(host, inner.get(key))
+    return bundle
+
+
 def start_device_code(host: str, scopes: list[str], client_id: str) -> dict:
     status, body = _post_json(
         host.rstrip("/") + "/api/auth/device/code",
@@ -73,6 +93,7 @@ def start_device_code(host: str, scopes: list[str], client_id: str) -> dict:
         err = (body or {}).get("error", f"HTTP {status}")
         desc = (body or {}).get("error_description", "")
         raise DeviceFlowError(f"device-code init failed: {err}{(': ' + desc) if desc else ''}")
+    body["verification_uri"] = resolve_url(host, body.get("verification_uri"))
     return body
 
 
@@ -170,7 +191,7 @@ def poll_device_token(
         )
         body = body or {}
         if status == 200:
-            return body
+            return resolve_bundle_urls(host, body)
         err = body.get("error", f"http_{status}")
         if err == "authorization_pending":
             time.sleep(interval)

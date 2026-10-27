@@ -72,6 +72,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional
+from . import tls as _tls  # noqa: F401  (a pinned self-signed Cardinal host verifies)
 
 SCHEMA = "investigation-state/v1.1"
 

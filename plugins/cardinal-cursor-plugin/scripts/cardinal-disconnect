@@ -163,6 +163,11 @@ def remove_hooks_config(path: Path) -> bool:
 
 
 def revoke_key(host: str, key_id: str, plaintext: str | None) -> tuple[bool, str]:
+    try:  # a pinned self-signed Cardinal host (docs/specs/tls-trust.md) verifies against its pin
+        sys.path.insert(0, str(PLUGIN_ROOT / "hooks"))
+        from cardinal_core import tls as _tls  # noqa: F401
+    except ImportError:
+        pass
     url = host.rstrip("/") + f"/api/maestro-keys/{key_id}/revoke"
     headers = {"content-type": "application/json"}
     if plaintext:
