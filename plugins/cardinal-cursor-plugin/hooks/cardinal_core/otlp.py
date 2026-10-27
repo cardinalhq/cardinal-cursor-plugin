@@ -17,6 +17,7 @@ from typing import Any
 
 from . import CORE_VERSION
 from .paths import AgentPaths
+from . import tls as _tls  # noqa: F401  (a pinned self-signed Cardinal host verifies)
 
 DEFAULT_TIMEOUT_SEC = 2.0
 DEFAULT_API_HEADER = "x-cardinalhq-api-key"

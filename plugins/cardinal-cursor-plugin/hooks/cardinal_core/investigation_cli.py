@@ -144,6 +144,250 @@ class CLI:
     def _home(self) -> Path:
         return self.wiring.paths.home.parent
 
+    def _gate(self, args):
+        from .investigation_gate import Gate
+        if args.gate_file is None:
+            from . import investigation_gate_runtime as runtime
+            selected = runtime.route(self._home(), args.session, investigation=args.investigation,
+                batch=getattr(args, "batch", None), credential_file=args.credential_file)
+            if not selected:
+                raise ValueError("no gate route for this session; pass --gate-file explicitly")
+            if args.investigation and args.investigation != selected["investigation_id"]:
+                raise ValueError("explicit investigation differs from this session's gate route")
+            if args.credential_file and str(args.credential_file.absolute()) != selected.get("credential_file"):
+                raise ValueError("explicit credential differs from this session's gate route")
+            args.gate_file = Path(selected["gate_file"])
+            args.investigation = selected["investigation_id"]
+            args.credential_file = Path(selected["credential_file"]) if selected.get("credential_file") else None
+            self.scoped = args.credential_file is not None or gr.token_set(self.wiring.environ)
+        got = self._target(args)
+        if got is None:
+            raise ValueError("gate requires an investigation and connection")
+        conn, client, inv = got
+        return Gate({**conn, "investigation_id": inv}, args.gate_file, session=args.session,
+                    client=client, home=self._home(), credential_file=args.credential_file)
+
+    def cmd_gate_enable(self, args):
+        from . import investigation_gate_runtime as runtime
+        gate = self._gate(args)
+        value = json.loads(args.policy.read_text(encoding="utf-8"))
+        print(json.dumps(runtime.activate(gate, value, runtime=getattr(self.wiring, "runtime", ""),
+                                         cli=self.wiring.cli, environ=self.wiring.environ,
+                                         new_epoch=args.new_epoch, budget_file=args.budget_file,
+                                         argv=getattr(args, "gate_argv", None))))
+        return 0
+
+    def cmd_gate_status(self, args):
+        print(json.dumps(self._gate(args).status()))
+        return 0
+
+    def cmd_request(self, args):
+        return self._request_write(args, "request.created", {"text": args.text,
+            "assignee": {"principal": args.assignee, "session": args.assignee_session},
+            "intent": args.intent or args.text})
+
+    def _intent_gates(self, args):
+        from . import investigation_gate_runtime as runtime
+        if not self._session_arg(args):
+            raise ValueError("coordination requires this agent's session")
+        got = self._target(args)
+        if not got:
+            raise ValueError("coordination requires an authenticated Investigation")
+        conn, client, inv = got
+        args.intent_connection = consumer.identity({**conn, "investigation_id": inv})
+        return runtime.prepare_intent(session=args.session, runtime=self.wiring.runtime,
+            home=self._home(), conn={**conn, "investigation_id": inv}, client=client,
+            cli=self.wiring.cli, credential_file=args.credential_file)
+
+    def _sync_intent(self, args, gates):
+        pending = []
+        for gate in gates:
+            required = args.requires if consumer.identity(gate.conn) == args.intent_connection else ()
+            result = gate.synchronize(args.intent, required)
+            if result.status != "allow":
+                status = "needs_feedback" if result.batch else result.reason or "retry"
+                after = getattr(args, "after_response", None)
+                if (status == "needs_attention" and after is not None and result.requests
+                        and all(r["request"] in required and (r["status"] == "waiting" or
+                            (r["status"] == "blocked" and r["response"] <= after)) for r in result.requests)):
+                    status = "waiting"
+                pending.append({"status": status, "intent": args.intent, "released": False,
+                    "investigation_id": gate.conn["investigation_id"],
+                    "batch": result.batch or None, "message": result.message,
+                    "requests": list(result.requests)})
+        if pending:
+            priority = {"needs_feedback": 0, "needs_attention": 1, "retry": 2, "uncertain": 2, "waiting": 3}
+            selected = min(pending, key=lambda item: priority.get(item["status"], 2))
+            return {**selected, "pending_contexts": [
+                {"status": item["status"], "batch": item["batch"],
+                 "requests": [r["request"] for r in item["requests"]]} for item in pending]}
+        return {"status": "ready", "intent": args.intent, "released": True}
+
+    def cmd_sync(self, args):
+        result = self._sync_intent(args, self._intent_gates(args))
+        print(json.dumps(result, ensure_ascii=False))
+        return 0 if result["released"] else 3
+
+    def cmd_wait(self, args):
+        """One bounded invocation; new feedback interrupts the wait for handling."""
+        if not 0 < args.timeout <= 300:
+            raise ValueError("wait timeout must be >0 and <=300 seconds")
+        if args.after_response is not None and (args.after_response < 0 or not args.requires):
+            raise ValueError("--after-response needs --request and a nonnegative sequence")
+        end = time.monotonic() + args.timeout
+        gates = self._intent_gates(args)
+        delay = 0.1
+        while True:
+            result = self._sync_intent(args, gates)
+            if result["status"] != "waiting" and not (args.incoming and result["released"]):
+                print(json.dumps(result, ensure_ascii=False))
+                return 0 if result["released"] else 3
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                print(json.dumps({**result, "status": "timeout", "released": False,
+                    "message": "Wait ended; this intent and its required results remain durable. Resume with the same intent."}, ensure_ascii=False))
+                return 3
+            time.sleep(min(delay, remaining))
+            delay = min(2.0, delay * 2)
+
+    def cmd_respond(self, args):
+        return self._request_write(args, "request.responded", {"request": args.request,
+            "outcome": args.outcome, "text": args.text})
+
+    def cmd_resolve(self, args):
+        payload = {"request": args.request, "outcome": args.outcome, "text": args.text}
+        if args.response is not None:
+            payload["response"] = args.response
+        return self._request_write(args, "request.resolved", payload)
+
+    def _request_write(self, args, typ, payload):
+        import hashlib
+        got = self._target(args)
+        if not got:
+            return EXIT_USAGE
+        conn, client, inv = got
+        if not conn.get("grant_id") and not self._session_arg(args):
+            return EXIT_USAGE
+        if typ == "request.created":
+            if not self._session_arg(args):
+                return EXIT_USAGE
+            from . import investigation_requests as requests
+            out = requests.create(conn, inv, args.session, payload, home=self._home(), client=client,
+                key=args.key, credential_file=args.credential_file)
+            print(json.dumps(out, ensure_ascii=False))
+            return 0
+        # Response/resolution retries refer to the same immutable request.
+        key = args.key or "request:" + hashlib.sha256(json.dumps(
+            [inv, args.session, typ, payload], sort_keys=True).encode()).hexdigest()
+        out = ie.append_event(conn, inv, typ, payload, idempotency_key=key, client=client,
+            session_id=None if conn.get("grant_id") else args.session)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+
+    def cmd_requests(self, args):
+        if args.request is not None and args.request < 1:
+            raise ValueError("request sequence must be positive")
+        if args.after_response is not None and (not args.request or args.after_response < 0):
+            raise ValueError("--after-response needs --request and a nonnegative sequence")
+        if not 0 < args.timeout <= 300:
+            raise ValueError("request wait timeout must be >0 and <=300 seconds")
+        from . import investigation_requests as requests
+        got = self._target(args)
+        if not got:
+            return EXIT_USAGE
+        conn, client, inv = got
+        after, head, state = 0, None, {}
+        for _ in range(100):
+            page = ie.read_snapshot(conn, inv, after=after, through_seq=head, limit=200,
+                types=list(requests.TYPES), client=client, request_protocol=2)
+            requests.fold(state, page["events"])
+            if page["scan_complete"]:
+                values = list(state.get("requests", {}).values())
+                who = consumer.principal_key(page["viewer"]["principal"])
+                if who.startswith("grantee:") and page["viewer"].get("lineage_root_id"):
+                    who = "grantee:" + page["viewer"]["lineage_root_id"]
+                args.request_viewer = who
+                target = next((r for r in values if r["request"] == args.request), None) if args.request else None
+                incoming = [r for r in values if r["assignee"] == requests.party(who, args.session)
+                            and not r["resolved"] and r["status"] == "waiting"]
+                if args.request and not target:
+                    raise ValueError("request not found in the authenticated snapshot")
+                result_ready = target and target["status"] != "waiting" and (args.after_response is None or (target["response"] or 0) > args.after_response)
+                if not args.wait or result_ready or (not args.request and incoming):
+                    print(json.dumps({"investigation_id": inv, "snapshot_head_seq": page["snapshot_head_seq"],
+                        "requests": [target] if args.request and target else values}, ensure_ascii=False))
+                    return 0
+                return self._wait_requests(args)
+            after, head = page["scanned_through"], page["snapshot_head_seq"]
+        raise ValueError("request snapshot incomplete; no dependency status inferred")
+
+    def _wait_requests(self, args):
+        import copy
+        end = time.monotonic() + args.timeout
+        probe = copy.copy(args)
+        probe.wait = False
+        import contextlib, io
+        from . import investigation_requests as requests
+        got = self._target(args)
+        if not got:
+            return EXIT_USAGE
+        conn = got[0]
+        while time.monotonic() < end:
+            time.sleep(min(2.0, max(0, end - time.monotonic())))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.cmd_requests(probe)
+            result = json.loads(output.getvalue())
+            values = result["requests"]
+            if args.request:
+                ready = any(r["request"] == args.request and r["status"] != "waiting"
+                    and (args.after_response is None or (r["response"] or 0) > args.after_response) for r in values)
+            else:
+                # User/key participant identity comes from the authenticated
+                # snapshot viewer, captured by cmd_requests, never its text.
+                who = getattr(probe, "request_viewer", None)
+                ready = any(r["assignee"] == requests.party(who, args.session) and not r["resolved"]
+                            and r["status"] == "waiting" for r in values) if who else False
+            if ready:
+                print(json.dumps(result, ensure_ascii=False))
+                return 0
+        print(json.dumps({"status": "timeout", "released": False,
+            "message": "No required result arrived; dependencies remain unresolved."}))
+        return 3
+
+    def cmd_gate_disable(self, args):
+        from . import investigation_gate_runtime as runtime
+        print(json.dumps(runtime.deactivate(self._gate(args))))
+        return 0
+
+    def cmd_gate_read(self, args):
+        gate = self._gate(args)
+        current = gate.status()
+        batch = args.batch or current["batch"]
+        if not batch:
+            raise ValueError("no pending gate batch")
+        next_index = next((i for i in range(1, current["chunks"] + 1) if i not in current["delivered"]), 1)
+        print(gate.read(batch, args.chunk if args.chunk is not None else next_index).message)
+        return 0
+
+    def cmd_gate_reviewed(self, args):
+        from . import investigation_budget as budget
+        gate = self._gate(args)
+        budget_file = gate.status().get("budget_file")
+        if args.budget_file and str(args.budget_file.absolute()) != budget_file:
+            raise ValueError("--budget-file differs from the gate's enabled response guard; start a new epoch")
+        def guarded_review():
+            review_args = argparse.Namespace(**vars(args))
+            review_args.cursor_file = args.gate_file
+            review_args.page_file = None
+            # The gate cursor is independent of the established supervisor
+            # cache. Moving the cursor must never choose an empty new cache.
+            review_args.budget_file = Path(budget_file)
+            return budget.reviewed(review_args, grant=gate.conn, own_conn=self.connection,
+                                   home=self._home(), out=lambda _: None)
+        print(json.dumps(gate.reviewed(args.batch, args.chunk_hash, supervisor_review=guarded_review)))
+        return 0
+
     def _session_arg(self, args):
         sid = args.session
         if not ie.valid_session(sid):
@@ -929,7 +1173,26 @@ class CLI:
                       f"--previous-credential-file {old_path} --credential-file {args.out} --cursor-file {cursor}`, "
                       "then delete it", file=sys.stderr)
                 return 1
+        # A durable, explicit successor association lets automatic consumers
+        # validate the new grant before retiring old routes. Never guess files.
+        consumer.private_write(old_path.with_suffix(old_path.suffix + ".successor.json"), {
+            "old_identity": consumer.identity(old), "credential_file": str(args.out.absolute()),
+            "new_identity": consumer.identity(consumer.credential_connection(args.out)),
+            "lineage_root_id": out.get("lineage_root_id")})
+        # Persist both new credential and successor directory entries before
+        # deleting the old credential. Never lose both sides on power failure.
+        for directory in {args.out.parent, old_path.parent}:
+            fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         old_path.unlink()
+        fd = os.open(old_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         shown = {k: v for k, v in out.items() if k != "token"}
         shown.update(credential_file=str(args.out), succeeded=old["grant_id"])
         if renewed is not None:
@@ -1815,6 +2078,8 @@ def build_parser(wiring, session_env=()):
         "proposals",
         "withdraw-proposal",
         "budget",
+        "request", "respond", "resolve", "requests", "sync", "wait",
+        "gate-enable", "gate-status", "gate-read", "gate-reviewed", "gate-disable",
     ):
         p = sub.add_parser(
             action,
@@ -1855,6 +2120,47 @@ def build_parser(wiring, session_env=()):
             ),
         )
         p.set_defaults(investigation_id=None)
+        if action in ("request", "respond", "resolve"):
+            p.add_argument("--text", required=True, help="request, result, blocker, abstention/rejection or resolution reason")
+            p.add_argument("--key", help="retry identity; omit for a deterministic key")
+        if action == "request":
+            p.add_argument("--assignee", required=True, help="authenticated kind:id principal")
+            p.add_argument("--assignee-session", help="required for user/key; omit for a grantee")
+            p.add_argument("--intent", help="free-form dependent work; defaults to the request text")
+        if action in ("sync", "wait"):
+            p.add_argument("--intent", required=True, help="purpose of the work or decision being synchronized")
+            p.add_argument("--request", dest="requires", action="append", type=int, default=[],
+                           help="required request sequence; repeat for multiple results; retained across restarts")
+            if action == "wait":
+                p.add_argument("--timeout", type=float, default=120, help="bounded wait, at most 300 seconds; timeout never releases work")
+                p.add_argument("--incoming", action="store_true", help="wait for new information or an assignment even with no outgoing dependency")
+                p.add_argument("--after-response", type=int, help="await progress after this blocked response")
+        if action in ("respond", "resolve"):
+            p.add_argument("request", type=int, help="request.created event sequence")
+            p.add_argument("--outcome", required=True, choices=("complete", "blocked", "abstain", "reject") if action == "respond" else ("accepted", "cancelled"))
+        if action == "requests":
+            p.add_argument("--request", type=int, help="one request sequence")
+            p.add_argument("--wait", action="store_true", help="wait for a response, or an incoming request when --request is omitted")
+            p.add_argument("--after-response", type=int, help="with --request --wait, await a newer response after a blocked update")
+            p.add_argument("--timeout", type=float, default=120, help="bounded wait seconds; a timeout never releases dependent actions")
+        if action == "resolve":
+            p.add_argument("--response", type=int, help="exact complete response sequence, required for accepted")
+        if action.startswith("gate-"):
+            p.add_argument("--gate-file", type=Path, required=action == "gate-enable",
+                           help="separate private gate state; never a delivery cursor")
+            if action == "gate-enable":
+                p.add_argument("--policy", type=Path, required=True)
+                p.add_argument("--new-epoch", action="store_true", help="archive old policy and rescan from zero")
+                p.add_argument("--budget-file", type=Path, help="pin an existing supervisor response-guard cache")
+            elif action == "gate-read":
+                p.add_argument("--batch", help="default: this session's pending gate batch")
+                p.add_argument("--chunk", type=int, help="default: next undelivered chunk, or replay chunk 1")
+            elif action == "gate-reviewed":
+                p.add_argument("--batch", required=True)
+                p.add_argument("--chunk-hash", action="append", required=True)
+                p.add_argument("--budget-file", type=Path)
+                for flag in ("tag", "done", "reopen", "redone"):
+                    p.add_argument("--" + flag, action="append", default=[])
         if action in ("events", "show", "post", "bind", "attach", "propose-decision", "supervising", "budget",
                       "challenges"):
             p.add_argument("investigation_id", nargs=None if action in ("bind", "attach") else "?")
@@ -2076,6 +2382,7 @@ def normalize_argv(argv):
         "--unverifiable",
         "--check-heads",
         "--help",
+        "--new-epoch",
         "-h",
     }
     positional = []
@@ -2113,6 +2420,7 @@ def normalize_argv(argv):
 
 def cli_main(argv, wiring, session_env=(), *, legacy=False):
     args = build_parser(wiring, session_env).parse_args(normalize_argv(argv))
+    args.gate_argv = normalize_argv(argv)
     cli = CLI(wiring, args, legacy)
     try:
         if cli.scoped and args.action in ("propose-decision", "supervising"):
@@ -2121,7 +2429,9 @@ def cli_main(argv, wiring, session_env=(), *, legacy=False):
                   f"{args.action} without --credential-file and without CARDINAL_INVESTIGATION_TOKEN", file=sys.stderr)
             return EXIT_USAGE
         if cli.scoped and args.action not in ("events", "post", "show", "reviewed", "verify", "rule", "proposals",
-                                              "withdraw-proposal", "budget", "renew-cursor", "verdict", "challenges"):
+                                              "withdraw-proposal", "budget", "renew-cursor", "verdict", "challenges",
+                                              "request", "respond", "resolve", "requests", "sync", "wait",
+                                              "gate-enable", "gate-status", "gate-read", "gate-reviewed", "gate-disable"):
             return EXIT_USAGE if not cli._author_only("not recorded") else 0
         if args.action == "post" and (args.type is None or args.text is None):
             raise ValueError("post requires type and text (positional or --type/--text)")

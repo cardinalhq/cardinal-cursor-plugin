@@ -21,6 +21,16 @@ Besides the ingest and MCP keys, the script requests a control-plane token (`mae
 
 The script prints an approval URL. Show that URL to the user and wait for the script to finish. On success, tell the user to restart Cursor so it reloads MCP and hook config, then suggest the status skill.
 
+## A self-hosted Cardinal behind a self-signed certificate
+
+Most Cardinal hosts carry a certificate the machine already trusts, and the script says nothing about TLS. When `--host` presents one it does not trust (self-signed, or a private CA), the script stops **before** the device flow with exit status 3 and prints the certificate: the verification error, subject, issuer, the names it carries (and whether they include the host), validity and its SHA-256 fingerprint, plus the exact re-run command. Show all of that to the user and ask whether they expected it (they run this Cardinal) and want to trust exactly that certificate. Never answer for them. If they say yes, re-run with the fingerprint the script printed:
+
+```bash
+python3 <plugin directory>/scripts/cardinal-connect --host <url> --trust-cert <sha256 fingerprint>
+```
+
+That pins the certificate for that hostname in `~/.cardinal/tls/` (delete the file to forget it): every Cardinal hook, script and skill then verifies the host against it, and nothing else is weakened. If the fingerprint does not match what the server presents on the re-run, the script refuses. Cursor's own MCP client is not configured by this plugin: the script prints the system-store / launch-environment note. That client also checks that the certificate names the host; the script says when it does not. See `docs/specs/tls-trust.md`.
+
 ## Owner input (the user's own decision)
 
 `cardinal-connect --owner-input on|off` does not connect. It decides whether this machine's Cursor sessions record the prompts the user types as owner input of their Cardinal Investigation. It prints the full text being consented to, and `on` asks the user to type `yes`.

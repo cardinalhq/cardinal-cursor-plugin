@@ -48,7 +48,7 @@ from typing import Callable, List, Mapping, Optional
 from . import investigation_events as ie
 
 # Whether the runtime's turn end may block with advisory text (R1, above).
-TURN_END_BLOCK = {"claude": True, "codex": True, "gemini": False, "cursor": False}
+TURN_END_BLOCK = {"claude": True, "codex": True, "gemini": False, "cursor": False, "copilot": False}
 
 MAX_STAGED = 20                    # staged items kept: past it the oldest go
 MAX_STAGED_CHARS = 4 * ie.RENDER_BUDGET
@@ -161,6 +161,16 @@ def naming_reminder(home: Path, sid: str, *, repeat: bool = False) -> Optional[s
 
 
 def at_tool(home: Path, sid: str, org: Optional[str], runtime: str, *, is_subagent: bool) -> Delivery:
+    from .investigation_gate_runtime import delivery_guard
+    try:
+        binding = ie.read_binding(home, sid) or {}
+        with delivery_guard(home, sid, binding.get("investigation_id"), runtime) as allowed:
+            return _at_tool(home, sid, org, runtime, is_subagent=is_subagent) if allowed else Delivery()
+    except Exception:
+        return Delivery()
+
+
+def _at_tool(home: Path, sid: str, org: Optional[str], runtime: str, *, is_subagent: bool) -> Delivery:
     """A tool boundary of session `sid`. A subagent's (is_subagent) gets
     nothing and changes nothing: no output, the inbox, the cursor and the
     staged items are left for the main thread. Otherwise: staged items,
@@ -211,7 +221,11 @@ def at_turn_end(home: Path, sid: str, conn: Optional[dict], client: str, runtime
         if not ie.valid_session(sid) or ie.read_binding(home, sid) is None:
             return out
         try:
-            _turn_end_events(home, sid, conn or {}, client, environ, stop_hook_active, deadline, parts.append)
+            from .investigation_gate_runtime import delivery_guard
+            binding = ie.read_binding(home, sid) or {}
+            with delivery_guard(home, sid, binding.get("investigation_id"), runtime) as allowed:
+                if allowed:
+                    _turn_end_events(home, sid, conn or {}, client, environ, stop_hook_active, deadline, parts.append)
         except Exception:
             pass
         b = ie.read_binding(home, sid)
@@ -269,7 +283,14 @@ def at_prompt(home: Path, sid: str, runtime: str) -> Delivery:
     Cursor beforeSubmitPrompt / sessionStart): what was staged, as model
     context. No network. Never raises."""
     out = Delivery()
-    out.agent_context.extend(consume_staged(home, sid))
+    from .investigation_gate_runtime import delivery_guard
+    try:
+        binding = ie.read_binding(home, sid) or {}
+        with delivery_guard(home, sid, binding.get("investigation_id"), runtime) as allowed:
+            if allowed:
+                out.agent_context.extend(consume_staged(home, sid))
+    except (ValueError, OSError):
+        pass
     reminder = naming_reminder(home, sid, repeat=True)
     if reminder:
         out.agent_context.append(reminder)

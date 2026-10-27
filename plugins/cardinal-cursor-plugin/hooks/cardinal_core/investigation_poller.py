@@ -263,7 +263,10 @@ def _step(home, sid, connection, client, opener, status, interval, now) -> None:
         return
     status["polled_at"] = now
     try:
-        status["last"] = ie.poll_once(home, sid, conn, client, opener=opener, now=now)
+        from .investigation_gate_runtime import delivery_guard
+        binding = ie.read_binding(home, sid) or {}
+        with delivery_guard(home, sid, binding.get("investigation_id")) as allowed:
+            status["last"] = ie.poll_once(home, sid, conn, client, opener=opener, now=now) if allowed else "gate_owned"
         status["ok_at"] = now
         status["failures"] = 0
         status["next_at"] = now + interval

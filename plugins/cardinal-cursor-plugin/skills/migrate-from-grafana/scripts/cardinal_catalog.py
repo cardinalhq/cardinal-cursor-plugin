@@ -45,6 +45,15 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from convert import guess_kind_from_query, post_parser_spans  # noqa: E402
 
+# A pinned self-signed Cardinal host (docs/specs/tls-trust.md): the plugin's
+# vendored core installs the urllib opener that verifies it. Absent in the
+# common/ checkout, where the script only ever talks to a trusted host.
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "hooks"))
+try:
+    from cardinal_core import tls as _tls  # noqa: E402,F401
+except ImportError:
+    pass
+
 UNIT_SUFFIXES = ["_seconds", "_milliseconds", "_microseconds", "_nanoseconds", "_bytes", "_bits",
                  "_ratio", "_percent", "_celsius", "_meters", "_hertz", "_volts", "_amperes",
                  "_joules", "_grams", "_minutes", "_hours", "_days"]
@@ -63,7 +72,7 @@ def load_env_file(path):
 
 # Where the agent's Cardinal connect wrote its state: CARDINAL_AGENT_HOME (each
 # adapter's SKILL.md sets it, e.g. ~/.codex), else the first agent home that has one.
-AGENT_HOMES = ["~/.claude", "~/.codex", "~/.cursor", "~/.gemini"]
+AGENT_HOMES = ["~/.claude", "~/.codex", "~/.cursor", "~/.gemini", "~/.copilot"]
 # --check exit codes the skill branches on: connect, or reconnect with --rotate.
 EXIT_NOT_CONNECTED, EXIT_CONNECT_REJECTED, EXIT_NEEDS_TOKEN = 3, 4, 6
 EXIT_PICK_INSTANCE = 7  # several data lakes and no --instance: ask the user which one

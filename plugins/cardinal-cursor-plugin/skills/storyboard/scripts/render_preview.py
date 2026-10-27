@@ -44,7 +44,7 @@ Output (stdout): one JSON object per line.
   last line:          {"summary": {...}}
 PNGs go to ~/.<runtime>/cardinal/storyboards/<storyboard_id>/r<revision>/
 <scene>-<step>.png (-dark before .png for --theme dark), mode 0600, overwritten
-per revision; <runtime> is --runtime (claude, codex, cursor or gemini), the agent
+per revision; <runtime> is --runtime (claude, codex, cursor, gemini or copilot), the agent
 whose Cardinal connection is used. --out DIR overrides the directory.
 
 Exit codes:
@@ -349,6 +349,7 @@ AGENTS = {
     "codex": ("Codex", "the Cardinal plugin's scripts/cardinal-connect"),
     "cursor": ("Cursor", "the Cardinal plugin's scripts/cardinal-connect"),
     "gemini": ("Gemini CLI", "the Cardinal plugin's scripts/cardinal-connect"),
+    "copilot": ("Copilot CLI", "the Cardinal plugin's scripts/cardinal-connect"),
 }
 RUNTIME = "claude"
 
@@ -446,7 +447,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _opener():
-    return urllib.request.build_opener(_NoRedirect())
+    handlers = [_NoRedirect()]
+    try:
+        from cardinal_core.tls import https_handler  # a pinned self-signed Cardinal host
+        handlers.append(https_handler())
+    except ImportError:
+        pass
+    return urllib.request.build_opener(*handlers)
 
 
 def _error_body(err: urllib.error.HTTPError) -> dict:

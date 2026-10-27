@@ -173,7 +173,8 @@ MAX_AUDIENCE_RENDERED = 400  # escaped characters of a story request's audience
 READ_CLASSES = EVENT_CLASSES + (OWNER,)
 SUPERVISION_RECORDS = "supervision"   # a supervisor's own records (record-supervision): read by their author only,
                                       # never delivered or rendered (investigation_budget rebuilds its cache from them)
-CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,)   # for an event without `class` only
+REQUEST_TYPES = ("request.created", "request.responded", "request.resolved")
+CONTROL_TYPES = DELIVERABLE + (ACKNOWLEDGED,) + REQUEST_TYPES   # for an event without `class` only
 OWNER_INPUT_TYPES = ("owner_input.recorded",)   # written by the prompt hook only (owner_input.py)
 GRANTEE = "grantee"                             # producer.principal.kind of an access grant's holder
 MAX_TEXT = 4000
@@ -531,6 +532,95 @@ def read_events(conn: dict, investigation_id: str, *, after: int = 0, limit: int
     return {"investigation_id": investigation_id, "events": kept, "last_seq": last, "page_size": len(events),
             "head_seq": head, "principals": principals,
             "viewer": out.get("viewer") if isinstance(out.get("viewer"), dict) else {}}
+
+
+def read_snapshot(conn: dict, investigation_id: str, *, after: int = 0, through_seq=None,
+                  limit: int = 100, types=None, client: str, opener=None, timeout: float = 3.0, request_protocol=None, previous_grant_ids=None) -> dict:
+    """Strict Phase 1 fixed-head reader. Missing proof is an error, never completion.
+
+    Kept separate from the legacy reader: in particular, foreign events and
+    hidden tails cannot silently turn a partial snapshot into a successful scan.
+    """
+    def number(value):
+        return type(value) is int and 0 <= value <= 9007199254740991
+
+    def principal(value):
+        return isinstance(value, str) and ":" in value and all(value.split(":", 1))
+
+    if not valid_investigation(investigation_id) or not number(after) or type(limit) is not int or not 1 <= limit <= 200:
+        raise ist.FetchError("invalid snapshot request")
+    if through_seq is not None and (not number(through_seq) or after > through_seq):
+        raise ist.FetchError("invalid snapshot bound")
+    body = {"investigation_id": investigation_id, "snapshot": True, "after": after, "limit": limit}
+    if request_protocol is not None:
+        if type(request_protocol) is not int or request_protocol not in (1, 2):
+            raise ist.FetchError("unsupported request protocol")
+        body["request_protocol"] = request_protocol
+    if previous_grant_ids:
+        if request_protocol not in (1, 2) or len(previous_grant_ids) > 32 or any(not re.fullmatch(r"grt_[0-9a-f]{24}", g) for g in previous_grant_ids):
+            raise ist.FetchError("invalid previous grant proof request")
+        body["previous_grant_ids"] = list(previous_grant_ids)
+    if through_seq is not None:
+        body["through_seq"] = through_seq
+    if types is not None:
+        body["types"] = list(types)
+    raw = sync._post(conn, "read-investigation-events", body, client=client, opener=opener, timeout=timeout)
+    if not isinstance(raw, dict):
+        raise ist.FetchError("invalid snapshot response")
+    events, head, bound, scanned = (raw.get(k) for k in
+                                    ("events", "head_seq", "snapshot_head_seq", "scanned_through"))
+    complete, viewer = raw.get("scan_complete"), raw.get("viewer")
+    if (raw.get("investigation_id") != investigation_id or not isinstance(events, list)
+            or len(events) > limit or not all(number(x) for x in (head, bound, scanned))
+            or not after <= scanned <= bound <= head or type(complete) is not bool
+            or type(raw.get("next_after")) is not int or raw["next_after"] != scanned
+            or bound != (head if through_seq is None else through_seq)
+            or not isinstance(viewer, dict) or not principal(viewer.get("principal"))):
+        raise ist.FetchError("snapshot response lacks a consistent fixed-head proof")
+    last = after
+    for event in events:
+        if (not isinstance(event, dict) or not number(event.get("seq")) or not last < event["seq"] <= scanned
+                or event.get("investigation_id") != investigation_id
+                or not isinstance(event.get("type"), str) or not isinstance(event.get("payload"), dict)
+                or (types is not None and event["type"] not in types)):
+            raise ist.FetchError("invalid or unordered snapshot event")
+        expected = (CONTROL if event["type"] in CONTROL_TYPES else
+                    SEMANTIC if event["type"] in SEMANTIC_TYPES else
+                    OWNER if event["type"] == OWNER_DECIDED else None)
+        if expected and (event.get("class") != expected or not isinstance(event.get("producer"), dict)
+                         or not isinstance(event.get("authority"), str)):
+            raise ist.FetchError("registered snapshot event lacks its typed producer/authority envelope")
+        if expected:
+            producer = event["producer"].get("principal")
+            if not (principal(producer) or
+                    (isinstance(producer, dict) and isinstance(producer.get("kind"), str)
+                     and producer["kind"] and isinstance(producer.get("id"), str) and producer["id"])):
+                raise ist.FetchError("snapshot event has no producer identity")
+            authorities = ({"owner_decision", "owner_relayed"} if expected == OWNER else
+                           {"producer_claim"} if expected == SEMANTIC else
+                           {"delegated_supervision"} if event["type"] == RULING else
+                           {"supervisor_attestation"} if event["type"] == VERIFICATION else {"advisory"})
+            if event["authority"] not in authorities:
+                raise ist.FetchError("snapshot event authority does not match its registered type")
+            for sid in (event["producer"].get("session_id"), event.get("to_session_id")):
+                if sid is not None and not valid_session(sid):
+                    raise ist.FetchError("snapshot event has invalid session routing")
+            if event["type"] == ACKNOWLEDGED:
+                payload = event["payload"]
+                if type(payload.get("ack_of")) is not int or (
+                        payload.get("note") is not None and not isinstance(payload["note"], str)):
+                    raise ist.FetchError("invalid acknowledgment snapshot payload")
+                ack_payload(payload["ack_of"], payload.get("disposition"), payload.get("note"),
+                            payload.get("conflicts_with"))
+        last = event["seq"]
+    expected_complete = len(events) < limit or last == bound
+    if complete != expected_complete or (complete and scanned != bound) or (
+            not complete and (scanned != last or scanned >= bound)):
+        raise ist.FetchError("snapshot response has inconsistent completeness")
+    principals = raw.get("principals", {})
+    if not isinstance(principals, dict):
+        raise ist.FetchError("invalid snapshot principals")
+    return {**raw, "principals": principals}
 
 
 def read_all(conn: dict, investigation_id: str, *, after: int, to_session_id: Optional[str] = None, client: str,

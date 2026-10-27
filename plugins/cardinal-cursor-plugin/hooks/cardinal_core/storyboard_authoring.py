@@ -72,7 +72,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Optional, Tu
 if TYPE_CHECKING:  # imported lazily: a hook's fast path imports this module
     from .paths import AgentPaths
 
-RUNTIMES = ("claude", "codex", "cursor", "gemini")
+RUNTIMES = ("claude", "codex", "cursor", "gemini", "copilot")
 # Cardinal's own MCP server, as each runtime names it. Claude Code: a
 # user-scope `cardinal` server, or the plugin's bundled one. The others:
 # the `cardinal` server their cardinal-connect writes.
@@ -81,6 +81,7 @@ CARDINAL_SERVERS = {
     "codex": ("cardinal",),
     "cursor": ("cardinal",),
     "gemini": ("cardinal",),
+    "copilot": ("cardinal",),
 }
 OFF_VALUES = ("0", "false", "off", "no")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -196,6 +197,9 @@ def mcp_tool(runtime: str, tool_name: Any, *, server: Optional[str] = None) -> O
       cursor         mcp__<server>__<tool> (what the cursor adapter has always
                      parsed; unverified against a live Cursor). Cursor's
                      MCP:<tool> spelling names no server: only with `server`.
+      copilot        mcp__<server>__<tool>: the adapter rewrites Copilot
+                     CLI's <server>-<tool> to it against the servers it knows
+                     (hooks/cardinal-copilot-telemetry.py canonical_tool_name).
       gemini         mcp_<server>_<tool> (gemini-cli 0.50 generateValidName
                      and parseMcpToolName, chunk-W4YMYD53.js:265051-265070,
                      265388-265400). Ambiguous when the server name holds
@@ -208,7 +212,7 @@ def mcp_tool(runtime: str, tool_name: Any, *, server: Optional[str] = None) -> O
     Cursor), checked against the name when the name carries one."""
     if not isinstance(tool_name, str) or not tool_name:
         return None
-    if runtime in ("claude", "codex", "cursor"):
+    if runtime in ("claude", "codex", "cursor", "copilot"):
         if tool_name.startswith("mcp__"):
             srv, sep, tool = tool_name[len("mcp__"):].partition("__")
             if not (sep and srv and tool):

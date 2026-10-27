@@ -35,7 +35,7 @@ from pathlib import Path
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN_ROOT / "hooks"))
-from cardinal_core import deviceflow  # noqa: E402
+from cardinal_core import deviceflow, tls  # noqa: E402
 from cardinal_core.paths import atomic_write, atomic_write_secret, backup  # noqa: E402
 
 
@@ -439,6 +439,9 @@ def write_state(
     if installed_project_paths:
         state["project_install"] = installed_project_paths
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tls_state = tls.state_block(bundle, host)
+    if tls_state:
+        state["tls"] = tls_state
     atomic_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
 
 
@@ -496,6 +499,15 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
     ingest = bundle.get("ingest")
     mcp = bundle.get("mcp")
     act = deviceflow.act_credential(bundle)
+
+    # The bundle's endpoints may sit on another hostname than the app host:
+    # the same trust check, before anything probes them.
+    try:
+        tls.ensure_hosts_trusted(tls.connection_urls(bundle, args.host), trust=getattr(args, "trust_cert", []),
+                                 command=connect_command(args))
+    except tls.CertificateError as exc:
+        print(str(exc), file=sys.stderr)
+        return tls.EXIT_UNTRUSTED_CERT
 
     # Set when the server granted the other scopes but minted no ingest key
     # (org has no Lakerunner, or no ingest endpoint configured). Connect goes
@@ -625,6 +637,8 @@ def continue_after_grant(args: argparse.Namespace, grant: dict) -> int:
             "Commit .cursor/mcp.json and .cursor/hooks.json to your repo so "
             "cloud agents pick them up."
         )
+    for line in tls.runtime_lines("cursor", bundle, args.host):
+        print(line)
     print()
     print("Restart Cursor so it reloads MCP and hook config, then run cardinal-status.")
     return 0
@@ -741,12 +755,30 @@ def parse_args() -> argparse.Namespace:
              "dashboards or alert rules as you (migrate-from-grafana) then need a "
              "reconnect or an org API key.",
     )
+    parser.add_argument(
+        "--trust-cert", action="append", default=[], metavar="SHA256",
+        help="Trust the certificate with this SHA-256 fingerprint for the host "
+             "that presents it (a self-hosted Cardinal behind a self-signed "
+             "certificate). Connect shows the fingerprint and asks only when "
+             "the machine does not already trust the host; repeatable.",
+    )
     args = parser.parse_args()
     try:
         args.named_scopes = deviceflow.parse_act_scopes(args.scopes)
     except ValueError as exc:
         parser.error(str(exc))
     return args
+
+
+def connect_command(args: argparse.Namespace) -> str:
+    """How to re-run this connect (shown when a certificate needs --trust-cert)."""
+    parts = ["cardinal-connect"]
+    if args.host != "https://app.cardinalhq.io":
+        parts += ["--host", args.host]
+    for flag in ("rotate", "telemetry_only", "minimal_scopes"):
+        if getattr(args, flag, False):
+            parts.append("--" + flag.replace("_", "-"))
+    return " ".join(parts)
 
 
 def main() -> int:
@@ -794,6 +826,14 @@ def main() -> int:
         print(f"     It is stored 0600 in {SECRETS_PATH}; cardinal-disconnect revokes it.")
         for line in deviceflow.act_scope_warnings(extra):
             print(line)
+    # A host whose certificate this machine does not trust (self-hosted,
+    # self-signed) is shown and pinned with the user's consent first; a
+    # trusted host passes silently. docs/specs/tls-trust.md.
+    try:
+        tls.ensure_trusted(args.host, trust=getattr(args, "trust_cert", []), command=connect_command(args))
+    except tls.CertificateError as exc:
+        print(str(exc), file=sys.stderr)
+        return tls.EXIT_UNTRUSTED_CERT
     try:
         grant, requested = deviceflow.start_device_code_with_fallback(
             args.host, required, act_scopes, CLIENT_ID)

@@ -37,7 +37,7 @@ from pathlib import Path
 import re
 import time
 
-RUNTIMES = ('claude', 'codex', 'cursor', 'gemini')
+RUNTIMES = ('claude', 'codex', 'cursor', 'gemini', 'copilot')
 VERDICTS = ('MATCH', 'NON_MATCH', 'UNKNOWN', 'NOT_APPLICABLE')
 DRAFT_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 TRACE_RE = re.compile(r'^[a-f0-9]{32}$')

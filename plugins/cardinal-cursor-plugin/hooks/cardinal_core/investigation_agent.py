@@ -62,8 +62,12 @@ def owner_input_recorded(wiring, binding: dict) -> bool:
 def describe(wiring, sid: str, binding: dict) -> str:
     """The session guidance (investigation_text.session_text) with this
     adapter's command and an explicit --session."""
+    from .investigation_gate_runtime import owns_delivery
+    gate_owned = bool(getattr(wiring, "paths", None)) and owns_delivery(
+        home(wiring), sid, binding.get("investigation_id"), runtime(wiring))
     return text.session_text(sid, binding, cmd=command(wiring), target=f"--session {shlex.quote(sid)}",
-                             runtime=runtime(wiring), owner_input_recorded=owner_input_recorded(wiring, binding))
+                             runtime=runtime(wiring), owner_input_recorded=owner_input_recorded(wiring, binding),
+                             coordination_gate=gate_owned or runtime(wiring) in ("codex", "claude"))
 
 
 def start(wiring, sid: str, source: Optional[str] = None, *, cwd: Optional[str] = None) -> Optional[str]:

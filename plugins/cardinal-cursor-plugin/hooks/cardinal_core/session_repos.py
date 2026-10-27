@@ -13,7 +13,7 @@ from .paths import AgentPaths, read_json
 from .storyboard_context import REPO_RE
 
 MAX_REPOS = 32
-RUNTIMES = ("claude", "codex", "cursor", "gemini")
+RUNTIMES = ("claude", "codex", "cursor", "gemini", "copilot")
 OFF = ("0", "false", "off", "no")
 
 
@@ -78,7 +78,7 @@ def replay(home, sid, runtime, client, *, env=None):
 def observe(call, home, *, env=None):
     """Explicit tool working directories and file arguments; no shell guessing."""
     runtime = "claude" if call.runtime == "claude-code" else call.runtime
-    if runtime not in ("claude", "codex", "cursor", "gemini") or disabled(home, runtime, env):
+    if runtime not in RUNTIMES or disabled(home, runtime, env):
         return
     if not ie.read_binding(home, call.session_id or "") or call.error:
         return

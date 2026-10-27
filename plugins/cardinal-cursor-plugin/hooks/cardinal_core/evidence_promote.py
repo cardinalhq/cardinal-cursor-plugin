@@ -67,6 +67,7 @@ from typing import Any, Callable, Optional
 from . import evidence
 from . import evidence_capture as capture
 from . import evidence_gate as gate
+from . import tls as _tls  # noqa: F401  (a pinned self-signed Cardinal host verifies)
 
 EXIT_OK = 0
 EXIT_ITEM_ERRORS = 1
@@ -176,7 +177,8 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def no_redirect_opener():
-    return urllib.request.build_opener(_NoRedirect())
+    from .tls import https_handler
+    return urllib.request.build_opener(_NoRedirect(), https_handler())
 
 
 def _error_body(err: urllib.error.HTTPError) -> dict:
