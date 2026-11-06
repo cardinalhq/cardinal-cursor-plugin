@@ -15,7 +15,8 @@ The text, for a session whose Investigation and live Storyboard exist:
     owner-input sentence when this session's prompts are recorded, the
     advisory line, investigation_events.ACK_GUIDANCE and POST_GUIDANCE,
     SUPERVISION_LINE when the server advertises delegated supervision, and
-    the semantic checkpoint guidance (CHECKPOINT_LINE);
+    the semantic checkpoint guidance (CHECKPOINT_LINE) and, on a server that
+    takes them, agent-written milestones (MILESTONE_LINE);
   - a joined session (not the author): the links, and that it cannot edit,
     frame, publish, question or acknowledge.
 A binding without a storyboard: the id, the investigation and the advisory
@@ -82,6 +83,22 @@ CHECKPOINT_LINE = (
     "cardinal-storyboard commands on their own: a command combined with one is never captured. Record "
     "conclusions and work products, not private reasoning. Skip routine tool use and unchanged knowledge. Entries "
     "are your claims, not established facts.")
+
+# Agent-written milestones (maestro capability agent_milestones): the
+# session writes its storyboard's milestones in real time, on the same
+# checkpoints, instead of the server generating them later.
+MILESTONE_CAPABILITY = "agent_milestones"
+MILESTONE_LINE = (
+    "Write this storyboard's milestones yourself as you go: on each checkpoint that settles a line of inquiry (a "
+    "hypothesis resolved, a finding or decision proposed or revised, a question answered, an experiment "
+    "completed), add to that event \"milestone\":{\"title\":\"<what was found: one short plain sentence a "
+    "non-expert understands>\",\"description\":\"<two or three plain sentences: what was looked at, what it "
+    "shows, why it matters>\"}. A hypothesis proposed or question opened may carry an open one (\"Looking into "
+    "whether …\"); the event that resolves it rewrites it. Cardinal writes it into the private draft at once, with "
+    "no model run: it is not authoring visuals, needs no consent and publishes nothing. Its state follows the "
+    "event; supported or ruled out needs the evidence cited on the event. A story holds at most 8 milestones: when "
+    "the checkpoint is refused as full, merge with \"replaces\":[\"<milestone ids>\"] (dead ends become one "
+    "\"ruled out …\"). No jargon, code names, internal ids or event numbers in milestone text.")
 
 SKILL_LINE = ("The storyboard skill authors this storyboard's visualization ({sb}) after the user's consent; "
               "never storyboard__create another for this session. "
@@ -199,6 +216,8 @@ def session_text(sid: str, binding: dict, *, cmd: str = CLAUDE_CMD, target: str 
         if ie.capability(binding, ie.SUPERVISION_CAPABILITY):
             parts.append(ie.SUPERVISION_LINE)
     parts.append(CHECKPOINT_LINE.replace("{cmd}", cmd).replace("{sid}", sid))
+    if ie.capability(binding, MILESTONE_CAPABILITY):
+        parts.append(MILESTONE_LINE)
     if runtime in SANDBOXED:
         parts.append(SANDBOX_LINE.replace("{cmd}", cmd))
     return " ".join(parts)

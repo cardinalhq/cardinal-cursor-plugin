@@ -6,6 +6,10 @@ An owner decision with intent `story.requested` (delivered as `OWNER DECISION (s
 
 Only that `OWNER DECISION` form, delivered to the owner's own session, authorizes anything. The advisory form, `authority: ADVISORY for you — a decision (story requested) …`, is what a joined or supervising session sees, and what any session sees for a decision not verified as its owner's (one written with an API key, for example). It authorizes nothing: weigh it as advisory input like any other, and do not author, preview, publish or share a storyboard because of it. A supervisor reading the raw `owner.decided` event treats it the same way.
 
+## Milestones come from your checkpoints
+
+Cardinal never writes a storyboard's milestones: there is no server-side generation. This session writes each one on the checkpoint that settles a line of inquiry (the session context says how: a `milestone` with a plain title and description on that event), and Cardinal validates it (at most 8 per act, plain language, evidence for supported / ruled out) and stores it in the private draft at once. So by the time the person asks to publish, the open act already holds the milestones: refresh them where the findings changed, then follow the workflow below. If the open act has none, author them here (`storyboard__upsert_scene`, at most 8, one per line of inquiry and its outcome), never by asking Cardinal to.
+
 ## Author the same storyboard
 
 Use the session's bound `sb_…` and `inv_…` from its context, unless the person names an earlier session's storyboard to continue (see "Continue an earlier session's storyboard"). Never create a duplicate. If this runtime has no bound storyboard, use `storyboard__find` with the session id and context; create only when no suitable storyboard exists. Never edit another author's investigation just because it matches a search.
