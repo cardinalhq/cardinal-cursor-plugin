@@ -1011,11 +1011,66 @@ def checkpoint_capabilities(events: list, binding: dict) -> list:
         if stripped:
             print("warning: this Cardinal server does not support checkpoint artifacts/gate; fields stripped",
                   file=sys.stderr)
+    if not capability(binding, "agent_milestones") and any("milestone" in e for e in events):
+        for e in events:
+            e.pop("milestone", None)
+        print("warning: this Cardinal server does not write agent milestones yet; milestone stripped (the events "
+              "are still recorded)", file=sys.stderr)
     if not capability(binding, "checkpoint_revision") and any("revision" in e["payload"] for e in events):
         for e in events:
             e["payload"].pop("revision", None)
         print("warning: this Cardinal server does not support checkpoint revision; field stripped", file=sys.stderr)
     return events
+
+
+# A semantic event's `milestone` (maestro storyboard/agent-milestones.ts,
+# capability agent_milestones): the agent writes the storyboard's milestone
+# itself, on the checkpoint that settles a line of inquiry. Checked here for
+# shape only; the server holds it to the milestone rules (8 per act, a
+# plain non-vague title, a short description, supported / ruled_out only on
+# witnessed or captured evidence) and refuses the whole checkpoint if not.
+MILESTONE_FIELDS = ("id", "title", "description", "state", "bindings", "presentation", "open_questions", "replaces")
+MILESTONE_STATES = ("supported", "ruled_out", "open", "context")
+MAX_MILESTONE_TITLE = 600
+MAX_MILESTONE_DESCRIPTION = 2000
+MILESTONE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _milestone(value: Any, where: str) -> dict:
+    where = f"{where}: milestone"
+    if not isinstance(value, dict):
+        raise CheckpointInputError(f"{where} is an object {{title, description, ...}}")
+    unknown = sorted(str(k) for k in set(value) - set(MILESTONE_FIELDS))
+    if unknown:
+        raise CheckpointInputError(f"{where}: unknown field {', '.join(_claimed(k) for k in unknown)}; it takes "
+                                   f"{', '.join(MILESTONE_FIELDS)}")
+    out: dict = {}
+    for name, cap in (("title", MAX_MILESTONE_TITLE), ("description", MAX_MILESTONE_DESCRIPTION)):
+        v = value.get(name)
+        if not isinstance(v, str) or not v.strip() or len(v) > cap:
+            raise CheckpointInputError(f"{where}: \"{name}\" is required, 1-{cap} characters of plain language")
+        out[name] = v.strip()
+    if "id" in value:
+        if not isinstance(value["id"], str) or not MILESTONE_ID_RE.fullmatch(value["id"]):
+            raise CheckpointInputError(f"{where}: \"id\" is 1-64 of A-Z a-z 0-9 _ - (default m-<the event's id>)")
+        out["id"] = value["id"]
+    if "state" in value:
+        if value["state"] not in MILESTONE_STATES:
+            raise CheckpointInputError(f"{where}: \"state\" is one of {', '.join(MILESTONE_STATES)} (default: from the event)")
+        out["state"] = value["state"]
+    for name in ("bindings", "presentation"):
+        if name in value:
+            if not isinstance(value[name], dict):
+                raise CheckpointInputError(f"{where}: \"{name}\" is an object")
+            out[name] = value[name]
+    for name, cap in (("open_questions", 3), ("replaces", 8)):
+        v = value.get(name)
+        if v is None or v == []:
+            continue
+        if not isinstance(v, list) or len(v) > cap or not all(isinstance(x, str) and x.strip() for x in v):
+            raise CheckpointInputError(f"{where}: \"{name}\" is a list of at most {cap} strings")
+        out[name] = list(v)
+    return out
 
 
 def _semantic_event(e: Any, i: int) -> dict:
@@ -1030,11 +1085,13 @@ def _semantic_event(e: Any, i: int) -> dict:
         raise CheckpointInputError(f"{where}: unknown type {_claimed(t)}; one of {', '.join(SEMANTIC_TYPES)}")
     where = f"{where} ({t})"
     if "payload" in e:
-        if set(e) - {"type", "payload"} or not isinstance(e["payload"], dict):
+        if set(e) - {"type", "payload", "milestone"} or not isinstance(e["payload"], dict):
             raise CheckpointInputError(f"{where}: either {{type, payload: {{...}}}} or flat fields, not both")
         fields = dict(e["payload"])
+        fields.pop("milestone", None)
     else:
-        fields = {k: v for k, v in e.items() if k != "type"}
+        fields = {k: v for k, v in e.items() if k not in ("type", "milestone")}
+    milestone = _milestone(e["milestone"], where) if e.get("milestone") is not None else None
     sid, alias = fields.pop("semantic_id", None), fields.pop("id", None)
     if sid is not None and alias is not None and sid != alias:
         raise CheckpointInputError(f"{where}: \"id\" and \"semantic_id\" differ; give one")
@@ -1083,7 +1140,7 @@ def _semantic_event(e: Any, i: int) -> dict:
     for name in structured:
         if name in fields:
             payload[name] = validate_structured(name, fields[name], where)
-    return {"type": t, "payload": payload}
+    return {"type": t, "payload": payload, **({"milestone": milestone} if milestone is not None else {})}
 
 
 def checkpoint_events(raw: Any) -> list:
@@ -1131,7 +1188,7 @@ def with_receipts(events: list, receipts: dict) -> list:
                 if x not in items:
                     items.append(x)
             payload["evidence"] = items
-        out.append({"type": e["type"], "payload": payload})
+        out.append({**e, "payload": payload})
     return out
 
 
@@ -1441,7 +1498,8 @@ def checkpoint(conn: dict, investigation_id: str, session_id: str, events: Any, 
                                    "Cardinal")
     events = checkpoint_events(events)
     binding = read_binding(home or home_dir(), session_id) or {}
-    if any(e["type"] == "experiment.revised" for e in events) and not capability(binding, "experiment_revised"):
+    if (any(e["type"] == "experiment.revised" for e in events) and not capability(binding, "experiment_revised")) \
+            or (any("milestone" in e for e in events) and not capability(binding, "agent_milestones")):
         binding = refresh_binding_capabilities(home or home_dir(), session_id, conn, client, opener=opener) or binding
     events = checkpoint_capabilities(events, binding)
     key = idempotency_key or checkpoint_key(investigation_id, session_id, events)
@@ -1517,6 +1575,13 @@ def checkpoint_refusal(err: "sync.ServerError") -> str:
                                                  else None)
     if said:
         line += f": {said}"
+    if code == "milestone_invalid" and isinstance(body.get("issues"), list):
+        # The milestone rules say how to fix it (which milestones to merge):
+        # every issue in full, one per line.
+        for i in body["issues"][:MAX_CHECKPOINT_EVENTS]:
+            if isinstance(i, dict):
+                line += f"\n  {_tok(i.get('path'))} ({_tok(i.get('code'))}): {_one_line(i.get('message') or '', 1200)}"
+        return line
     issues = sync._issues(body)
     if issues:
         line += f" ({_one_line(issues, 300)})"
@@ -1532,7 +1597,30 @@ def checkpoint_line(out: dict) -> str:
     if out.get("duplicate"):
         return f"already checkpointed {span} (retry deduplicated)"
     items = ", ".join(f"{_tok(e.get('type'))} {_tok((e.get('payload') or {}).get('semantic_id'))}" for e in evs)
-    return f"checkpointed {span} ({items})"
+    return f"checkpointed {span} ({items})" + milestone_lines(out)
+
+
+def milestone_lines(out: dict) -> str:
+    """What the server did with the checkpoint's milestones, one line each
+    (nothing when it carried none): written / rewritten / merged, its state
+    and any warning to fix next time, or why it was not written."""
+    lines = []
+    for m in out.get("milestones") if isinstance(out.get("milestones"), list) else []:
+        if not isinstance(m, dict):
+            continue
+        did = "milestone written" if m.get("created") else "milestone rewritten"
+        line = f"{did}: {_tok(m.get('milestone_id'))} ({_tok(m.get('state'))})"
+        replaced = m.get("replaced") if isinstance(m.get("replaced"), list) else []
+        if replaced:
+            line += ", merging " + ", ".join(_tok(x) for x in replaced[:MAX_REFS])
+        for w in (m.get("warnings") if isinstance(m.get("warnings"), list) else [])[:3]:
+            line += f"\n  warning: {_one_line(w, 300)}"
+        lines.append(line)
+    for m in out.get("milestone_errors") if isinstance(out.get("milestone_errors"), list) else []:
+        if isinstance(m, dict):
+            lines.append(f"milestone not written: {_tok(m.get('milestone_id'))} ({_tok(m.get('code'))}): "
+                         f"{_one_line(m.get('message') or '', 300)}")
+    return "".join("\n" + x for x in lines)
 
 
 _SEMANTIC_TEXT = ("statement", "outcome", "reason", "answer")
