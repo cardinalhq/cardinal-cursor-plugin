@@ -39,7 +39,7 @@ class Authoring:
         if not isinstance(result['behavior_contract'].get('clauses'), list):
             raise ValueError('API returned an invalid Behavior Contract')
         if path.exists():
-            previous = json.loads(path.read_text())
+            previous = json.loads(path.read_text(encoding='utf-8'))
             if (result.get('compilation_context') and previous.get('compilation_context')
                     and result['compilation_context'] != previous['compilation_context']):
                 raise ValueError('immutable program compilation context changed')
@@ -163,7 +163,7 @@ class Authoring:
         path = self.program_path(diagnostic_version)
         if not path.exists():
             raise ValueError('Compile or inspect this candidate before testing it')
-        program = json.loads(path.read_text())
+        program = json.loads(path.read_text(encoding='utf-8'))
         if udf_source is not None and udf_source != program['source']:
             raise ValueError('source differs from compiled candidate; compile the revised source before testing')
         if (not isinstance(trace_ids, list) or not 1 <= len(trace_ids) <= 8
@@ -219,13 +219,13 @@ class Authoring:
             raise ValueError('teaching test receipt does not match returned results')
         receipt_path = self.output / 'teaching' / f'{digest}.json'
         if receipt_path.exists():
-            if json.loads(receipt_path.read_text()) != receipt:
+            if json.loads(receipt_path.read_text(encoding='utf-8')) != receipt:
                 raise ValueError('cached teaching test receipt integrity check failed')
         else:
             private_json(receipt_path, receipt)
         def persist_program():
             with program_lock(path):
-                current = json.loads(path.read_text())
+                current = json.loads(path.read_text(encoding='utf-8'))
                 current.update(test_receipt=result['test_receipt'], teaching_receipt=result)
                 private_json(path, current)
         if history:
@@ -243,12 +243,12 @@ class Authoring:
         path = self.program_path(diagnostic_version)
         if not path.exists():
             raise ValueError('Inspect the Behavior Contract and source before accepting this version')
-        program = json.loads(path.read_text())
+        program = json.loads(path.read_text(encoding='utf-8'))
         if not program.get('compilation_scope'):
             raise ValueError('Recompile through compile_behavior to register the development regression suite')
         history = RegressionHistory(self.output, program['compilation_scope'])
         with history.locked(), program_lock(path):
-            program = json.loads(path.read_text())
+            program = json.loads(path.read_text(encoding='utf-8'))
             if not program.get('test_receipt'):
                 raise ValueError('Run test_behavior on real teaching traces before accepting this version')
             teaching = program['teaching_receipt']['results']
@@ -265,14 +265,14 @@ class Authoring:
             return result
 
     def compilation_status(self, diagnostic_version):
-        program = json.loads(self.program_path(diagnostic_version).read_text())
+        program = json.loads(self.program_path(diagnostic_version).read_text(encoding='utf-8'))
         if not program.get('compilation_scope'):
             raise ValueError('Compile this candidate to register its compilation scope')
         return RegressionHistory(self.output, program['compilation_scope']).status(diagnostic_version)
 
     def run_regressions(self, diagnostic_version):
         """Execute every accumulated real-trace case, even after a failed batch."""
-        program = json.loads(self.program_path(diagnostic_version).read_text())
+        program = json.loads(self.program_path(diagnostic_version).read_text(encoding='utf-8'))
         if not program.get('compilation_scope'):
             raise ValueError('Compile this candidate to register its compilation scope')
         history = RegressionHistory(self.output, program['compilation_scope'])

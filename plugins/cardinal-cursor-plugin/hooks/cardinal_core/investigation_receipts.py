@@ -72,6 +72,8 @@ def latest_binding(home, org):
 
 
 def cli_main(argv, wiring):
+    from .paths import utf8_stdio
+    utf8_stdio()
     p = argparse.ArgumentParser(prog="cardinal-storyboard receipt")
     p.add_argument("receipt_id", help="rcpt_ receipt or locally captured ev_ id")
     p.add_argument("--rows", type=rows_arg)

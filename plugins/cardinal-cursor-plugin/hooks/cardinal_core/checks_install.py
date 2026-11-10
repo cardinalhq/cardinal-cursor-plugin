@@ -51,7 +51,8 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
-from .paths import AgentPaths
+from .paths import AgentPaths, script_command
+from .paths import replace as _replace
 
 RUNTIMES = ("claude", "codex", "cursor", "gemini", "copilot")
 DISPLAY = {"claude": "Claude Code", "codex": "Codex", "cursor": "Cursor", "gemini": "Gemini CLI",
@@ -113,7 +114,7 @@ _CODEX_BEHAVIOR_TABLE_RE = re.compile(
 
 def _json_servers(path: Path) -> dict:
     try:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     servers = data.get("mcpServers") if isinstance(data, dict) else None
@@ -138,7 +139,7 @@ def behavior_registered(runtime: str, home: Optional[Path] = None) -> bool:
     agent = agent_paths(runtime, home).home
     if runtime == "codex":
         try:
-            return bool(_CODEX_BEHAVIOR_TABLE_RE.search((agent / "config.toml").read_text()))
+            return bool(_CODEX_BEHAVIOR_TABLE_RE.search((agent / "config.toml").read_text(encoding="utf-8")))
         except (OSError, UnicodeDecodeError):
             return False
     if runtime == "cursor":
@@ -168,15 +169,16 @@ def repair_command(runtime: str, root: Path) -> Optional[str]:
     Codex: --repair-hooks; Cursor, Gemini CLI and Copilot CLI: a re-run without --rotate."""
     if _runtime(runtime) == "claude":
         return None
-    script = shlex.quote(str(Path(root) / "scripts" / "cardinal-connect"))
-    return f"python3 {script} --repair-hooks" if runtime == "codex" else f"python3 {script}"
+    script = Path(root) / "scripts" / "cardinal-connect"
+    command = script_command(script, f"python3 {shlex.quote(str(script))}")
+    return f"{command} --repair-hooks" if runtime == "codex" else command
 
 
 # --- opt-in ---------------------------------------------------------------
 
 def is_enabled(runtime: str, home: Optional[Path] = None) -> bool:
     try:
-        data = json.loads((state_dir(runtime, home) / "enabled.json").read_text())
+        data = json.loads((state_dir(runtime, home) / "enabled.json").read_text(encoding="utf-8"))
         return isinstance(data, dict) and data.get("enabled") is True
     except (OSError, ValueError):
         return False
@@ -195,7 +197,7 @@ def set_enabled(runtime: str, enabled: bool, home: Optional[Path] = None) -> Non
             stream.write(json.dumps({"enabled": bool(enabled), "updated_at": time.time()}) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp, path)
+        _replace(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -219,7 +221,7 @@ def skills_dir(runtime: str, root: Path, home: Optional[Path] = None) -> Optiona
         return Path(root) / "skills"
     ext = gemini_extension_dir(home)
     try:
-        manifest = json.loads((ext / "gemini-extension.json").read_text())
+        manifest = json.loads((ext / "gemini-extension.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not (isinstance(manifest, dict) and manifest.get("cardinalManaged")):
@@ -249,7 +251,7 @@ def installed_digest(dest: Optional[Path]) -> Optional[str]:
     if dest is None:
         return None
     try:
-        data = json.loads((Path(dest) / MARKER).read_text())
+        data = json.loads((Path(dest) / MARKER).read_text(encoding="utf-8"))
         return data.get("template_sha256") if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
@@ -278,10 +280,10 @@ def install(root: Path, dest: Path) -> bool:
     if staging.exists():
         shutil.rmtree(staging)
     shutil.copytree(template_dir(root), staging, ignore=shutil.ignore_patterns("__pycache__"))
-    (staging / MARKER).write_text(json.dumps({"template_sha256": digest}) + "\n")
+    (staging / MARKER).write_text(json.dumps({"template_sha256": digest}) + "\n", encoding="utf-8")
     if dest.exists():
         shutil.rmtree(dest)
-    os.replace(staging, dest)
+    _replace(staging, dest)
     return True
 
 

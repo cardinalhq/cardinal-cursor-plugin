@@ -181,9 +181,8 @@ def _bootstrap_lock(home: Path, sid: str, wait: float):
     The server is idempotent either way."""
     try:
         import fcntl
-    except ImportError:  # pragma: no cover
-        yield True
-        return
+    except ImportError:  # Windows: the same calls on msvcrt.locking
+        from . import _winfcntl as fcntl  # type: ignore[no-redef]
     import os
     d = ie._ensure_dirs(home)
     fd = os.open(str(d / f"{ie.binding_path(home, sid).stem}.bootstrap.lock"), os.O_RDWR | os.O_CREAT, 0o600)

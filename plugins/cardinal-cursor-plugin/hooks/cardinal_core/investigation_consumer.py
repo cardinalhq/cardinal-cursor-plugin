@@ -16,13 +16,37 @@ from pathlib import Path
 
 from . import investigation_events as ie
 from . import investigation_grants as grants
+from .paths import replace as _replace
+
+
+def _mine_alone(st: os.stat_result) -> bool:
+    """Owned by this user, no access for group or others. Windows has
+    neither: st_uid is 0 and the mode bits are made up from the read-only
+    flag. A file there is as private as the directory it is in, and these
+    live under the user profile, whose ACL admits only its owner; that ACL
+    is not checked here."""
+    if not hasattr(os, "getuid"):
+        return True
+    return not st.st_mode & 0o077 and st.st_uid == os.getuid()
+
+
+def fsync_directory(path) -> None:
+    """Make a rename or unlink in `path` durable. Windows cannot open a
+    directory to fsync it (PermissionError); NTFS journals the entry."""
+    if os.name == "nt":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def private_read(path: Path) -> dict:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd) as stream:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, encoding="utf-8") as stream:
         mode = os.fstat(stream.fileno())
-        if not stat.S_ISREG(mode.st_mode) or mode.st_mode & 0o077 or mode.st_uid != os.getuid():
+        if not stat.S_ISREG(mode.st_mode) or not _mine_alone(mode):
             raise ValueError("credential/state file must be owned by you and private (mode 0600)")
         value = json.load(stream)
     if not isinstance(value, dict):
@@ -34,18 +58,18 @@ def private_write(path: Path, value: dict, *, create=False) -> None:
     data = json.dumps(value, ensure_ascii=False, indent=2) + "\n"
     if create:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         return
     fd, tmp = tempfile.mkstemp(prefix="." + path.name, dir=path.parent)
     try:
-        with os.fdopen(fd, "w") as stream:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp, path)
+        _replace(tmp, path)
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
@@ -67,7 +91,7 @@ def identity(conn: dict) -> dict:
 def private_directory(path: Path) -> Path:
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     mode = path.lstat()
-    if not stat.S_ISDIR(mode.st_mode) or mode.st_mode & 0o077 or mode.st_uid != os.getuid():
+    if not stat.S_ISDIR(mode.st_mode) or not _mine_alone(mode):
         raise ValueError("state directory must be owned by you, private (mode 0700), and not a symlink")
     return path.absolute()
 
@@ -107,8 +131,11 @@ def self_only(page: dict) -> bool:
 
 @contextlib.contextmanager
 def locked(path: Path):
-    import fcntl
-    fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        import fcntl
+    except ImportError:  # Windows: the same calls on msvcrt.locking
+        from . import _winfcntl as fcntl  # type: ignore[no-redef]
+    fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         yield

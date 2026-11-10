@@ -39,7 +39,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional
 
 from . import storyboard_context, storyboard_discovery, storyboard_files
-from .paths import AgentPaths
+from . import paths as paths_module
+from .paths import AgentPaths, script_command
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\Z")
 COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}\Z")
@@ -210,7 +211,7 @@ def session_line(session_id: Optional[str], cli: Optional[str], auto_context: bo
     line = (f"Cardinal session id for this session: {session_id}. When you call Cardinal's "
             f"storyboard__create, storyboard__add_act or storyboard__find, pass it as session_id")
     if cli:
-        cmd = f'python3 "{cli}" context --bare --session-id {session_id}'
+        cmd = script_command(cli, f'python3 "{cli}"') + f" context --bare --session-id {session_id}"
         if auto_context:
             line += (f"; the plugin fills session_id and context when you leave them out, and "
                      f"`{cmd}` prints that context object (where this storyboard is written from), "
@@ -246,7 +247,7 @@ def hooks_file_registers(path: Path, event: str, needle: str) -> bool:
     """registered_hook_group over the `hooks` map of the JSON file at path;
     False when it is missing or unreadable."""
     try:
-        data = json.loads(Path(path).read_text())
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
     except Exception:
         return False
     return registered_hook_group(data.get("hooks") if isinstance(data, dict) else None, event, needle)
@@ -547,6 +548,7 @@ def launcher_main(runtime: str, agent: str, home_name: str, version_fn: Callable
     """The body of an adapter's scripts/cardinal-storyboard: exits via
     os._exit (discover may leave an abandoned request thread behind its
     deadline)."""
+    paths_module.utf8_stdio()
     code = 0
     try:
         try:

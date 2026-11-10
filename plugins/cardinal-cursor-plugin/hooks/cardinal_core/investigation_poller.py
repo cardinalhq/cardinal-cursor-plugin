@@ -53,11 +53,12 @@ from typing import Callable, Optional
 from . import investigation_bootstrap as boot
 from . import investigation_events as ie
 from . import investigation_state_sync as sync
+from .paths import replace as _replace
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
+except ImportError:  # Windows: the same calls on msvcrt.locking
+    from . import _winfcntl as fcntl  # type: ignore[no-redef]
 
 POLL_INTERVAL = 5.0
 MIN_INTERVAL = 1.0          # the floor for an override (CARDINAL_INVESTIGATION_POLL_INTERVAL)
@@ -69,6 +70,10 @@ LOCK_WAIT = 10.0            # a poller of the previous process may still hold th
 FRESH = POLL_INTERVAL + 1.0  # a successful poll this recent covers the Stop backstop
 
 SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "mksh", "fish", "busybox"}
+# On Windows a hook runs under PowerShell (or Git Bash), and Python may be
+# started by the py launcher; names there carry .exe and any letter case.
+WINDOWS = os.name == "nt"
+WINDOWS_SHELLS = SHELLS | {"powershell", "pwsh", "cmd", "py"}
 
 
 def pid_path(home: Path, sid: str) -> Path:
@@ -99,6 +104,9 @@ def fresh(home: Path, sid: str, now: Optional[float] = None, within: float = FRE
 def alive(pid: int) -> bool:
     if not isinstance(pid, int) or pid <= 1:
         return False
+    if WINDOWS:  # os.kill(pid, 0) is not a probe there: it sends CTRL_C_EVENT
+        from . import _winproc
+        return _winproc.alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -128,7 +136,9 @@ def resolve_anchor(pid: int, ps: Optional[Callable[[int], Optional[tuple]]] = No
             return pid
         ppid, comm = got
         name = os.path.basename(comm).lstrip("-")
-        if name in SHELLS and ppid > 1:
+        if WINDOWS:
+            name = name.lower()[:-4] if name.lower().endswith(".exe") else name.lower()
+        if name in (WINDOWS_SHELLS if WINDOWS else SHELLS) and ppid > 1:
             pid = ppid
             continue
         return pid
@@ -136,6 +146,12 @@ def resolve_anchor(pid: int, ps: Optional[Callable[[int], Optional[tuple]]] = No
 
 
 def _ps(pid: int) -> Optional[tuple]:
+    if WINDOWS:  # no `ps`
+        try:
+            from . import _winproc
+            return _winproc.parent(pid)
+        except (OSError, AttributeError, ValueError):
+            return None
     try:
         out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True,
                              timeout=2, check=False).stdout.strip()
@@ -147,9 +163,6 @@ def _ps(pid: int) -> Optional[tuple]:
 
 @contextlib.contextmanager
 def _single(home: Path, sid: str, wait: float):
-    if fcntl is None:  # pragma: no cover
-        yield True
-        return
     d = ie._ensure_dirs(home)
     fd = os.open(str(d / f"{ie.binding_path(home, sid).stem}.poller.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     got = False
@@ -211,7 +224,7 @@ def _write_pid(home: Path, sid: str) -> None:
     p = pid_path(home, sid)
     tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
     tmp.write_text(f"{os.getpid()}\n")
-    os.replace(str(tmp), str(p))
+    _replace(str(tmp), str(p))
 
 
 def _loop(home, sid, connection, client, anchor, connected, interval, idle, max_lifetime, once, tick,

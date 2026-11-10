@@ -41,7 +41,7 @@ def compile_and_qualify(root, *, source, plan, description, context, sdk,
         families=[c['family'] for c in discovery]
         def challenge(candidate,revision):
             cases=corpus.make(f'challenge-{revision}',challenge_per_label,
-                             Path(candidate['source']).read_text(),families)
+                             Path(candidate['source']).read_text(encoding='utf-8'),families)
             families.extend(c['family'] for c in cases)
             return cases
         def repair(candidate,counterexamples,revision):
@@ -65,7 +65,7 @@ def compile_and_qualify(root, *, source, plan, description, context, sdk,
                 '"description"; other source_ref values are "context" and "sdk". Every literal JEV proposition '
                 'must be 1-1000 characters. Incorporate supplied compiler rejection details before proposing '
                 'another candidate. No new imports beyond SDK and allowed Python stdlib.',
-                {'source':Path(candidate['source']).read_text(),'compile_plan':read(candidate['plan']),
+                {'source':Path(candidate['source']).read_text(encoding='utf-8'),'compile_plan':read(candidate['plan']),
                  'description':description,'context':context,'contract':corpus.contract,'common':corpus.common,
                  'sdk_documentation':sdk_documentation,'jev_config':jev_config,
                  'actual_system_prompt':corpus.system,'counterexamples':feedback,'compilation_failures':compilation_feedback})

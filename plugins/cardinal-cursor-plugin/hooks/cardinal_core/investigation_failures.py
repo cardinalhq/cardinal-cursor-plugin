@@ -176,7 +176,7 @@ def observe(home, sid, tool_input, response=None, error=None, *, runtime=None, t
                 path(home, sid).unlink()
             return None
         try:
-            state = json.loads(path(home, sid).read_text())
+            state = json.loads(path(home, sid).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             state = {}
         if not isinstance(state, dict):

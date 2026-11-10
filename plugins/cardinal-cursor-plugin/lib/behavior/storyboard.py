@@ -102,7 +102,7 @@ pre{{overflow:auto;background:#f1f4f9;padding:1rem;border-radius:8px;font-size:.
 <div class="scenes">{''.join(scene_cards)}</div><h2>Trace evidence</h2>{''.join(evidence)}
 </main></html>'''
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(html)
+    output.write_text(html, encoding='utf-8')
     return {"storyboard": str(output), "receipt": receipt,
             "population_size": report.population_size,
             "verdicts": {name: sum(item.verdict == name for item in report.results)

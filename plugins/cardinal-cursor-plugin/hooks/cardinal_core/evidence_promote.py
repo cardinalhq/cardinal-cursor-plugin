@@ -886,6 +886,8 @@ HANDLERS = {"promote": cmd_promote, "list": cmd_list, "find": cmd_find, "show": 
 
 
 def main(argv: Optional[list], adapter: PromoteAdapter) -> int:
+    from .paths import utf8_stdio
+    utf8_stdio()
     parser = build_parser(adapter.prog)
     args = parser.parse_args(argv)
     handler = HANDLERS.get(args.command)
