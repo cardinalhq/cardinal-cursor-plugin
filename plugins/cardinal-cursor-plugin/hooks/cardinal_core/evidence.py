@@ -63,6 +63,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from .paths import replace as _replace
 
 SCHEMA = "cardinal.evidence.v1"
 TIER = "captured"
@@ -1341,7 +1342,7 @@ def write_entry(root: Path, entry: dict) -> Path:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")))
         os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        _replace(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -1519,7 +1520,7 @@ def _write_session_json(root: Path, session_id: Any, name: str, tmp_prefix: str,
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(body, separators=(",", ":")))
         os.chmod(tmp, 0o600)
-        os.replace(tmp, sdir / name)
+        _replace(tmp, sdir / name)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -2058,7 +2059,7 @@ def _gc_index_save(root: Path, index: dict) -> None:
         fd, tmp = tempfile.mkstemp(dir=str(root), prefix=".gc-index_", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps({"version": 1, "sessions": index}, separators=(",", ":")))
-        os.replace(tmp, str(root / GC_INDEX))
+        _replace(tmp, str(root / GC_INDEX))
         tmp = None
     except (OSError, ValueError, TypeError):
         pass

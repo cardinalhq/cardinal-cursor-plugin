@@ -27,6 +27,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
+from .paths import replace as _replace
 
 PIN_DIR_PARTS = (".cardinal", "tls")
 BUNDLE_NAME = "ca-bundle.pem"
@@ -138,7 +139,7 @@ def save_pin(hostname: str, pem: str, home: Optional[Path] = None) -> Path:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(header + pem.strip() + "\n", encoding="utf-8")
     os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
+    _replace(tmp, path)
     _rebuild_bundle(home)
     _context_cache.clear()
     return path
@@ -173,7 +174,7 @@ def _rebuild_bundle(home: Optional[Path]) -> None:
     tmp = bundle.with_name(bundle.name + ".tmp")
     tmp.write_text("".join(parts), encoding="utf-8")
     os.chmod(tmp, 0o644)
-    os.replace(tmp, bundle)
+    _replace(tmp, bundle)
 
 
 # ---------------------------------------------------------------------------

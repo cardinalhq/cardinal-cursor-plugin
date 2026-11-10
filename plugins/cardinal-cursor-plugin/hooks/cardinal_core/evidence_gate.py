@@ -487,6 +487,26 @@ def _brace_words(s: str) -> list:
     return out[:MAX_BRACE_WORDS]
 
 
+# Windows spellings of a path (issue #250): a drive letter, a UNC share, the
+# profile variable, or `~\`. Unambiguous, so they are read on every OS.
+_WINDOWS_PATH = re.compile(r"(?i)^(?:[a-z]:[\\/]|\\\\[^\\/]+[\\/]|(?:\$env:|%)(?:userprofile|home)%?[\\/]|~\\)")
+WINDOWS = os.name == "nt"
+_WINDOWS_HOME = re.compile(r"(?i)^(?:\$env:|%)(?:userprofile|home)%?/")
+
+
+def windows_path(tok: str) -> Optional[str]:
+    """`tok` as the POSIX path the rules read when it is a Windows path,
+    else None: `\\` is `/`, the drive letter or UNC server is dropped and
+    the profile variable is `~`. C:\\Users\\a\\.ssh\\id_rsa -> /Users/a/.ssh/id_rsa."""
+    if tok.startswith(("\\\\?\\", "\\\\.\\")):  # \\\\?\\C:\\... device and long-path prefixes
+        tok = tok[4:]
+    if not _WINDOWS_PATH.match(tok):
+        # Where `\\` is the separator (the gate running on Windows), any path written with it.
+        return tok.replace("\\", "/") if WINDOWS and "\\" in tok else None
+    t = _WINDOWS_HOME.sub("~/", tok.replace("\\", "/"))
+    return re.sub(r"^(?:[A-Za-z]:|//[^/]+)/", "/", t)
+
+
 def paths_in(s: str, cwd: Optional[str], home: Optional[str], budget: Optional["_Budget"] = None) -> Iterator[str]:
     prose = "\n" in s.strip() or len(s) > PROSE_CHARS
     budget = budget or _Budget()
@@ -495,6 +515,13 @@ def paths_in(s: str, cwd: Optional[str], home: Optional[str], budget: Optional["
     toks = _TOKEN_SPLIT.split(s)
     if not prose:
         toks = toks + _brace_words(s)
+    if "\\" in s or ":/" in s:
+        toks = toks + [w for w in map(windows_path, toks) if w]
+        # A Windows path holding spaces (C:\Users\Alice Smith\...) arrives whole as a
+        # tool argument: convert it before the split, so its parts are POSIX paths.
+        whole = None if prose else windows_path(s.strip().strip("\"'"))
+        if whole and whole not in toks:
+            toks = toks + _TOKEN_SPLIT.split(whole)
     for tok in toks:
         if tok and _path_like(tok, prose, cwd, budget):
             p = _norm(tok, cwd, home)
@@ -716,6 +743,43 @@ _DECODED_EXEC = re.compile(r"\$\([^()]*" + _DECODE + r"|`[^`]*" + _DECODE + r"|"
                            r"[^;&]*\|\s*(?:sudo\s+)?(?:(?:ba|z|da|k)?sh|eval|source|xargs)\b")
 
 
+_PS_LISTERS = frozenset(("get-childitem", "gci", "dir", "ls", "get-item", "gi"))
+_POWERSHELLS = frozenset(("powershell", "pwsh", "powershell.exe", "pwsh.exe"))
+# $env:NAME, ${env:NAME}, and the Env: drive item (Get-Content Env:NAME).
+_PS_ENV_REF = re.compile(r"(?i)\$\{?env:([A-Za-z_][A-Za-z0-9_]*)|^env:[\\/]?([A-Za-z_][A-Za-z0-9_]*)$")
+# [Environment]::GetEnvironmentVariable('NAME') / ::GetEnvironmentVariables()
+_PS_ENV_API = re.compile(r"(?i)GetEnvironmentVariable(s)?\s*\(\s*(?:['\"]([A-Za-z_][A-Za-z0-9_]*))?")
+
+
+def _ps_param(arg: str, name: str = "") -> Any:
+    """A PowerShell parameter without its lead (`-`, `--` or `/`), lowercased;
+    with `name`, whether it is that parameter: PowerShell takes any prefix
+    (`-enc`, `-e`, `-com`, `/c`)."""
+    low = arg.lower()
+    lead = next((x for x in ("--", "-", "/") if low.startswith(x)), None)
+    param = low[len(lead):] if lead else ""
+    return bool(param) and name.startswith(param) if name else param
+
+
+def _ps_secret_env(word: str) -> bool:
+    """A PowerShell read of a secret-named environment variable. Names are
+    case-insensitive on Windows, so `$env:github_token` counts."""
+    return ":" in word and any(secretish_name((m.group(1) or m.group(2)).upper())
+                               for m in _PS_ENV_REF.finditer(word))
+
+
+def powershell_env_rule(s: str) -> Optional[tuple]:
+    """The .NET environment API in a script: every variable, or a secret-named one."""
+    if "getenvironmentvariable" not in s.lower():
+        return None
+    for m in _PS_ENV_API.finditer(s):
+        if m.group(1):
+            return REASON_COMMAND, "cmd.env-dump", "[Environment]::GetEnvironmentVariables()"
+        if m.group(2) and secretish_name(m.group(2).upper()):
+            return REASON_COMMAND, "cmd.secret-var", "[Environment]::GetEnvironmentVariable('SECRET_VAR')"
+    return None
+
+
 def command_rule(argv: list, assigns: list, env_dump: bool) -> Optional[tuple]:
     """(reason, rule id, hint) for one simple command, else None."""
     for a in assigns:
@@ -732,6 +796,13 @@ def command_rule(argv: list, assigns: list, env_dump: bool) -> Optional[tuple]:
     lower = [a.lower() for a in pos]
     if cmd == "printenv":
         return REASON_COMMAND, "cmd.env-dump", "env / printenv / export -p"
+    # PowerShell (issue #250): the Env: drive lists every variable, $env:NAME reads one.
+    if cmd in _PS_LISTERS and any(a.lower().rstrip("\\/*") == "env:" for a in pos):
+        return REASON_COMMAND, "cmd.env-dump", "Get-ChildItem Env:"
+    if any(_ps_secret_env(a) for a in argv):
+        return REASON_COMMAND, "cmd.secret-var", "$env:SECRET_VAR"
+    if cmd in _POWERSHELLS and any(_ps_param(a, "encodedcommand") or _ps_param(a) == "ec" for a in args):
+        return REASON_COMMAND, "cmd.decoded-exec", "powershell -EncodedCommand"
     if cmd == "ps" and any((not a.startswith("-") and "e" in a) or (a.startswith("-") and "E" in a) for a in args):
         # BSD-style `ps eww` / `ps auxe`, macOS `ps -E`: every process's environment.
         return REASON_COMMAND, "cmd.env-dump", "ps e / ps -E"
@@ -866,6 +937,7 @@ _FILE_READERS = frozenset((
     "uniq", "nl", "tac", "tee", "diff", "cmp", "jq", "yq", "vim", "vi", "nano", "view", "open", "pbcopy", "wc",
     "dd", "openssl", "gpg", "xargs", "find", "curl", "wget", "python", "python3", "node", "ruby", "perl", "bash",
     "sh", "zsh", "column", "fold", "fmt", "paste", "join", "iconv", "file", "stat", "install", "ln", "readlink",
+    "get-content", "gc", "type", "select-string", "sls",  # PowerShell
 ))
 
 
@@ -884,6 +956,18 @@ def _inner_commands(argv: list) -> list:
             if a == "--command" and j + 1 < len(argv):
                 out.append(argv[j + 1])
                 break
+    if cmd in _POWERSHELLS:  # powershell -Command <script>: the rest of the line is the script
+        # The script follows -Command, or is the first word that is not a
+        # parameter or a parameter's value (-Command is the default). Which
+        # parameters take a value is not tracked: every such tail is checked.
+        tails = 0
+        for j, a in enumerate(argv[1:], 1):
+            if _ps_param(a, "command"):
+                out.append(" ".join(argv[j + 1:]))
+                break
+            if not _ps_param(a) and tails < 8:  # the scan for -Command goes on past this cap
+                out.append(" ".join(argv[j:]))
+                tails += 1
     if cmd in _SHELLS or cmd in ("eval", "source", "."):
         for j, a in enumerate(argv[1:], 1):
             if a == "<<<" and j + 1 < len(argv):
@@ -927,6 +1011,9 @@ def _inner_commands(argv: list) -> list:
     return out
 
 
+_QUOTED = re.compile(r"\"([^\"\n]+)\"|'([^'\n]+)'")
+
+
 def check_command(s: str, rules: Rules, depth: int = 0, count: Optional[list] = None, *, cwd: Optional[str] = None,
                   home: Optional[str] = None, budget: Optional[_Budget] = None) -> Optional[Withheld]:
     """Every simple command in a string, through wrappers, `sh -c`, eval,
@@ -941,7 +1028,7 @@ def check_command(s: str, rules: Rules, depth: int = 0, count: Optional[list] = 
         return None
     prose = "\n" in s.strip() or len(s) > PROSE_CHARS
     if depth == 0:
-        hit = env_code_rule(s)
+        hit = env_code_rule(s) or powershell_env_rule(s)
         if hit and hit[1] not in rules.allow_rules:
             return Withheld(*hit)
         if ("base64" in s or "xxd" in s or "openssl" in s) and _DECODED_EXEC.search(s) \
@@ -969,6 +1056,13 @@ def check_command(s: str, rules: Rules, depth: int = 0, count: Optional[list] = 
                         w = check_paths(word, cwd, home, rules, budget)
                         if w:
                             return w
+                if "\\" in seg:  # Windows paths as written: the POSIX unquoting above ate their separators
+                    quoted = [q for pair in _QUOTED.findall(seg[:4096]) for q in pair if q]
+                    for tok in (quoted + _TOKEN_SPLIT.split(seg[:4096]))[:MAX_SEGMENTS]:
+                        if windows_path(tok):
+                            w = check_paths(tok, cwd, home, rules, budget)
+                            if w:
+                                return w
             if not argv:
                 continue
             for inner in _inner_commands(argv):

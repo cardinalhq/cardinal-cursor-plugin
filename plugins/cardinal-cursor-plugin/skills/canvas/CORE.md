@@ -93,7 +93,7 @@ re-render; `{unavailable}` scenes echo the reason preview reported.
 |---|---|---|
 | 0 | Ran. Some scenes may still carry errors or be unavailable. | Read the PNGs, fix what the lines report. |
 | 2 | Nothing rendered: input, connection or fetch problem (not connected, wrong org, viewer role, stale revision, busy, "upgrade Cardinal"). | Relay the `summary.message`. For stale revision or missing dataset, run `storyboard__preview` again and re-render. |
-| 3 | No usable local Chrome/Chromium (112+), Windows, or Chromium could not start with its sandbox on (e.g. Linux without user namespaces). | **Tell the user visual review is unavailable and keep authoring the draft.** Leave the storyboard unpublished until its previews can be reviewed. |
+| 3 | No usable local Chrome/Chromium (112+; on Windows also Edge), or Chromium could not start with its sandbox on (e.g. Linux without user namespaces). | **Tell the user visual review is unavailable and keep authoring the draft.** Leave the storyboard unpublished until its previews can be reviewed. |
 
 Chromium is found via `$CARDINAL_CHROMIUM` (authoritative), `$PUPPETEER_EXECUTABLE_PATH`,
 `$CHROME_PATH`, the usual Chrome/Chromium/Canary/Brave/Edge install locations, then the

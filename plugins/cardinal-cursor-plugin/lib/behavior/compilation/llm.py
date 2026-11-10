@@ -43,8 +43,8 @@ class Model:
                                              'usage': None, 'cost_usd': None})
                 raise
         # Preserve raw model events; never persist credentials/environment.
-        (slot / 'events.jsonl').write_text(proc.stdout)
-        (slot / 'stderr.txt').write_text(proc.stderr)
+        (slot / 'events.jsonl').write_text(proc.stdout, encoding='utf-8')
+        (slot / 'stderr.txt').write_text(proc.stderr, encoding='utf-8')
         messages, usage, prohibited = [], None, []
         for line in proc.stdout.splitlines():
             event = json.loads(line)

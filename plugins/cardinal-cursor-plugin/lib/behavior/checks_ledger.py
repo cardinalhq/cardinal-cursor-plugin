@@ -72,7 +72,7 @@ def draft_path(draft: str, state: Path) -> Path:
 def read_draft(draft: str, state: Path) -> dict:
     path = draft_path(draft, state)
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         data = None
     if not isinstance(data, dict):
@@ -250,7 +250,7 @@ def accepted_checks(output=None, service=None) -> list:
         programs = []
     for path in programs:
         try:
-            program = json.loads(path.read_text())
+            program = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             continue
         if not isinstance(program, dict):
@@ -262,7 +262,7 @@ def accepted_checks(output=None, service=None) -> list:
         incumbent = None
         if scope:
             try:
-                incumbent = json.loads((output / 'compilation' / scope / 'regression.json').read_text()).get('incumbent')
+                incumbent = json.loads((output / 'compilation' / scope / 'regression.json').read_text(encoding='utf-8')).get('incumbent')
             except (OSError, ValueError, AttributeError):
                 incumbent = None
         version = program.get('diagnostic_version')
@@ -304,7 +304,10 @@ def range_dir(range_id: str, output=None) -> Path:
 
 
 def range_worker_running(directory: Path) -> bool:
-    import fcntl
+    try:
+        import fcntl
+    except ImportError:  # Windows: the same calls on msvcrt.locking
+        from compilation import winfcntl as fcntl
     try:
         with (Path(directory) / 'lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -447,7 +450,7 @@ def watch_range(range_id: str, out, poll_s: float = 1.0, idle_s: float = RANGE_I
 
 def range_status(range_id: str, output=None) -> dict:
     directory = range_dir(range_id, output)
-    state = json.loads((directory / 'state.json').read_text())
+    state = json.loads((directory / 'state.json').read_text(encoding='utf-8'))
     out = {'range_id': range_id, 'phase': state.get('phase'), 'population': state.get('population'),
            'start': state.get('start'), 'end': state.get('end'),
            'windows_done': len(state.get('windows', [])), 'windows_left': len(state.get('pending', [])),
@@ -562,7 +565,7 @@ def range_poll(range_id: str, after_event: int = 0, wait_seconds: float = 0, out
                                                             'boundaries', 'evaluated_traces', 'next_action')}
     if latest_kind == 'completed':
         try:
-            out['summary'] = json.loads((directory / 'summary.json').read_text())
+            out['summary'] = json.loads((directory / 'summary.json').read_text(encoding='utf-8'))
         except (OSError, ValueError):
             pass
     return out

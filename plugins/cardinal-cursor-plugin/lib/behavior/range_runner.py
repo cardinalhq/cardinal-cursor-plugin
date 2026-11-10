@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -38,6 +37,10 @@ import time
 
 import range_run
 from compilation.files import private_json
+try:
+    import fcntl
+except ImportError:  # Windows: the same calls on msvcrt.locking
+    from compilation import winfcntl as fcntl
 from compilation.hosted import APIRejected
 
 MAX_POLL_FAILURES = 3
@@ -45,6 +48,11 @@ POLL_BACKOFF_S = 10
 LIST_LIMIT = 100
 TERMINAL_EVENTS = ('needs_extents', 'completed', 'failed')
 EXPERIMENTAL = 'Judge-based check: experimental. Judge verdicts can vary between runs on identical evidence.'
+
+# The worker must outlive this process: its own session on POSIX; on Windows,
+# where start_new_session does nothing, its own process group and no console
+# window (CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW).
+DETACHED = {'creationflags': 0x00000200 | 0x08000000} if os.name == 'nt' else {'start_new_session': True}
 
 
 def range_dir(output: Path, range_id: str) -> Path:
@@ -66,7 +74,7 @@ class RangeRunner:
         return self.dir / 'state.json'
 
     def read_state(self):
-        state = json.loads(self.state_file.read_text())
+        state = json.loads(self.state_file.read_text(encoding='utf-8'))
         if state.get('range_id') != self.range_id:
             raise ValueError('range receipt identity mismatch')
         return state
@@ -86,7 +94,7 @@ class RangeRunner:
 
     def last_event(self):
         try:
-            lines = (self.dir / 'events.jsonl').read_text().splitlines()
+            lines = (self.dir / 'events.jsonl').read_text(encoding='utf-8').splitlines()
         except OSError:
             return None
         for line in reversed(lines):
@@ -153,7 +161,7 @@ class RangeRunner:
         log = open(self.dir / 'worker.log', 'ab')
         try:
             subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
-                             close_fds=True, start_new_session=True, cwd=str(self.dir))
+                             close_fds=True, cwd=str(self.dir), **DETACHED)
         finally:
             log.close()
         return True
@@ -433,7 +441,7 @@ def main(argv=None):
     parser.add_argument('--runtime')
     args = parser.parse_args(argv)
     import server
-    config = (json.loads(Path(args.config).expanduser().read_text()) if args.config
+    config = (json.loads(Path(args.config).expanduser().read_text(encoding='utf-8')) if args.config
               else server.default_config(runtime=args.runtime))
     if args.runtime:
         config.setdefault('runtime', args.runtime)

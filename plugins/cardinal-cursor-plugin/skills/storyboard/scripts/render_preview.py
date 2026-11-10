@@ -52,8 +52,8 @@ Exit codes:
      output; exit 0 does not mean every scene rendered)
   2  nothing rendered because of input, connection, auth or fetch problems
      (not connected, wrong org, stale revision, upgrade Cardinal, ...)
-  3  no usable local Chromium, unsupported platform (Windows) or Chromium could
-     not start with its sandbox on: skip the preview, tell the user, keep
+  3  no usable local Chromium, or Chromium could not start with its sandbox
+     on: skip the preview, tell the user, keep
      authoring
 
 Chromium: $CARDINAL_CHROMIUM, $PUPPETEER_EXECUTABLE_PATH or $CHROME_PATH, then
@@ -68,6 +68,7 @@ import base64
 import hashlib
 import http.client
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -180,7 +181,8 @@ def note(msg: str) -> None:
 def _write_private(path: Path, data: bytes) -> None:
     """Write `data` to `path` with mode 0600, replacing any existing file."""
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_BINARY: without it Windows opens the descriptor in text mode and os.write turns each \n of a PNG into \r\n.
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
     try:
         view = memoryview(data)
         while view:
@@ -242,6 +244,12 @@ def _cache_candidates(home: Path, system: str) -> list:
             (home / ".cache/puppeteer",
              "chrome/*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"),
         ]
+    elif system == "Windows":
+        local = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+        patterns = [
+            (local / "ms-playwright", "chromium-*/chrome-win*/chrome.exe"),
+            (home / ".cache/puppeteer", "chrome/*/chrome-win*/chrome.exe"),
+        ]
     else:
         patterns = [
             (home / ".cache/ms-playwright", "chromium-*/chrome-linux*/chrome"),
@@ -252,6 +260,11 @@ def _cache_candidates(home: Path, system: str) -> list:
         if root.is_dir():
             out.extend(sorted((str(p) for p in root.glob(pattern)), key=_version_sort_key, reverse=True))
     return out
+
+
+WINDOWS_APPS = (r"Google\Chrome\Application\chrome.exe", r"Microsoft\Edge\Application\msedge.exe",
+                r"Chromium\Application\chrome.exe")
+WINDOWS_COMMANDS = ("chrome", "msedge", "chromium")
 
 
 def _version_sort_key(path: str) -> tuple:
@@ -277,9 +290,28 @@ def chromium_candidates(env: dict, system: str, home: Path, which=shutil.which, 
             out.append(("PATH", found or cmd))
         for p in LINUX_PATHS:
             out.append(("path", p))
+    elif system == "Windows":
+        # Machine-wide installs, then per-user ones, then PATH. Edge ships with Windows.
+        upper = {k.upper(): v for k, v in env.items()}  # a copy of os.environ has upper-case names on Windows
+        for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            if upper.get(var):
+                for app in WINDOWS_APPS:
+                    out.append(("app", ntpath.join(upper[var], app)))
+        # shutil.which looks in the current directory first on Windows. The
+        # renderer holds the Cardinal key: never take a browser from the
+        # workspace, and never fall back to a bare name.
+        here = ntpath.normcase(ntpath.abspath(os.getcwd())) + "\\"
+        for cmd in WINDOWS_COMMANDS:
+            found = which(cmd)
+            if found and ntpath.isabs(found) and not ntpath.normcase(ntpath.abspath(found)).startswith(here):
+                out.append(("PATH", found))
     for p in _cache_candidates(home, system):
         out.append(("cache", p))
     return out
+
+
+def host_system() -> str:
+    return "Windows" if os.name == "nt" else "Darwin" if sys.platform == "darwin" else "Linux"
 
 
 def chromium_version(path: str) -> str | None:
@@ -836,9 +868,44 @@ class Browser:
         self.proc = None
         self.cdp = None
 
+    def _launch_windows(self) -> tuple:
+        """Start Chromium with its DevTools pipe on two inherited handles:
+        it reads commands from the first one named in
+        --remote-debugging-io-pipes and writes replies to the second. Only
+        those two (and the log file) are inherited; there is no TCP port.
+        -> (fd to write commands to, fd to read replies from)."""
+        import msvcrt
+        cmd_r, cmd_w = os.pipe()   # we write commands, Chromium reads
+        res_r, res_w = os.pipe()   # Chromium writes, we read
+        handles = [msvcrt.get_osfhandle(cmd_r), msvcrt.get_osfhandle(res_w)]
+        for handle in handles:
+            os.set_handle_inheritable(handle, True)
+        env = dict(os.environ)
+        env["TZ"] = "UTC"
+        err = open(str(self.stderr_path), "wb")
+        try:
+            self.proc = subprocess.Popen(
+                [self.binary] + launch_args(str(self.profile))
+                + [f"--remote-debugging-io-pipes={handles[0]},{handles[1]}"],
+                stdin=subprocess.DEVNULL, stdout=err, stderr=err, env=env, close_fds=True,
+                startupinfo=subprocess.STARTUPINFO(lpAttributeList={"handle_list": handles}),
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        except OSError as e:
+            os.close(cmd_w)
+            os.close(res_r)
+            raise LaunchError(f"could not start {self.binary}: {e}")
+        finally:
+            err.close()
+            os.close(cmd_r)
+            os.close(res_w)
+        return cmd_w, res_r
+
     def start(self, timeout: float = 30.0) -> PipeCDP:
+        if os.name == "nt":
+            return self._connect(*self._launch_windows(), timeout)
         if os.name != "posix":
-            raise LaunchError("local preview is not supported on Windows yet")
+            raise LaunchError("local preview is not supported on this system")
         cmd_r, cmd_w = os.pipe()   # we write commands, Chromium reads fd 3
         res_r, res_w = os.pipe()   # Chromium writes fd 4, we read
         # Keep both child ends clear of 3/4 so the dup2s below cannot collide.
@@ -867,6 +934,9 @@ class Browser:
             err.close()
             os.close(hi_cmd_r)
             os.close(hi_res_w)
+        return self._connect(cmd_w, res_r, timeout)
+
+    def _connect(self, cmd_w: int, res_r: int, timeout: float) -> PipeCDP:
         self.cdp = PipeCDP(cmd_w, res_r)
         try:
             self.cdp.send("Browser.getVersion", timeout=timeout)
@@ -904,7 +974,27 @@ class Browser:
                 pass
         self.kill()
 
+    def _kill_windows(self) -> None:
+        """No process groups to signal: end the browser's process tree."""
+        if not self.proc:
+            return
+        try:
+            subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"], capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
     def kill(self) -> None:
+        if os.name == "nt":
+            return self._kill_windows()
         if self.proc and self.proc.poll() is None:
             try:
                 os.killpg(self.proc.pid, signal.SIGKILL)
@@ -1419,12 +1509,10 @@ def static_main(args, home: Path, deadline: float, finish, summary: dict) -> int
     if not m:
         return finish(EXIT_FETCH, "--viewport takes WxH, e.g. 560x640")
     viewport = (max(64, min(int(m.group(1)), 4096)), max(64, min(int(m.group(2)), 4096)))
-    if os.name != "posix" or sys.platform.startswith("win"):
-        return finish(EXIT_NO_CHROMIUM, no_chromium_message([], "Local preview is not supported on Windows yet."))
     env = dict(os.environ)
     if args.chromium:
         env["CARDINAL_CHROMIUM"] = args.chromium
-    found, searched = find_chromium(env, "Darwin" if sys.platform == "darwin" else "Linux", home)
+    found, searched = find_chromium(env, host_system(), home)
     if not found:
         return finish(EXIT_NO_CHROMIUM, no_chromium_message(searched))
     summary["chromium"] = found
@@ -1565,9 +1653,7 @@ def main(argv: list | None = None) -> int:
                                                        "storyboard__preview reported and preview again" if problems else ""))
 
     # -- Chromium ---------------------------------------------------------------
-    if os.name != "posix" or sys.platform.startswith("win"):
-        return finish(EXIT_NO_CHROMIUM, no_chromium_message([], "Local preview is not supported on Windows yet."))
-    system = "Darwin" if sys.platform == "darwin" else "Linux"
+    system = host_system()
     env = dict(os.environ)
     if args.chromium:
         env["CARDINAL_CHROMIUM"] = args.chromium

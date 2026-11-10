@@ -91,11 +91,7 @@ class Result:
 
 def _save(path, state):
     c.private_write(path, state)
-    fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    c.fsync_directory(path.parent)
 
 
 def _chunks(page):

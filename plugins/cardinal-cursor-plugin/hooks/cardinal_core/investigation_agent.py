@@ -24,6 +24,7 @@ from . import investigation_grants as grants
 from . import investigation_poller as poller
 from . import investigation_text as text
 from . import investigation_turn as turn
+from .paths import detached, script_command
 
 
 def home(wiring) -> Path:
@@ -35,7 +36,7 @@ def enabled(wiring) -> bool:
 
 
 def command(wiring) -> str:
-    return f"{shlex.quote(sys.executable)} {shlex.quote(wiring.cli)} investigation"
+    return script_command(wiring.cli, f"{shlex.quote(sys.executable)} {shlex.quote(wiring.cli)}") + " investigation"
 
 
 def runtime(wiring) -> str:
@@ -103,7 +104,7 @@ def spawn_poller(wiring, sid: str, script: str) -> None:
         return
     subprocess.Popen([sys.executable, script, "--session", sid, "--anchor", str(os.getppid())],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     close_fds=True, start_new_session=True)
+                     close_fds=True, **detached())
 
 
 def _bound(wiring, sid: str) -> Optional[dict]:
@@ -182,4 +183,6 @@ def prompt(wiring, sid: str) -> "turn.Delivery":
 
 def cli_main(argv, wiring, session_env=(), *, legacy=False) -> int:
     from . import investigation_cli
+    from .paths import utf8_stdio
+    utf8_stdio()
     return investigation_cli.cli_main(argv, wiring, session_env, legacy=legacy)

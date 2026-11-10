@@ -31,7 +31,7 @@ class SDK:
         if not out.resolve().is_relative_to(self.root.resolve()) or out == self.root:
             raise ValueError('invalid compilation name')
         out.mkdir()
-        (out / 'program.py').write_text(source)
+        (out / 'program.py').write_bytes(source.encode('utf-8'))  # exactly the source: no newline translation
         write(out / 'plan.json', plan)
         store = ArtifactStore(out / 'artifacts')
         config = CompilerConfig(model='supplied-source', model_version='1', max_revisions=0,
@@ -63,7 +63,7 @@ class SDK:
         self.verify()
         store = ArtifactStore(candidate['store'])
         version = store.version(candidate['version'])
-        source = Path(candidate['source']).read_text()
+        source = Path(candidate['source']).read_text(encoding='utf-8')
         if digest(source.encode()) != version.source_sha256:
             raise ValueError('source/version binding failed')
         started = time.monotonic()

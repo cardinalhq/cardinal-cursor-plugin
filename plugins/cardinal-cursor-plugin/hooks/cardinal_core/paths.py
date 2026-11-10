@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -68,13 +70,83 @@ def state_home(home: Path, environ: Any = None) -> Path:
     return sandboxed_home(home) if in_seatbelt_sandbox(environ) else home
 
 
+def replace(src: Any, dst: Any, windows: Any = None) -> None:
+    """os.replace. On Windows it raises PermissionError while another process
+    has the destination open (a concurrent hook reading the file), so it is
+    retried there for about two seconds."""
+    if not (os.name == "nt" if windows is None else windows):
+        os.replace(src, dst)
+        return
+    for attempt in range(40):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == 39:
+                raise
+            time.sleep(0.05)
+
+
+def detached(windows: Any = None) -> dict:
+    """subprocess.Popen arguments for a child the caller does not wait for
+    and that must outlive it: its own session on POSIX. `start_new_session`
+    does nothing on Windows; there the child gets its own process group and
+    no console window."""
+    if not (os.name == "nt" if windows is None else windows):
+        return {"start_new_session": True}
+    return {"creationflags": 0x00000200 | 0x08000000}  # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+
+
+def powershell_literal(text: Any) -> str:
+    """`text` as a PowerShell single-quoted literal. PowerShell also ends a
+    literal at the typographic quotes U+2018 to U+201B, so each of those is
+    doubled like `'`. Always quoted: a bare word can still be an operator
+    there (`a,b`, a leading `@`)."""
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", str(text)) + "'"
+
+
+def shell_quote(text: Any, windows: Any = None) -> str:
+    """One argument of a command shown to the agent or the user: POSIX
+    quoting, except on Windows, where the shell is PowerShell (see
+    script_command)."""
+    if not (os.name == "nt" if windows is None else windows):
+        return shlex.quote(str(text))
+    return powershell_literal(text)
+
+
+def utf8_stdio() -> None:
+    """Make the standard streams UTF-8 where they are not. Before Python
+    3.15, Windows opens piped streams in the ANSI code page: non-ASCII input
+    is garbled or rejected and non-ASCII output raises. stdin is switched
+    wherever it is not UTF-8 (what an agent sends always is); stdout and
+    stderr only on Windows."""
+    streams = [(sys.stdin, "replace")]
+    if os.name == "nt":
+        streams += [(sys.stdout, None), (sys.stderr, None)]
+    for stream, errors in streams:
+        encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+        if encoding != "utf8" and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors=errors)
+
+
+def script_command(script: Any, posix: str, windows: Any = None) -> str:
+    """How to run a plugin script in a command shown to the agent or the
+    user: `posix` as given, except on Windows. There a script has no shebang
+    and `python3` is often missing or the Microsoft Store stub, so the
+    command names the running interpreter, in PowerShell syntax (the shell
+    Copilot CLI uses on Windows)."""
+    if not (os.name == "nt" if windows is None else windows):
+        return posix
+    return f"& {powershell_literal(sys.executable)} {powershell_literal(script)}"
+
+
 def safe_session(session_id: str) -> str:
     return SESSION_SAFE_RE.sub("_", session_id)[:128]
 
 
 def read_json(path: Path) -> dict[str, Any]:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -83,8 +155,8 @@ def read_json(path: Path) -> dict[str, Any]:
 def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content)
-    tmp.replace(path)
+    tmp.write_text(content, encoding="utf-8")
+    replace(tmp, path)
 
 
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -99,7 +171,7 @@ def atomic_write_json_compact(path: Path, obj: dict[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f)
-        os.replace(tmp, path)
+        replace(tmp, path)
     except OSError:
         try:
             os.unlink(tmp)
@@ -114,7 +186,7 @@ def atomic_write_secret(path: Path, content: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
-        os.replace(tmp, path)
+        replace(tmp, path)
         os.chmod(path, 0o600)
     except Exception:
         try:
@@ -129,7 +201,7 @@ def backup(path: Path) -> Path | None:
         return None
     ts = time.strftime("%Y%m%d-%H%M%S")
     target = path.with_suffix(f"{path.suffix}.bak.{ts}")
-    target.write_text(path.read_text())
+    target.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
     return target
 
 

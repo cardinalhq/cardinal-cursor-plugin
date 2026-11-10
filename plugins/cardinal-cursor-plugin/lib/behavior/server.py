@@ -700,6 +700,12 @@ def main():
         config.setdefault('runtime', runtime)
     behavior = Behavior(config)
     checks = Checks(behavior)
+    if os.name == 'nt':
+        # MCP is UTF-8; before Python 3.15 a Windows pipe is opened in the ANSI code page.
+        for stream in (sys.stdin, sys.stdout, sys.stderr):
+            if hasattr(stream, 'reconfigure'):
+                stream.reconfigure(encoding='utf-8')
+        os.environ.setdefault('PYTHONUTF8', '1')  # the range worker reads and writes the same files
     for line in sys.stdin:
         request = json.loads(line)
         if 'id' not in request:

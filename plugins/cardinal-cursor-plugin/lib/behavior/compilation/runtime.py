@@ -27,7 +27,7 @@ def load_frozen(bundle, observed):
         path = (bundle / name).resolve()
         if not path.is_relative_to(bundle.resolve()) or filehash(path) != sha:
             raise ValueError('frozen dependency changed: ' + name)
-    source = (bundle / 'program.py').read_text()
+    source = (bundle / 'program.py').read_text(encoding='utf-8')
     if digest(source.encode()) != certificate['identity']['program']:
         raise ValueError('program identity mismatch')
     gate = read(bundle / 'qualification.json')

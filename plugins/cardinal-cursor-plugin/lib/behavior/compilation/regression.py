@@ -4,7 +4,6 @@ Passing development tests is not independent qualification. The offline engine
 owns blind review, bounded repair and the untouched qualification audit.
 """
 from contextlib import contextmanager
-import fcntl
 import json
 import re
 import uuid
@@ -12,6 +11,11 @@ from pathlib import Path
 from .engine import gate
 from .files import private_json
 from .storage import digest
+
+try:
+    import fcntl
+except ImportError:  # Windows: the same calls on msvcrt.locking
+    from . import winfcntl as fcntl
 
 
 class RegressionHistory:
@@ -33,7 +37,7 @@ class RegressionHistory:
 
     def read(self):
         path = self.root / 'regression.json'
-        return json.loads(path.read_text()) if path.exists() else {
+        return json.loads(path.read_text(encoding='utf-8')) if path.exists() else {
             'cases': {}, 'results': {}, 'incumbent': None, 'accepted': {}}
 
     def reserve(self, version, service, start, end, trace_ids, expected_verdicts):
@@ -108,7 +112,7 @@ class RegressionHistory:
             observation = observations[key]
             receipt_id = observation['receipt']
             if receipt_id not in receipts:
-                receipt = json.loads((self.output / 'teaching' / (receipt_id + '.json')).read_text())
+                receipt = json.loads((self.output / 'teaching' / (receipt_id + '.json')).read_text(encoding='utf-8'))
                 if digest(receipt) != receipt_id or receipt.get('diagnostic_version') != version:
                     raise ValueError('regression receipt integrity/version mismatch')
                 receipts[receipt_id] = receipt

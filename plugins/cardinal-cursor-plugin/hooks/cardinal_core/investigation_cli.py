@@ -16,6 +16,7 @@ from . import investigation_grants as gr
 from . import investigation_text
 from . import owner_relay
 from . import supervision_status as sv
+from .paths import detached as popen_detached
 
 EXIT_USAGE = 2
 
@@ -736,7 +737,7 @@ class CLI:
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
                             close_fds=True,
-                            start_new_session=True,
+                            **popen_detached(),
                         )
                 except Exception:
                     pass
@@ -1182,17 +1183,9 @@ class CLI:
         # Persist both new credential and successor directory entries before
         # deleting the old credential. Never lose both sides on power failure.
         for directory in {args.out.parent, old_path.parent}:
-            fd = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            consumer.fsync_directory(directory)
         old_path.unlink()
-        fd = os.open(old_path.parent, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        consumer.fsync_directory(old_path.parent)
         shown = {k: v for k, v in out.items() if k != "token"}
         shown.update(credential_file=str(args.out), succeeded=old["grant_id"])
         if renewed is not None:

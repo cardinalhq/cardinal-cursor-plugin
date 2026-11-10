@@ -38,6 +38,8 @@ import os
 import shlex
 from typing import Optional
 
+from .paths import shell_quote
+
 CLAUDE_CMD = "cardinal-storyboard investigation"
 
 SESSION_ID_LINE = ("Cardinal session id for this session: {sid}. "
@@ -98,7 +100,9 @@ MILESTONE_LINE = (
     "no model run: it is not authoring visuals, needs no consent and publishes nothing. Its state follows the "
     "event; supported or ruled out needs the evidence cited on the event. A story holds at most 8 milestones: when "
     "the checkpoint is refused as full, merge with \"replaces\":[\"<milestone ids>\"] (dead ends become one "
-    "\"ruled out …\"). No jargon, code names, internal ids or event numbers in milestone text.")
+    "\"ruled out …\"). When the work changes direction, write ONE milestone that says what was tried first and "
+    "why it was left, with \"replaces\" listing every milestone of the earlier direction. No jargon, code names, "
+    "internal ids or event numbers in milestone text.")
 
 SKILL_LINE = ("The storyboard skill authors this storyboard's visualization ({sb}) after the user's consent; "
               "never storyboard__create another for this session. "
@@ -234,8 +238,8 @@ def watch_command(investigation_id: str, *, credential_file: Optional[str] = Non
     supervise skill's default directory) has not committed, so re-running it
     skips what was committed."""
     if credential_file:
-        cred = f" --credential-file {shlex.quote(credential_file)}"
-        cursor = shlex.quote(os.path.join(os.path.dirname(credential_file), "cursor.json"))
+        cred = f" --credential-file {shell_quote(credential_file)}"
+        cursor = shell_quote(os.path.join(os.path.dirname(credential_file), "cursor.json"))
     else:
         cred, cursor = "", f"~/.cardinal/supervise/{shlex.quote(investigation_id)}/cursor.json"
     return f"{cmd} events {investigation_id}{cred} --cursor-file {cursor} --follow"

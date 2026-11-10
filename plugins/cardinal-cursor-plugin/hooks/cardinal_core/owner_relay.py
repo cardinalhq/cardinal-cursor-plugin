@@ -119,6 +119,7 @@ from typing import Any, Callable, Optional
 from . import investigation_events as ie
 from . import investigation_state as ist
 from . import investigation_state_sync as sync
+from .paths import detached as popen_detached
 
 ROUTE = "relay-owner-decision"
 CAPABILITY = "owner_relay"            # capabilities.owner_relay.enabled
@@ -1298,7 +1299,7 @@ def spawn_verifier(job: dict) -> bool:
         root = str(Path(__file__).resolve().parent.parent)
         proc = subprocess.Popen([sys.executable, "-I", "-c", _VERIFY_CODE, root], stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
-                                start_new_session=True)
+                                **popen_detached())
         try:
             proc.stdin.write(json.dumps(job).encode())
         finally:
