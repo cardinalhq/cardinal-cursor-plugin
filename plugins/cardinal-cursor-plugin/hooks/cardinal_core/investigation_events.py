@@ -170,6 +170,11 @@ OWNER_RELAYED = "owner_relayed"               # approved in the owner's supervis
 # §5): the owner's Request story from the Story tab. Rendered explicitly so
 # the agent never infers it from free text.
 STORY_REQUESTED = "story.requested"
+# The owner's Illustrate / Cancel on one milestone (conductor
+# storyboard-milestones.md, "Illustrated milestones"): payload.milestone_id
+# names it. Rendered explicitly, like a story request.
+ILLUSTRATION_REQUESTED = "milestone.illustration_requested"
+ILLUSTRATION_CANCELLED = "milestone.illustration_cancelled"
 MAX_AUDIENCE_RENDERED = 400  # escaped characters of a story request's audience
 READ_CLASSES = EVENT_CLASSES + (OWNER,)
 SUPERVISION_RECORDS = "supervision"   # a supervisor's own records (record-supervision): read by their author only,
@@ -1946,6 +1951,36 @@ def is_story_request(event) -> bool:
             and payload.get("intent") == STORY_REQUESTED)
 
 
+def illustration_intent(event):
+    """The illustration intent of an owner.decided ("requested" or
+    "cancelled") and the milestone it names, or (None, None). A milestone id
+    that is not 1-64 chars of A-Z a-z 0-9 _ - is never rendered."""
+    payload = event.get("payload") if isinstance(event, dict) else None
+    if not (isinstance(event, dict) and event.get("type") == OWNER_DECIDED and isinstance(payload, dict)):
+        return None, None
+    intent, mid = payload.get("intent"), payload.get("milestone_id")
+    if intent not in (ILLUSTRATION_REQUESTED, ILLUSTRATION_CANCELLED) or not isinstance(mid, str) \
+            or not MILESTONE_ID_RE.fullmatch(mid):
+        return None, None
+    return ("requested" if intent == ILLUSTRATION_REQUESTED else "cancelled"), mid
+
+
+def illustration_request_rule(milestone_id: str) -> str:
+    return (f"Intent milestone.illustration_requested: the owner asks for an illustration of milestone "
+            f"\"{milestone_id}\" of this storyboard's open act. It authorizes drawing ONE Canvas for that milestone "
+            "in the anatomy style (the canvas skill, section \"Illustrating a milestone\": the iso library, "
+            "bound to that milestone's receipts), previewing it, and attaching it with "
+            "storyboard__set_milestone_visual. The text, if any, is what the owner wants it to show. It does not "
+            "authorize changing the milestone's title, statement, state or evidence, touching other milestones, "
+            "finalizing the act (storyboard__publish) or sharing it.")
+
+
+def illustration_cancel_rule(milestone_id: str) -> str:
+    return (f"Intent milestone.illustration_cancelled: the owner withdrew their request to illustrate milestone "
+            f"\"{milestone_id}\". Stop any drawing for it and do not attach one. An illustration already attached "
+            "stays; the owner can revert it themselves.")
+
+
 STORY_REQUEST_RULE = ("Intent story.requested: the owner asks for this storyboard's story. It authorizes updating "
                       "this storyboard's visuals and previewing them (the storyboard skill). If its latest act is "
                       "already final (published), this \"Request update\" means opening the next act with "
@@ -2006,7 +2041,9 @@ def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance:
         relayed = verified_relayed_owner_decision(e)
         owner = owner_authority(e) and isinstance(binding, dict) and binding.get("is_author") is True
         story = is_story_request(e) and not relayed   # a relay carries no intent
-        tag = " (story requested)" if story else ""
+        illus, milestone = (None, None) if relayed else illustration_intent(e)
+        tag = (" (story requested)" if story
+               else f" (illustration {illus} for milestone {milestone})" if illus else "")
         if owner and relayed:
             where = f"in their supervisor session {_claimed(p.get('session_id'))}"
             if relay_source(e) == "verbatim":
@@ -2038,6 +2075,9 @@ def render_event(e: dict, sid: str, ack: bool = True, binding=None, *, guidance:
             if isinstance(audience, str) and audience.strip():
                 lit, cut = clipped_json_text(audience, MAX_AUDIENCE_RENDERED)
                 lines.append(f"Audience (verbatim JSON string): {lit}" + ("…" if cut else ""))
+        if illus and owner:
+            lines.append(illustration_request_rule(milestone) if illus == "requested"
+                         else illustration_cancel_rule(milestone))
         if owner and ack:
             lines.append(f"Acknowledge: cardinal-storyboard investigation ack {inv} {seq} --session {sid} "
                          '--disposition accepted|declined|noted --note "<what you will do>"')
