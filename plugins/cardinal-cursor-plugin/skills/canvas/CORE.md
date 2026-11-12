@@ -4,6 +4,12 @@ A Canvas is the visual of one storyboard scene: a surface's JavaScript source ru
 sandboxed iframe (`sandbox="allow-scripts"` only, no network) and receives **only** the
 evidence bindings maestro resolved. You own every pixel; you own none of the numbers.
 
+On an investigation's storyboard, a milestone's Canvas is drawn only as the
+illustration its owner asked for (see "Illustrating a milestone" below):
+`storyboard__upsert_scene` refuses any other Canvas on it, and the viewer shows a
+milestone no visual until it is illustrated. Free-form surfaces are for
+storyboards with no investigation.
+
 ## Fetch the guide first
 
 Before you write or revise a surface, call `storyboard__describe_grammar {section:
@@ -29,6 +35,71 @@ Read them; do not copy them.
 - `exemplars/cohort-rows.js`: a population drawn one row per member, with one shared
   scale and counts derived over whole receipts. For thousands of rows, draw on a
   `<canvas>` instead.
+- `exemplars/iso-gauge.js`: a milestone illustration in the anatomy style on the `iso`
+  library: one bench instrument whose needle and set hand are the two bound values, a
+  plate card under it, marked readouts, one animated reveal. See "Illustrating a
+  milestone" below.
+
+## Illustrating a milestone
+
+The owner's **Illustrate** on a milestone reaches you as an owner decision with intent
+`milestone.illustration_requested` naming the milestone (the hook prints its id and the
+rule; a continue prompt says "Illustration requested: … milestone "<id>""). It asks for
+**one figure of that one milestone**, drawn in the anatomy style: an isometric drawing of
+a physical machine whose parts *are* the finding, never boxes and arrows. It authorizes
+only that: never rewrite the milestone's title, statement, state or evidence, never touch
+another milestone, never publish or share.
+
+1. **Read the milestone.** `storyboard__get` the storyboard and find the scene whose `id`
+   is the milestone id, in the open act. Read its statement, state, evidence and its
+   presentation's `bindings` (the card's bound values): those are the numbers you may
+   show. Need another number? Bind it from a receipt the milestone already cites. The
+   owner's decision text, if any, says what they want it to show; follow it where the
+   evidence allows.
+2. **Fetch the guide.** `storyboard__describe_grammar {section: "canvas"}` and
+   `{section: "libraries"}` (the `iso` library is listed there). Read
+   `exemplars/iso-gauge.js` end to end.
+3. **Pick the machine.** One object a stranger recognises, whose moving or sized part
+   carries the milestone's point: a gauge with a set hand (a value against its
+   objective or threshold), a tank and its fill line (a backlog or queue depth), a pipe
+   with a leak (an error rate), a balance (two values compared), a valve partly closed
+   (throttling, a rate limit), a chain of gears with one slipping (a dependency that
+   failed), a thermometer (saturation). Every visible magnitude comes from a bound value
+   or a scale derived from them; nothing is drawn to a made-up size.
+4. **Draw it with `Iso`.** `libraries: ["iso"]` gives the frame a frozen `window.Iso`:
+   `Iso.fitProjection` (camera), `Iso.slabOf` / `Iso.cylinder` / `Iso.insetPlan` /
+   `Iso.ring` (solids), `Iso.solidSvg` / `Iso.lineSvg` / `Iso.dotsSvg` /
+   `Iso.wireSvg` (strokes), `Iso.faceTextSvg` (text on a face: pass a **string**),
+   `Iso.figureSvg` (the drawing), `Iso.plateHtml` (the figure card), and
+   `Iso.mount(cv.root)` before you fill it (it scopes the kit's CSS; light and dark
+   themes come with it). The rest of the cv rules hold unchanged: every number through
+   `cv.data`, `cv.mark` each shown value, at most a few `cv.reveal` steps (the last is
+   the complete picture), reduced motion jumps to the end, validate the bound values and
+   throw a `TypeError` naming a bad one. Keep the source well under 64 KiB; the kit
+   itself is not counted.
+5. **Make it readable on a phone.** The viewer is 390 px wide on a phone: at most two or
+   three labels, large enough to read there; the plate's caption carries the rest. Dial
+   numerals and fine ticks are texture, not information.
+6. **Attach it.** `storyboard__set_milestone_visual {storyboard_id, milestone_id,
+   surface: {source, libraries: ["iso"]}, bindings, config?}`. It stores the figure on
+   the milestone's own illustration surface and changes only how the milestone is
+   drawn. Pass every binding the source reads (bindings you omit are not kept). A redraw
+   is the same call again.
+7. **Preview, then critique**, as above: `storyboard__preview {storyboard_id,
+   scene_ids: [milestone_id]}`, read every PNG (both steps; also the dark theme once),
+   revise with `set_milestone_visual`, repeat until the point is obvious in five seconds.
+8. **Acknowledge** the owner decision (`accepted`, with a note naming the machine you
+   drew), and stop. The owner sees it on the milestone, and can **Redraw** or
+   **Remove illustration**.
+
+Refusals: `milestone_published` (409: its act is final; tell the owner), `canvas_not_allowed`
+(422: the storyboard is prefab-only; tell the owner), `milestone_not_found` (422: merged or
+removed; tell the owner), `invalid_surface` / `surface_rejected` (400: fix the source).
+`milestone.illustration_cancelled` for the same milestone: stop and attach nothing.
+
+A later checkpoint that rewrites the milestone keeps its illustration unless that
+checkpoint states a `presentation`; card bindings sent with it are not applied (the
+server warns). If the milestone's numbers change, redraw.
 
 ## Preview, then critique
 
