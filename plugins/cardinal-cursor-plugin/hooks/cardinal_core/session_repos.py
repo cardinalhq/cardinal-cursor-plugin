@@ -41,7 +41,7 @@ def valid_repo(repo):
 
 
 def stage(home, sid, context, *, runtime, env=None):
-    """Stage once per repo on this author's bound session. Local I/O only."""
+    """Stage once per forge and repo on this author's bound session. Local I/O only."""
     from . import investigation_bootstrap as boot
     try:
         if runtime not in RUNTIMES or not ie.valid_session(sid) or disabled(home, runtime, env):
@@ -53,7 +53,8 @@ def stage(home, sid, context, *, runtime, env=None):
             if not locked or not b or b.get("is_author") is False:
                 return False
             contexts = pending(home, sid, b.get("org"))
-            if any(c["repo"] == context["repo"] for c in contexts) or len(contexts) >= MAX_REPOS:
+            if any((c.get("repo_host"), c["repo"]) == (context.get("repo_host"), context["repo"])
+                   for c in contexts) or len(contexts) >= MAX_REPOS:
                 return False
             # Only allow path-free provenance fields, never arbitrary tool input.
             from .storyboard_context import CONTEXT_FIELDS
@@ -90,8 +91,8 @@ def observe(call, home, *, env=None):
             directories.insert(0, os.path.dirname(os.path.join(call.cwd or os.getcwd(), value)))
     from . import storyboard_context
     for directory in dict.fromkeys(d for d in directories if isinstance(d, str) and d):
-        # No associations_api: no repo_host from here. (`investigation repos
-        # --cwd` stages wiring.collect, which may carry it: the bootstrap strips
-        # it at send time unless the origin is at associations_api >= 2.)
-        context = storyboard_context.collect(directory, client=call.client or runtime)
+        # Collect forge identity for local staging regardless of server version.
+        # The bootstrap applies the actual origin's capability gate at send time.
+        context = storyboard_context.collect(directory, client=call.client or runtime,
+                                             associations_api=storyboard_context.REPO_HOST_API)
         stage(home, call.session_id, context, runtime=runtime, env=env)
