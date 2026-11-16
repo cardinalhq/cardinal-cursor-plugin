@@ -11,7 +11,7 @@ Design constraints honored throughout (spec §omnigent constraints):
 - Identity (user_email/actor) is an argument, never a file read.
 """
 
-CORE_VERSION = "0.5.0"
+CORE_VERSION = "0.5.1"
 
 # A Cardinal host whose certificate the machine does not trust (self-hosted,
 # self-signed) is pinned by cardinal-connect under ~/.cardinal/tls; every

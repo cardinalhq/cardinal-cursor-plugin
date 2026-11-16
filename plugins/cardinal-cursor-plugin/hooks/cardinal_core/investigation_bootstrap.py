@@ -236,8 +236,12 @@ def sendable_context(home: Path, conn: dict, context: Optional[dict]) -> Optiona
     """context as it may be sent to conn now: `repo_host` (kept in the saved
     snapshot and staged repo labels) only while conn's origin is cached at
     associations_api >= 2 (storyboard_context's gate), since an older
-    maestro answers 400 to the unknown key. The saved copies are unchanged."""
-    if not isinstance(context, dict) or "repo_host" not in context:
+    maestro answers 400 to the unknown key. Workstation-derived workdir_hash
+    never leaves the machine. The saved copies are unchanged."""
+    if not isinstance(context, dict):
+        return context
+    context = {k: v for k, v in context.items() if k != "workdir_hash"}
+    if "repo_host" not in context:
         return context
     from . import storyboard_context, storyboard_discovery
     if storyboard_context.sends_repo_host(storyboard_discovery.read_caps_any(home, conn.get("origin"))):
