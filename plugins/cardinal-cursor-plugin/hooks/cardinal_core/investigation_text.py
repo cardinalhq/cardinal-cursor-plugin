@@ -104,6 +104,17 @@ MILESTONE_LINE = (
     "why it was left, with \"replaces\" listing every milestone of the earlier direction. No jargon, code names, "
     "internal ids or event numbers in milestone text.")
 
+# agent_milestones version 2 (maestro: milestone.progress, apart from the
+# state). A version-1 server refuses `progress`, so only version 2 is told.
+MILESTONE_PROGRESS_VERSION = 2
+MILESTONE_PROGRESS_LINE = (
+    "A milestone's state is what the evidence backs; its progress is whether the work is done, and readers see both "
+    "as one status. A finding, an answered question or a finished experiment citing evidence reads supported; a "
+    "decision reads Decided until the owner approves it, so record work you finished and verified (a change made, "
+    "its tests passing) as a finding.proposed citing that evidence, not as a decision. When work continues after "
+    "the event (a bug found whose fix has not started), add \"progress\":\"in_progress\" to its milestone; the "
+    "event that finishes it rewrites it.")
+
 SKILL_LINE = ("The storyboard skill authors this storyboard's visualization ({sb}) after the user's consent; "
               "never storyboard__create another for this session. "
               "Pass the session id as session_id to storyboard__find and storyboard__add_act. "
@@ -222,6 +233,8 @@ def session_text(sid: str, binding: dict, *, cmd: str = CLAUDE_CMD, target: str 
     parts.append(CHECKPOINT_LINE.replace("{cmd}", cmd).replace("{sid}", sid))
     if ie.capability(binding, MILESTONE_CAPABILITY):
         parts.append(MILESTONE_LINE)
+        if ie.capability_version(binding, MILESTONE_CAPABILITY) >= MILESTONE_PROGRESS_VERSION:
+            parts.append(MILESTONE_PROGRESS_LINE)
     if runtime in SANDBOXED:
         parts.append(SANDBOX_LINE.replace("{cmd}", cmd))
     return " ".join(parts)
